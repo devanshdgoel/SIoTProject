@@ -1,16 +1,11 @@
 """
 find_live_studies.py
-====================
-Finds Movebank studies that are (a) downloadable by YOU, (b) still reporting
-recent data, and (c) migratory birds — then prints a ranked shortlist.
 
-Run this ON YOUR OWN MACHINE (Movebank is reachable there). It reuses the
-same auth pattern as your animal.py.
+This script will help find studies on Movebank that are: 
+a) downloadable by me,
+(b) still reporting live recent data
+(c) migratory birds as they would move aorund — then prints a ranked shortlist.
 
-Usage:
-    python find_live_studies.py
-
-It reads MOVEBANK_USERNAME / MOVEBANK_PASSWORD from your .env (same as animal.py).
 """
 
 import os

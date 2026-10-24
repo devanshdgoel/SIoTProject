@@ -1,3 +1,11 @@
+"""
+scout.py
+
+This script is sued to find studies and animals that are 
+giving live, recent data. 
+
+"""
+
 import os
 import csv 
 import io 
@@ -13,7 +21,7 @@ load_dotenv(BASE_DIR / ".env")
 MOVEBANK_USERNAME = os.getenv("MOVEBANK_USERNAME")
 MOVEBANK_PASSWORD = os.getenv("MOVEBANK_PASSWORD")
 
-STUDY_ID = "24442409"
+STUDY_ID = "24442409" 
 ANIMAL_ID = ""
 
 MOVEBANK_BASE = "https://www.movebank.org/movebank/service/direct-read"
