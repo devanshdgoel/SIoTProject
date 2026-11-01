@@ -107,6 +107,12 @@ class Database:
         with self.conn() as c:
             return c.execute(q + " ORDER BY ts DESC LIMIT 1", args).fetchone()
 
+    def latest_display(self):
+        """Newest pet display state (a Row or None): what the node should be showing."""
+        with self.conn() as c:
+            return c.execute("SELECT expression, message FROM display_log "
+                             "ORDER BY id DESC LIMIT 1").fetchone()
+
     def max_alert_ts(self):
         with self.conn() as c:
             return c.execute("SELECT MAX(event_ts) FROM overflow_alerts").fetchone()[0]

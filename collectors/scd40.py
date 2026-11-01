@@ -31,6 +31,7 @@ import math
 import os
 import queue
 import random
+import re
 import threading
 import time
 from pathlib import Path
@@ -40,6 +41,7 @@ from config import settings
 
 SOURCE = "scd40"
 SAMPLE_PERIOD_S = 5
+ROOM_RE = re.compile(r"[a-z0-9_-]{1,20}")   # room names become observation locations
 
 
 # --------------------------------------------------------------------------
@@ -141,16 +143,33 @@ class SimBackend:
         return self.window_at(int(time.time()), seconds)
 
 
+def _clean(s, n):
+    """Printable ASCII only, no quotes or backslashes: the node parses the reply by hand."""
+    return re.sub(r'[^ -~]|["\\]', "", str(s))[:n]
+
+
+def _display_for_node(row):
+    """db.latest_display() row -> the pet state sent back in the /ingest reply."""
+    return None if row is None else {"expression": _clean(row["expression"], 15),
+                                     "message": _clean(row["message"], 40)}
+
+
 class HttpBackend:
     """ESP32 (or any node) pushes minute-averaged readings over WiFi:
 
         POST /ingest   header X-Auth-Token: <INGEST_TOKEN>
-        {"device": "esp32-1", "readings": [{"ts": 1793313660, "co2": 812.4,
+        {"device": "esp32-1", "room": "desk", "readings": [{"ts": 1793313660, "co2": 812.4,
                                             "co2_max": 840, "t": 21.3, "rh": 49.8, "n": 12}, ...]}
 
     The node timestamps readings (NTP) and buffers them while this host is offline, then
     uploads the backlog; storage is idempotent on (metric, location, ts), so retries are
-    safe. The reply carries the latest outdoor pressure so the node can pressure-compensate."""
+    safe. The reply carries the host's decisions back on the same connection:
+
+        {"accepted": 2, "pressure_hpa": 1012.3,
+         "display": {"expression": "concerned", "message": "open a window"}}
+
+    pressure_hpa lets the node pressure-compensate the sensor; display is the newest
+    display_log row, which the node with the OLED renders (null until one exists)."""
 
     MAX_AGE_S, MAX_FUTURE_S = 3 * 86400, 300
 
@@ -159,7 +178,7 @@ class HttpBackend:
         token = token or os.getenv("INGEST_TOKEN")
         if not token:
             raise NotConfigured("INGEST_TOKEN missing from .env (shared secret for the ESP32)")
-        self.queue, self.db, self.pressure = queue.Queue(), db, None
+        self.queue, self.db, self.pressure, self.display = queue.Queue(), db, None, None
         backend = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -185,7 +204,10 @@ class HttpBackend:
                         raise ValueError("size")
                     body = json.loads(self.rfile.read(n))
                     readings = body["readings"]
-                    accepted = sum(backend.accept(r) for r in readings)
+                    room = str(body.get("room") or settings.SCD40_LOCATION)
+                    if not ROOM_RE.fullmatch(room):
+                        raise ValueError("room")
+                    accepted = sum(backend.accept(r, room) for r in readings)
                 except (ValueError, KeyError, TypeError):
                     return self._reply(400, {"error": "malformed"})
                 if backend.db is not None and readings:
@@ -194,13 +216,14 @@ class HttpBackend:
                                             len(readings) - accepted, len(readings),
                                             int(time.time() - oldest) if oldest else None,
                                             self.client_address[0])
-                self._reply(200, {"accepted": accepted, "pressure_hpa": backend.pressure})
+                self._reply(200, {"accepted": accepted, "pressure_hpa": backend.pressure,
+                                  "display": backend.display})
 
         self.server = ThreadingHTTPServer(("0.0.0.0", settings.INGEST_PORT if port is None else port), Handler)
         self.port = self.server.server_address[1]
         threading.Thread(target=self.server.serve_forever, daemon=True, name="ingest").start()
 
-    def accept(self, r):
+    def accept(self, r, room=settings.SCD40_LOCATION):
         """Validate one reading and queue it; returns 1 if kept (bad/old/future rows are dropped)."""
         try:
             ts, co2, t, rh = int(r["ts"]), float(r["co2"]), float(r["t"]), float(r["rh"])
@@ -212,13 +235,18 @@ class HttpBackend:
             return 0
         if not (350 <= co2 <= 10000 and -10 <= t <= 60 and 0 <= rh <= 100):
             return 0
-        self.queue.put((ts, co2, co2_max, t, rh, n))
+        self.queue.put((ts, co2, co2_max, t, rh, n, room))
         return 1
 
     def drain(self):
+        """Queued readings for storage; also refresh what the next reply tells the node.
+
+        Both DB reads happen here, on the collector thread, so the request handler
+        never touches SQLite."""
         if self.db is not None:
             p = self.db.latest("pressure_hpa")
             self.pressure = round(p["value"], 1) if p is not None and p["value"] else None
+            self.display = _display_for_node(self.db.latest_display())
         rows = []
         while True:
             try:

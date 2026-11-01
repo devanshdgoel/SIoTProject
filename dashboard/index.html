@@ -218,8 +218,9 @@ function renderDisplay(){
 
 /* ---------- live-signal charts ---------- */
 const CHARTS = [
-  {id:'co2', title:'Indoor CO₂ (ppm)', lines:[1000,1500], series:[{m:'co2_ppm', loc:'room', label:'CO₂'}]},
-  {id:'indoor', title:'Indoor temperature (°C) and humidity (%)', series:[{m:'indoor_temp_c', loc:'room', label:'Temp °C'},{m:'indoor_rh_pct', loc:'room', label:'RH %', axis:'y1'}]},
+  {id:'co2', title:'Indoor CO₂ (ppm)', lines:[1000,1500], series:[{m:'co2_ppm', loc:'desk', label:'CO₂ desk'},{m:'co2_ppm', loc:'bedroom', label:'CO₂ bedroom'}]},
+  {id:'indoor', title:'Indoor temperature (°C) and humidity (%)', series:[{m:'indoor_temp_c', loc:'desk', label:'Temp desk'},{m:'indoor_rh_pct', loc:'desk', label:'RH desk', axis:'y1'},
+      {m:'indoor_temp_c', loc:'bedroom', label:'Temp bedroom'},{m:'indoor_rh_pct', loc:'bedroom', label:'RH bedroom', axis:'y1'}]},
   {id:'air', title:'Outdoor air quality (µg/m³)', series:[{m:'pm2_5',loc:'home',label:'PM2.5'},{m:'pm10',loc:'home',label:'PM10'},{m:'no2',loc:'home',label:'NO₂'}]},
   {id:'wx', title:'Outdoor temperature (°C) and wind (m/s)', series:[{m:'outdoor_temp_c',loc:'home',label:'Temp °C'},{m:'wind_ms',loc:'home',label:'Wind m/s',axis:'y1'}]},
   {id:'carbon', title:'Grid carbon intensity (gCO₂/kWh)', series:[{m:'carbon_actual_gco2_kwh',loc:'GB',label:'Actual (GB)'},
@@ -260,7 +261,7 @@ async function refreshCharts(){
 
 function overall(){
   const hs = S.collectors.map(c=>c.health);
-  const nodeBad = S.config.scd40_backend==='http' && (!S.devices.length || Date.now()/1000 - S.devices[0].last_seen > 300);
+  const nodeBad = S.config.scd40_backend==='http' && (!S.devices.length || S.devices.some(d => Date.now()/1000 - d.last_seen > 300));
   const bad = hs.includes('bad'), warn = hs.includes('warn') || nodeBad;
   const el = $('#overall'); el.className = 'pill ' + (bad?'bad':warn?'warn':'good');
   el.textContent = bad ? 'Problems' : warn ? 'Attention' : 'All collectors healthy';

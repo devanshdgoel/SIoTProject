@@ -149,6 +149,34 @@ def test_http_ingest_roundtrip_auth_and_validation(db):
     b.server.shutdown()
 
 
+def test_http_ingest_keeps_rooms_separate(db):
+    import time, requests
+    b = scd40.HttpBackend(db, port=0, token="secret")
+    url, hdr = f"http://127.0.0.1:{b.port}/ingest", {"X-Auth-Token": "secret"}
+    now = int(time.time()) // 60 * 60
+    r = {"ts": now, "co2": 700, "co2_max": 720, "t": 20.0, "rh": 50, "n": 12}
+    assert requests.post(url, headers=hdr, json={"room": "bedroom", "readings": [r]}).json()["accepted"] == 1
+    assert requests.post(url, headers=hdr, json={"readings": [r]}).json()["accepted"] == 1     # no room -> default
+    assert requests.post(url, headers=hdr, json={"room": "Bad Room!", "readings": [r]}).status_code == 400
+    locs = {scd40.reading_to_obs(*row)[0].location for row in b.drain()}
+    assert locs == {"bedroom", "desk"}
+    b.server.shutdown()
+
+
+def test_ingest_reply_carries_pet_display_to_the_node(db):
+    import time, requests
+    b = scd40.HttpBackend(db, port=0, token="secret")
+    url, hdr = f"http://127.0.0.1:{b.port}/ingest", {"X-Auth-Token": "secret"}
+    now = int(time.time()) // 60 * 60
+    r = {"ts": now, "co2": 1200, "co2_max": 1250, "t": 21.0, "rh": 50, "n": 12}
+    assert requests.post(url, headers=hdr, json={"readings": [r]}).json()["display"] is None
+    db.set_display("concerned", 'open a window "now"\x01', mode="test")
+    b.drain()                                    # the collector thread refreshes the reply payload
+    d = requests.post(url, headers=hdr, json={"readings": [r]}).json()["display"]
+    assert d == {"expression": "concerned", "message": "open a window now"}   # quotes/controls stripped
+    b.server.shutdown()
+
+
 def test_http_backend_requires_token(monkeypatch):
     monkeypatch.delenv("INGEST_TOKEN", raising=False)
     with pytest.raises(NotConfigured):

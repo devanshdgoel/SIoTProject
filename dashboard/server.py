@@ -29,7 +29,7 @@ from config import settings
 
 INDEX = Path(__file__).with_name("index.html")
 CHART_JS = Path(__file__).with_name("chart.min.js")   # Chart.js 4.4.1, bundled so the page works offline
-EXPRESSIONS = ["neutral", "happy", "concerned", "alert", "sleepy", "sad"]
+EXPRESSIONS = settings.EXPRESSIONS      # shared with the node firmware
 SECRETS = ["ULTRAHUMAN_TOKEN", "THAMES_CLIENT_ID", "THAMES_CLIENT_SECRET", "INGEST_TOKEN"]
 COMPONENT_DIRS = ["collectors", "analysis", "pet", "actions"]
 

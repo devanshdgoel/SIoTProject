@@ -50,7 +50,14 @@ SCD40_SERIAL_PORT = os.getenv("SCD40_SERIAL_PORT", "COM3")
 INGEST_PORT = int(os.getenv("INGEST_PORT", 8765))   # backend "http": ESP32 posts here; token in .env as INGEST_TOKEN
 SCD40_WINDOW_S = 60           # one stored reading = mean of the sensor samples in this window
 SCD40_TEMP_OFFSET_C = float(os.getenv("SCD40_TEMP_OFFSET_C", 4.0))  # self-heating correction; calibrate against a reference
-SCD40_LOCATION = "room"
+SCD40_LOCATION = "desk"       # default room for a node that does not say which room it is in
+# Each node names its room in the upload ("room": "bedroom"); the room becomes the
+# observation location, so every sensor keeps its own series.
+
+# --- Pet display -----------------------------------------------------------
+# The faces the pet can show. One list for the whole system: the host picks a face,
+# the dashboard draws it, and the node's OLED renders it (firmware/esp32_scd40).
+EXPRESSIONS = ["neutral", "happy", "concerned", "alert", "sleepy", "sad"]
 
 # --- Polling intervals (seconds) -------------------------------------------
 INTERVALS = {
