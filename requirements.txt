@@ -1,0 +1,13 @@
+requests>=2.31
+python-dotenv>=1.0
+pandas>=2.0
+numpy>=1.26
+scipy>=1.11
+matplotlib>=3.8
+pyproj>=3.6        # Thames Water British National Grid -> lat/lon
+tzdata             # Europe/London on Windows
+pyserial>=3.5      # SCD40 via USB-serial microcontroller (backend "serial")
+pytest>=8
+# Raspberry Pi only (SCD40 on I2C, backend "adafruit"):
+# adafruit-circuitpython-scd4x
+# adafruit-blinka

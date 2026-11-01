@@ -1,113 +1,86 @@
 """
 open_meteo.py
 
-Retrieves current and forecast outdoor weather and air-quality data for  
-home location and selected locations around London.
+Retrieves outdoor weather and air-quality data from Open-Meteo for each configured
+location. One poll returns hourly arrays covering the last two days (model
+analysis, kind='modelled') and the next FORECAST_HORIZON_H hours (kind='forecast',
+stamped with the poll hour as issued_at). Re-fetching the past window every poll
+makes the collector self-healing after downtime, and keeping issued forecasts
+allows forecast-vs-actual verification in the evaluation week.
 
+Air-quality values are CAMS model output, not station measurements.
 """
 
-import os
-import csv 
-import io 
-from datetime import datetime, timezone, timedelta
-from dotenv import load_dotenv
-import requests
-from pathlib import Path
-import json
-from animal import get_latest_animal_location
+import time
 
-BASE_DIR = Path(__file__).resolve().parents[1]
-load_dotenv(BASE_DIR / ".env")
+from collectors.base import CollectResult, Observation, get_json
+from config import settings
 
-OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY")
+SOURCE = "open_meteo"
 
-FORECAST_BASE = "https://api.open-meteo.com/v1/forecast"
-AIR_QUALITY_BASE = "https://air-quality-api.open-meteo.com/v1/air-quality"
-
-
-# Minimal WMO weather-code -> text map (add more if you like).
-_WMO = {
-    0: "clear sky", 1: "mainly clear", 2: "partly cloudy", 3: "overcast",
-    45: "fog", 48: "rime fog", 51: "light drizzle", 61: "light rain",
-    63: "rain", 65: "heavy rain", 71: "snow", 80: "rain showers",
-    95: "thunderstorm",
+# open-meteo variable -> (our metric, unit)
+WEATHER_VARS = {
+    "temperature_2m": ("outdoor_temp_c", "C"),
+    "relative_humidity_2m": ("outdoor_rh_pct", "%"),
+    "dew_point_2m": ("outdoor_dewpoint_c", "C"),
+    "precipitation": ("precip_mm", "mm"),
+    "surface_pressure": ("pressure_hpa", "hPa"),
+    "wind_speed_10m": ("wind_ms", "m/s"),
+    "wind_direction_10m": ("wind_dir_deg", "deg"),
+    "cloud_cover": ("cloud_pct", "%"),
+}
+AIR_VARS = {
+    "pm2_5": ("pm2_5", "ug/m3"),
+    "pm10": ("pm10", "ug/m3"),
+    "nitrogen_dioxide": ("no2", "ug/m3"),
+    "ozone": ("o3", "ug/m3"),
+    "sulphur_dioxide": ("so2", "ug/m3"),
+    "carbon_monoxide": ("co", "ug/m3"),
+    "european_aqi": ("european_aqi", "index"),
 }
 
 
-def get_current_weather(lat, lon):
-    response = requests.get(
-        FORECAST_BASE,
-        params={
-            "latitude": lat,
-            "longitude": lon,
-            # ask for exactly the current variables we want:
-            "current": "temperature_2m,apparent_temperature,relative_humidity_2m,"
-                       "surface_pressure,wind_speed_10m,wind_direction_10m,"
-                       "cloud_cover,uv_index,weather_code",
-            "wind_speed_unit": "ms",   # so it matches our wind_speed_mps column
-        },
-        timeout=30,
-    )
-    response.raise_for_status()
-    cur = response.json()["current"]   # all current readings live here
-
-    # Return the SAME keys as before, so storage.save_weather() is unchanged.
-    return {
-        "temperature_c": cur.get("temperature_2m"),
-        "feels_like_c": cur.get("apparent_temperature"),
-        "humidity_percent": cur.get("relative_humidity_2m"),
-        "pressure_hpa": cur.get("surface_pressure"),
-        "wind_speed_mps": cur.get("wind_speed_10m"),
-        "wind_direction_deg": cur.get("wind_direction_10m"),
-        "cloud_cover_percent": cur.get("cloud_cover"),
-        "uv_index": cur.get("uv_index"),
-        "weather": _WMO.get(cur.get("weather_code"), str(cur.get("weather_code"))),
-        "weather_time_unix": cur.get("time"),   # Open-Meteo gives an ISO string
-    }
+def _parse(payload, varmap, location, now):
+    """Hourly arrays -> Observations. Past/current hour = modelled, future = forecast."""
+    hourly = payload.get("hourly") or {}
+    times = hourly.get("time") or []
+    issued = now - now % 3600
+    horizon = issued + settings.FORECAST_HORIZON_H * 3600
+    out = []
+    for var, (metric, unit) in varmap.items():
+        for t, v in zip(times, hourly.get(var) or []):
+            if v is None or t > horizon:
+                continue
+            fc = t > issued
+            out.append(Observation(SOURCE, metric, location, int(t), float(v),
+                                   "forecast" if fc else "modelled", unit,
+                                   issued_at=issued if fc else 0, retrieved_at=now))
+    return out
 
 
-def get_air_quality(lat, lon):
-    response = requests.get(
-        AIR_QUALITY_BASE,
-        params={
-            "latitude": lat,
-            "longitude": lon,
-            "current": "pm2_5,pm10,nitrogen_dioxide,ozone,"
-                       "carbon_monoxide,sulphur_dioxide,ammonia,european_aqi",
-        },
-        timeout=30,
-    )
-    response.raise_for_status()
-    cur = response.json()["current"]
+def collect(db=None, past_days=2):
+    now = int(time.time())
+    result = CollectResult(SOURCE)
+    for name, (lat, lon) in settings.LOCATIONS.items():
+        common = {"latitude": lat, "longitude": lon, "timeformat": "unixtime",
+                  "past_days": past_days, "forecast_days": 2}
+        weather = get_json(settings.OPEN_METEO_WEATHER, {
+            **common, "hourly": ",".join(WEATHER_VARS), "wind_speed_unit": "ms"})
+        air = get_json(settings.OPEN_METEO_AIR, {**common, "hourly": ",".join(AIR_VARS)})
+        result.observations += _parse(weather, WEATHER_VARS, name, now)
+        result.observations += _parse(air, AIR_VARS, name, now)
+        result.raw[f"weather_{name}"] = weather
+        result.raw[f"air_{name}"] = air
+    return result
 
-    # Same keys as before. Note: aqi is now european_aqi (0..100+ scale).
-    return {
-        "aqi": cur.get("european_aqi"),
-        "pm2_5": cur.get("pm2_5"),
-        "pm10": cur.get("pm10"),
-        "no2": cur.get("nitrogen_dioxide"),
-        "o3": cur.get("ozone"),
-        "co": cur.get("carbon_monoxide"),
-        "so2": cur.get("sulphur_dioxide"),
-        "nh3": cur.get("ammonia"),
-    }
 
-def get_animal_environment(): 
-    animal_info = get_latest_animal_location()
-
-    lat = animal_info["latitude"]
-    lon = animal_info["longitude"]
-
-    weather = get_current_weather(lat, lon)
-    air_quality = get_air_quality(lat, lon)
-
-    return { 
-        "animal": animal_info,
-        "weather": weather, 
-        "air_quality": air_quality, 
-    }
+def backfill(days, db=None):
+    """Open-Meteo serves up to ~3 months of history in one call."""
+    return collect(db, past_days=min(int(days), 92))
 
 
 if __name__ == "__main__":
-    result = get_animal_environment()
-    print(json.dumps(result, indent=2))
+    r = collect()
+    print(f"{len(r.observations)} observations")
+    for o in r.observations[:3]:
+        print(o)
