@@ -221,7 +221,7 @@ const CHARTS = [
   {id:'co2', title:'Indoor CO₂ (ppm)', lines:[1000,1500], series:[{m:'co2_ppm', loc:'desk', label:'CO₂ desk'},{m:'co2_ppm', loc:'bedroom', label:'CO₂ bedroom'}]},
   {id:'indoor', title:'Indoor temperature (°C) and humidity (%)', series:[{m:'indoor_temp_c', loc:'desk', label:'Temp desk'},{m:'indoor_rh_pct', loc:'desk', label:'RH desk', axis:'y1'},
       {m:'indoor_temp_c', loc:'bedroom', label:'Temp bedroom'},{m:'indoor_rh_pct', loc:'bedroom', label:'RH bedroom', axis:'y1'}]},
-  {id:'air', title:'Outdoor air quality (µg/m³)', series:[{m:'pm2_5',loc:'home',label:'PM2.5'},{m:'pm10',loc:'home',label:'PM10'},{m:'no2',loc:'home',label:'NO₂'}]},
+  {id:'air', title:'Outdoor air quality (µg/m³): CAMS model cell vs LAQN analysers', series:[{m:'pm2_5',loc:'home',label:'PM2.5 model'},{m:'pm2_5',loc:'KC1',label:'PM2.5 KC1'},{m:'no2',loc:'home',label:'NO₂ model'},{m:'no2',loc:'KC5',label:'NO₂ KC5'}]},
   {id:'wx', title:'Outdoor temperature (°C) and wind (m/s)', series:[{m:'outdoor_temp_c',loc:'home',label:'Temp °C'},{m:'wind_ms',loc:'home',label:'Wind m/s',axis:'y1'}]},
   {id:'carbon', title:'Grid carbon intensity (gCO₂/kWh)', series:[{m:'carbon_actual_gco2_kwh',loc:'GB',label:'Actual (GB)'},
       {m:'carbon_forecast_gco2_kwh',loc:'London',label:'Forecast (London)',kind:'forecast',ahead:48,dash:true}]},

@@ -2,7 +2,7 @@
 
 import pytest
 
-from collectors import grid_carbon, open_meteo, scd40, thames_water, ultrahuman
+from collectors import grid_carbon, laqn, open_meteo, scd40, thames_water, ultrahuman
 from collectors.base import CollectorError, CollectResult, NotConfigured, Observation, run_collector
 from storage.database import Database
 
@@ -200,3 +200,53 @@ def test_ultrahuman_flags_implausible_readings():
         {"value": 33.0, "timestamp": 1}, {"value": 14.8, "timestamp": 2}]}}]}}}
     q = {o.ts: o.quality for o in ultrahuman.parse_day("d", payload).observations}
     assert q == {1: "ok", 2: "suspect"}
+
+
+def test_laqn_unwraps_dotnet_json_and_maps_species():
+    # the service renders XML as JSON: '@' prefixes, a named wrapper, hourly GMT stamps
+    payload = {"AirQualityData": {"@SiteCode": "KC1", "Data": [
+        {"@MeasurementDateGMT": "2026-10-29 21:00:00", "@SpeciesCode": "PM25", "@Value": "12.4"},
+        {"@MeasurementDateGMT": "2026-10-29 22:00:00", "@SpeciesCode": "NO2", "@Value": "41.0"},
+        {"@MeasurementDateGMT": "2026-10-29 22:00:00", "@SpeciesCode": "PM25", "@Value": ""},
+        {"@MeasurementDateGMT": "2026-10-29 22:00:00", "@SpeciesCode": "CO", "@Value": "0.3"},
+        {"@MeasurementDateGMT": "2026-10-29 22:00:00", "@SpeciesCode": "PM10", "@Value": "4000"},
+    ]}}
+    obs = laqn._parse(laqn._records(payload, "data"), "KC1", NOW)
+    got = {(o.metric, o.ts): (o.value, o.kind, o.unit, o.quality, o.location) for o in obs}
+    assert got == {
+        ("pm2_5", NOW - 6000): (12.4, "measured", "ug/m3", "ok", "KC1"),
+        ("no2", NOW - 2400): (41.0, "measured", "ug/m3", "ok", "KC1"),
+        ("pm10", NOW - 2400): (4000.0, "measured", "ug/m3", "suspect", "KC1"),
+    }   # blank value skipped (analyser down), CO skipped (mg/m3, would not compare with CAMS)
+
+
+def test_laqn_accepts_a_lone_record_and_rejects_a_shapeless_response():
+    one = {"RawAQData": {"Data": {"@MeasurementDateGMT": "2026-10-29 22:00:00",
+                                  "@SpeciesCode": "O3", "@Value": "55"}}}
+    assert [o.metric for o in laqn._parse(laqn._records(one, "data"), "KC1", NOW)] == ["o3"]
+    with pytest.raises(CollectorError):
+        laqn._records({"Nope": {"Other": 1}}, "data")
+
+
+def test_laqn_skipped_when_no_sites_configured(monkeypatch):
+    from config import settings
+    monkeypatch.setattr(settings, "LAQN_SITES", [])
+    with pytest.raises(NotConfigured):
+        laqn.collect()
+
+
+def test_laqn_nearest_ranks_sites_by_distance(monkeypatch):
+    feed = {"Sites": {"Site": [
+        {"@SiteCode": "FAR", "@SiteName": "Far", "@SiteType": "Roadside",
+         "@Latitude": "51.60", "@Longitude": "-0.10", "@DateClosed": ""},
+        {"@SiteCode": "NEAR", "@SiteName": "Near", "@SiteType": "Urban Background",
+         "@Latitude": "51.4890", "@Longitude": "-0.1900", "@DateClosed": ""},
+        {"@SiteCode": "SHUT", "@SiteName": "Shut", "@SiteType": "Kerbside",
+         "@Latitude": "51.4861", "@Longitude": "-0.1893", "@DateClosed": "2019-01-01"},
+        {"@SiteCode": "NOFIX", "@SiteName": "No fix", "@SiteType": "Kerbside",
+         "@Latitude": "0", "@Longitude": "0", "@DateClosed": ""},
+    ]}}
+    monkeypatch.setattr(laqn, "get_json", lambda *a, **k: feed)
+    out = laqn.nearest(51.486114, -0.1893498)
+    assert [r[1] for r in out] == ["NEAR", "FAR"]      # closed site and 0,0 placeholder dropped
+    assert out[0][0] < 1 and out[1][0] > 5             # km, nearest first

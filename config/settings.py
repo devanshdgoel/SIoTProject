@@ -42,6 +42,15 @@ USER_TZ = "Europe/London"
 # --- Thames Water (needs THAMES_CLIENT_ID / THAMES_CLIENT_SECRET in .env) --
 THAMES_API_ROOT = "https://prod-tw-opendata-app.uk-e1.cloudhub.io/data/STE/v1"
 
+# --- LAQN (London Air Quality Network; no API key) --------------------------
+# Reference analysers run by Imperial's ERG. Open-Meteo's air quality is a ~11 km
+# CAMS model cell, so these measured sites are what local air actually looks like.
+LAQN_API_ROOT = "https://api.erg.ic.ac.uk/AirQuality"
+# Site codes to pull; `python -m collectors.laqn` lists the sites nearest home.
+# KC1 North Kensington is the urban-background reference (has PM2.5);
+# KC5 Earl's Court is kerbside (NO2 and PM10 only) and much closer.
+LAQN_SITES = [c.strip().upper() for c in os.getenv("LAQN_SITES", "KC1,KC5").split(",") if c.strip()]
+
 # --- SCD40 -----------------------------------------------------------------
 # backend: "adafruit" (I2C on a Raspberry Pi), "serial" (Pico/Arduino/ESP over
 # USB, CSV lines "co2,temp_c,rh"), or "sim" (synthetic, for development).
@@ -66,6 +75,7 @@ INTERVALS = {
     "grid_carbon": 900,        # NESO updates each half hour
     "ultrahuman": 1800,        # ring syncs via phone, so sub-30-min polling gains nothing
     "thames_water": 600,
+    "laqn": 1800,              # hourly analyser means, revised as they are ratified
 }
 
 # --- Dashboard (localhost only: it exposes health data) ---------------------
@@ -82,4 +92,5 @@ STALE_AFTER_S = {
     "grid_carbon": 2 * 3600,   # 'actual' trails real time by ~1 h
     "ultrahuman": 6 * 3600,
     "thames_water": 3600,
+    "laqn": 4 * 3600,      # ratification lag means the newest hour often trails
 }

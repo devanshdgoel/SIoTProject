@@ -20,7 +20,7 @@ import threading
 import time
 from datetime import datetime, timezone
 
-from collectors import grid_carbon, open_meteo, scd40, thames_water, ultrahuman
+from collectors import grid_carbon, laqn, open_meteo, scd40, thames_water, ultrahuman
 from collectors.base import run_collector
 from config import settings
 from storage.database import Database
@@ -31,6 +31,7 @@ COLLECTORS = {
     "grid_carbon": grid_carbon,
     "ultrahuman": ultrahuman,
     "thames_water": thames_water,
+    "laqn": laqn,
 }
 log = logging.getLogger("siot")
 
