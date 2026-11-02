@@ -250,3 +250,58 @@ def test_laqn_nearest_ranks_sites_by_distance(monkeypatch):
     out = laqn.nearest(51.486114, -0.1893498)
     assert [r[1] for r in out] == ["NEAR", "FAR"]      # closed site and 0,0 placeholder dropped
     assert out[0][0] < 1 and out[1][0] > 5             # km, nearest first
+
+
+def test_two_nodes_posting_at_once_both_land_in_their_own_room(db):
+    """Both ESP32s share one ingest port. Each request gets its own handler thread,
+    so the queue and the device table have to cope with them arriving together."""
+    import threading, time, requests
+    b = scd40.HttpBackend(db, port=0, token="secret")
+    url, hdr = f"http://127.0.0.1:{b.port}/ingest", {"X-Auth-Token": "secret"}
+    now = int(time.time()) // 60 * 60
+    ok = []
+
+    def post(device, room, base):
+        batch = [{"ts": now - i * 60, "co2": base + i, "co2_max": base + i + 10,
+                  "t": 21.0, "rh": 50, "n": 12} for i in range(30)]
+        r = requests.post(url, headers=hdr, json={"device": device, "room": room,
+                                                  "readings": batch})
+        ok.append(r.json()["accepted"])
+
+    threads = [threading.Thread(target=post, args=("esp32-1", "desk", 700)),
+               threading.Thread(target=post, args=("esp32-2", "bedroom", 900))]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert ok == [30, 30]
+
+    rows = [r for row in b.drain() for r in scd40.reading_to_obs(*row)]
+    per_room = {}
+    for o in rows:
+        per_room[o.location] = per_room.get(o.location, 0) + 1
+    assert per_room == {"desk": 120, "bedroom": 120}        # 30 readings x 4 metrics each
+    with db.conn() as c:
+        seen = dict(c.execute("SELECT device, accepted_total FROM device_status"))
+    assert seen == {"esp32-1": 30, "esp32-2": 30}
+    b.server.shutdown()
+
+
+def test_a_full_48_hour_backlog_is_accepted_batch_after_batch(db):
+    """What happens when the laptop sleeps: the node holds up to 48 h and uploads it
+    all on waking. Nothing in that window may be rejected as too old."""
+    import time, requests
+    b = scd40.HttpBackend(db, port=0, token="secret")
+    url, hdr = f"http://127.0.0.1:{b.port}/ingest", {"X-Auth-Token": "secret"}
+    now = int(time.time()) // 60 * 60
+    oldest = now - 2880 * 60                                  # exactly the buffer depth
+    total = 0
+    for start in range(0, 2880, 30):                          # as the firmware sends it
+        batch = [{"ts": oldest + (start + i) * 60, "co2": 800, "co2_max": 820,
+                  "t": 21.0, "rh": 50, "n": 12} for i in range(30)]
+        total += requests.post(url, headers=hdr,
+                               json={"device": "esp32-2", "room": "bedroom",
+                                     "readings": batch}).json()["accepted"]
+    assert total == 2880                                      # not one reading refused
+    assert len(b.drain()) == 2880
+    b.server.shutdown()

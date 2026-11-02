@@ -62,7 +62,9 @@ static const uint8_t  SCD_ADDR       = 0x62;
 static const float    TEMP_OFFSET_C  = 4.0;      // self-heating compensation
 static const int      BUF_SIZE       = 2880;     // minutes of backlog (~48 h)
 static const int      BATCH_MAX      = 30;       // readings per POST
+static const int      MAX_BATCHES_PER_CALL = 8;  // keep sampling while a backlog drains
 static const uint32_t UPLOAD_EVERY_MS = 60000;
+static const uint32_t CATCHUP_MS      = 5000;    // retry sooner while still behind
 
 struct Reading { uint32_t ts; float co2, co2_max, t, rh; uint8_t n; };
 static Reading buf[BUF_SIZE];
@@ -71,6 +73,7 @@ static int bufHead = 0, bufCount = 0;            // ring buffer: oldest at bufHe
 // Shared node state, also what the display shows.
 static float lastCo2 = 0, lastT = 0, lastRh = 0;
 static bool  haveReading = false, timeOk = false, uploadOk = false, uploadTried = false;
+static uint32_t lastUpload = 0;                  // used by upload() to pace catching up
 static char  dispExpr[16] = "";                  // from the host; empty until it replies
 static char  dispMsg[64]  = "";
 
@@ -335,9 +338,10 @@ static bool jsonStr(const String &s, const char *key, char *out, size_t n) {
   return true;
 }
 
-static void upload() {
-  if (bufCount == 0) { Serial.println("[upload] nothing to send yet (first reading is stored after the first full minute)"); return; }
-  if (WiFi.status() != WL_CONNECTED) { Serial.printf("[upload] skipped: WiFi is down, %d reading(s) waiting in memory\n", bufCount); return; }
+/* Send one batch. Returns 1 sent, 0 nothing to send, -1 the host would not take it. */
+static int uploadBatch() {
+  if (bufCount == 0) return 0;
+  if (WiFi.status() != WL_CONNECTED) { Serial.printf("[upload] skipped: WiFi is down, %d reading(s) waiting in memory\n", bufCount); return -1; }
   int n = bufCount < BATCH_MAX ? bufCount : BATCH_MAX;
   String body = "{\"device\":\"" DEVICE_NAME "\",\"room\":\"" ROOM_NAME "\",\"readings\":[";
   for (int i = 0; i < n; i++) {
@@ -380,8 +384,7 @@ static void upload() {
     }
     Serial.printf("[upload] OK - host accepted %d reading(s). Backlog now %d. THE WHOLE CHAIN WORKS.\n", n, bufCount);
     http.end();
-    if (bufCount > 0) upload();                                 // drain backlog promptly
-    return;
+    return 1;
   }
   uploadOk = false;
   if (code < 0) {
@@ -395,12 +398,37 @@ static void upload() {
   }
   Serial.printf("[upload]   %d reading(s) kept in memory, will retry in %lu s\n", bufCount, (unsigned long)(UPLOAD_EVERY_MS / 1000));
   http.end();
+  return -1;
+}
+
+/* Drain the backlog in a loop, never by recursion.
+ *
+ * A full 48 h buffer is 96 batches. Ninety-six nested calls, each holding an
+ * HTTPClient and a 3 kB request body that is not released until the frame returns,
+ * would exhaust the task stack and the heap long before the backlog cleared - and a
+ * crash there loses the very data the buffer existed to protect.
+ *
+ * Only a few batches go out per call so the sensor keeps being read while catching
+ * up; if a backlog remains the next attempt is seconds away instead of a minute, so
+ * a full buffer still clears in a couple of minutes. */
+static void upload() {
+  if (bufCount == 0) {
+    Serial.println("[upload] nothing to send yet (the first reading is stored after one full minute)");
+    return;
+  }
+  for (int sent = 0; sent < MAX_BATCHES_PER_CALL; sent++) {
+    if (uploadBatch() <= 0) return;                 // done, or the host is not taking it
+    if (bufCount == 0) return;
+  }
+  Serial.printf("[upload] %d still queued, carrying on in %lu s\n",
+                bufCount, (unsigned long)(CATCHUP_MS / 1000));
+  lastUpload = millis() - UPLOAD_EVERY_MS + CATCHUP_MS;
 }
 
 // ---------------------------------------------------------------- main
 static double sumCo2 = 0, sumT = 0, sumRh = 0, maxCo2 = 0;
 static int nSamples = 0;
-static uint32_t curMinute = 0, lastUpload = 0, lastWifi = 0;
+static uint32_t curMinute = 0, lastWifi = 0;
 static bool timeReported = false, sensorOk = false;
 static uint32_t lastTimeMsg = 0, lastGoodSample = 0, lastSensorWarn = 0;
 

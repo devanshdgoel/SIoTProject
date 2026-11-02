@@ -78,6 +78,10 @@ INTERVALS = {
     "laqn": 1800,              # hourly analyser means, revised as they are ratified
 }
 
+# --- Analysis --------------------------------------------------------------
+ANALYSIS_INTERVAL_S = 300     # one pass per grid step; it only reads stored data
+ANALYSIS_WINDOW_DAYS = 14     # how far back each re-fit looks
+
 # --- Dashboard (localhost only: it exposes health data) ---------------------
 DASHBOARD_PORT = int(os.getenv("DASHBOARD_PORT", 8050))
 # nominal sample period (s) per metric, used for the data-completeness figures

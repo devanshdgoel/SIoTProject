@@ -146,3 +146,95 @@ class Database:
                                        MAX(started_at) last_run
                                 FROM collector_runs GROUP BY collector""").fetchall()
         return obs, runs
+
+    # ---- analysis layer --------------------------------------------------
+    def add_label(self, location, kind, value, start_ts, end_ts, note=None):
+        """Record user ground truth ('bedroom window open 14:00-15:00'). Idempotent."""
+        with self.conn() as c:
+            c.execute("INSERT OR REPLACE INTO labels (location,kind,value,start_ts,end_ts,note,created_at) "
+                      "VALUES (?,?,?,?,?,?,?)",
+                      (location, kind, value, int(start_ts), int(end_ts), note, int(time.time())))
+
+    def labels(self, location=None, kind=None, start=None, end=None):
+        q, args = "SELECT * FROM labels WHERE 1=1", []
+        for col, val, op in (("location", location, "="), ("kind", kind, "="),
+                             ("end_ts", start, ">="), ("start_ts", end, "<=")):
+            if val is not None:
+                q += f" AND {col}{op}?"
+                args.append(val)
+        with self.conn() as c:
+            return c.execute(q + " ORDER BY start_ts", args).fetchall()
+
+    def set_param(self, location, param, value, stderr=None, n=0, unit=None, detail=None):
+        """Store one learned room parameter, replacing any earlier fit."""
+        with self.conn() as c:
+            c.execute("INSERT OR REPLACE INTO room_params "
+                      "(location,param,value,stderr,n,unit,fitted_at,detail) VALUES (?,?,?,?,?,?,?,?)",
+                      (location, param, value, stderr, int(n), unit, int(time.time()),
+                       json.dumps(detail) if detail is not None else None))
+
+    def params(self, location):
+        """Learned parameters for one room as {param: Row}."""
+        with self.conn() as c:
+            return {r["param"]: r for r in
+                    c.execute("SELECT * FROM room_params WHERE location=?", (location,))}
+
+    def save_decays(self, rows):
+        with self.conn() as c:
+            for r in rows:
+                _insert(c, "decay_events", r, "INSERT OR REPLACE")
+        return len(rows)
+
+    def decays(self, location=None, min_r2=None):
+        q, args = "SELECT * FROM decay_events WHERE 1=1", []
+        if location:
+            q, args = q + " AND location=?", args + [location]
+        if min_r2 is not None:
+            q, args = q + " AND r2>=?", args + [min_r2]
+        with self.conn() as c:
+            return c.execute(q + " ORDER BY start_ts", args).fetchall()
+
+    def add_predictions(self, rows):
+        """Write forecasts before their outcome is known; scored later by score_due()."""
+        with self.conn() as c:
+            for r in rows:
+                _insert(c, "predictions", r, "INSERT OR REPLACE")
+        return len(rows)
+
+    def score_due(self, now=None, tol_s=600):
+        """Fill in `actual` for any prediction whose target time has passed.
+
+        The measurement nearest the target time wins, provided it is within tol_s;
+        otherwise the row stays unscored rather than being matched to a distant value."""
+        now = int(time.time()) if now is None else int(now)
+        scored = 0
+        with self.conn() as c:
+            due = c.execute("SELECT id, location, metric, target_ts FROM predictions "
+                            "WHERE scored_at IS NULL AND target_ts<=?", (now,)).fetchall()
+            for p in due:
+                row = c.execute("""SELECT value FROM observations
+                                   WHERE metric=? AND location=? AND kind!='forecast'
+                                     AND ts BETWEEN ? AND ? AND value IS NOT NULL
+                                   ORDER BY ABS(ts-?) LIMIT 1""",
+                                (p["metric"], p["location"], p["target_ts"] - tol_s,
+                                 p["target_ts"] + tol_s, p["target_ts"])).fetchone()
+                if row is None:
+                    continue
+                c.execute("UPDATE predictions SET actual=?, scored_at=? WHERE id=?",
+                          (row["value"], now, p["id"]))
+                scored += 1
+        return scored
+
+    def prediction_error(self, location=None, metric="co2_ppm", days=7):
+        """Mean absolute error of scored forecasts per day: the learning curve."""
+        q = ["SELECT DATE(issued_at,'unixepoch') day, horizon_s, COUNT(*) n,"
+             " ROUND(AVG(ABS(actual-predicted)),1) mae, ROUND(AVG(actual-predicted),1) bias",
+             "FROM predictions WHERE actual IS NOT NULL AND metric=?"]
+        args = [metric]
+        if location:
+            q.append("AND location=?")
+            args.append(location)
+        q.append("AND issued_at>=? GROUP BY day, horizon_s ORDER BY day")
+        args.append(int(time.time()) - days * 86400)
+        with self.conn() as c:
+            return c.execute(" ".join(q), args).fetchall()

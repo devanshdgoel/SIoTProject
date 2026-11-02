@@ -132,3 +132,75 @@ CREATE TABLE IF NOT EXISTS analysis_runs (
     n_events    INTEGER NOT NULL DEFAULT 0,
     note        TEXT
 );
+
+-- ---------------------------------------------------------------- analysis layer
+
+-- Ground truth the user types in: "the bedroom window was open 14:00-15:00".
+-- Labels calibrate the learned room parameters and score the system's own guesses.
+-- They are needed only for the first few days; after that the system infers these
+-- states itself and the labels become the test set.
+CREATE TABLE IF NOT EXISTS labels (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    location   TEXT    NOT NULL,
+    kind       TEXT    NOT NULL,          -- window | door | occupancy | cooking
+    value      TEXT    NOT NULL,          -- open | closed | present | absent | yes
+    start_ts   INTEGER NOT NULL,
+    end_ts     INTEGER NOT NULL,
+    note       TEXT,
+    created_at INTEGER NOT NULL,
+    UNIQUE (location, kind, start_ts, end_ts)
+);
+CREATE INDEX IF NOT EXISTS idx_labels ON labels (location, kind, start_ts);
+
+-- What the system has worked out about each room: one row per parameter, carrying
+-- the sample count and standard error so a recommendation can say how sure it is.
+-- Below MIN_N observations the analysis falls back to a published default instead.
+CREATE TABLE IF NOT EXISTS room_params (
+    location  TEXT    NOT NULL,
+    param     TEXT    NOT NULL,           -- c_out | lambda_sealed | lambda_open | source_ppm_h | volume_m3 | tau_t_h
+    value     REAL,
+    stderr    REAL,
+    n         INTEGER NOT NULL DEFAULT 0,
+    unit      TEXT,
+    fitted_at INTEGER NOT NULL,
+    detail    TEXT,                       -- JSON fit diagnostics, kept for the report
+    PRIMARY KEY (location, param)
+);
+
+-- One row per automatically detected CO2 decay: the data points behind the
+-- air-change-rate model, each stamped with the weather it happened under.
+CREATE TABLE IF NOT EXISTS decay_events (
+    location  TEXT    NOT NULL,
+    start_ts  INTEGER NOT NULL,
+    end_ts    INTEGER NOT NULL,
+    lambda_h  REAL    NOT NULL,           -- air changes per hour
+    stderr    REAL,
+    r2        REAL,
+    c_start   REAL,
+    c_end     REAL,
+    c_out     REAL,
+    delta_t_c REAL,                       -- indoor minus outdoor at the time
+    wind_ms   REAL,
+    labelled  TEXT,                       -- window state from labels, if one covers it
+    inferred  TEXT,                       -- sealed | ventilated, from the fitted value
+    PRIMARY KEY (location, start_ts)
+);
+
+-- Every forecast is written before its outcome is known and scored later. The
+-- rolling error over these rows is the evidence that the system is improving.
+CREATE TABLE IF NOT EXISTS predictions (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    issued_at INTEGER NOT NULL,
+    location  TEXT    NOT NULL,
+    metric    TEXT    NOT NULL,
+    target_ts INTEGER NOT NULL,
+    horizon_s INTEGER NOT NULL,
+    predicted REAL    NOT NULL,
+    lo        REAL,
+    hi        REAL,
+    basis     TEXT,                        -- learned | default: which parameters were used
+    actual    REAL,
+    scored_at INTEGER,
+    UNIQUE (location, metric, issued_at, target_ts)
+);
+CREATE INDEX IF NOT EXISTS idx_pred_open ON predictions (scored_at, target_ts);

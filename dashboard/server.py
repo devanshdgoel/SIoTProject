@@ -30,6 +30,7 @@ from config import settings
 INDEX = Path(__file__).with_name("index.html")
 CHART_JS = Path(__file__).with_name("chart.min.js")   # Chart.js 4.4.1, bundled so the page works offline
 EXPRESSIONS = settings.EXPRESSIONS      # shared with the node firmware
+LABEL_KINDS = ["window", "door", "occupancy", "cooking"]
 SECRETS = ["ULTRAHUMAN_TOKEN", "THAMES_CLIENT_ID", "THAMES_CLIENT_SECRET", "INGEST_TOKEN"]
 COMPONENT_DIRS = ["collectors", "analysis", "pet", "actions"]
 
@@ -162,6 +163,18 @@ def full_state(db, collectors):
                 "secrets_present": {k: bool(os.getenv(k)) for k in SECRETS},
             },
             "expressions": EXPRESSIONS,
+            "label_kinds": LABEL_KINDS,
+            "params": _rows(c, "SELECT location, param, value, stderr, n, unit, fitted_at "
+                               "FROM room_params ORDER BY location, param"),
+            "labels": _rows(c, "SELECT location, kind, value, start_ts, end_ts, note "
+                               "FROM labels ORDER BY start_ts DESC LIMIT 12"),
+            "decays": _rows(c, "SELECT location, COUNT(*) n, "
+                               "ROUND(AVG(lambda_h), 2) mean_lambda, inferred "
+                               "FROM decay_events WHERE r2>=0.9 GROUP BY location, inferred"),
+            "forecast_error": _rows(c, "SELECT DATE(issued_at,'unixepoch') day, horizon_s, "
+                                       "COUNT(*) n, ROUND(AVG(ABS(actual-predicted)),1) mae "
+                                       "FROM predictions WHERE actual IS NOT NULL "
+                                       "GROUP BY day, horizon_s ORDER BY day DESC LIMIT 14"),
         }
 
 
@@ -241,6 +254,23 @@ def make_handler(db, collectors):
                         return self._send(404, {"error": "unknown or non-runnable collector"})
                     status, rows, err = run_collector(name, collectors[name].collect, db)
                     return self._send(200, {"status": status, "rows": rows, "error": err})
+                if u.path == "/api/label":
+                    try:
+                        start, end = int(body["start_ts"]), int(body["end_ts"])
+                    except (KeyError, TypeError, ValueError):
+                        return self._send(400, {"error": "start_ts/end_ts required"})
+                    kind, value = str(body.get("kind", "")), str(body.get("value", ""))[:40]
+                    if kind not in LABEL_KINDS or not value or end <= start:
+                        return self._send(400, {"error": "bad label"})
+                    db.add_label(str(body.get("location", ""))[:40], kind, value,
+                                 start, end, str(body.get("note", ""))[:200] or None)
+                    return self._send(200, {"ok": True})
+                if u.path == "/api/analyse":
+                    from analysis import analysis_human
+                    out = analysis_human.run(db)
+                    return self._send(200, {"decision": out.get("decision"),
+                                            "fits": out.get("fits"),
+                                            "strictness": out.get("strictness")})
                 if u.path == "/api/display":
                     expr, msg = str(body.get("expression", "")), str(body.get("message", ""))[:120]
                     if expr not in EXPRESSIONS or not msg:

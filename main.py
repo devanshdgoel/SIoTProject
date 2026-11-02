@@ -9,6 +9,10 @@ Week 1 commands (collection only):
   python main.py once [name ...]    run collectors once and print the outcome
   python main.py backfill --days 7  pull history for sources that offer it
   python main.py status             row counts, freshness and reliability per source
+  python main.py analyse            one pass: re-fit the rooms, decide, forecast
+  python main.py label bedroom window open --last 60
+                                    tell the system what was true (calibrates it)
+  python main.py params             what the system has learned about each room
   python main.py dashboard          monitoring UI at http://127.0.0.1:8050 (separate process)
   python main.py simulate --days 7 --db data/sim.db
                                     synthetic SCD40 week for developing analysis
@@ -20,6 +24,7 @@ import threading
 import time
 from datetime import datetime, timezone
 
+from analysis import analysis_human
 from collectors import grid_carbon, laqn, open_meteo, scd40, thames_water, ultrahuman
 from collectors.base import run_collector
 from config import settings
@@ -46,10 +51,28 @@ def _job_loop(name, module, db, stop):
         stop.wait(max(0.0, interval - (time.time() - t0)))
 
 
+def _analysis_loop(db, stop):
+    """Analysis runs on its own clock; it only ever reads what the collectors stored."""
+    while not stop.is_set():
+        t0 = time.time()
+        try:
+            d = analysis_human.run(db).get("decision")
+            log.info("%-13s %-7s %s", "analysis", "ok",
+                     f"{d['room']} {d['expression']} - {d['message']}" if d else "no rooms yet")
+        except Exception as e:  # noqa: BLE001 - analysis must never kill collection
+            log.warning("analysis failed: %s: %s", type(e).__name__, e)
+            db.log_analysis_run(analysis_human.MODULE, t0, (time.time() - t0) * 1000,
+                                "error", 0, f"{type(e).__name__}: {e}"[:300])
+        stop.wait(max(0.0, settings.ANALYSIS_INTERVAL_S - (time.time() - t0)))
+
+
 def cmd_collect(args, db):
     stop = threading.Event()
     threads = [threading.Thread(target=_job_loop, args=(n, m, db, stop), name=n, daemon=True)
                for n, m in COLLECTORS.items() if not args.only or n in args.only]
+    if not args.no_analysis:
+        threads.append(threading.Thread(target=_analysis_loop, args=(db, stop),
+                                        name="analysis", daemon=True))
     for t in threads:
         t.start()
     log.info("collecting into %s (Ctrl+C to stop)", db.path)
@@ -101,6 +124,79 @@ def cmd_status(args, db):
               f"{(r['avg_ms'] or 0):8.0f}  {_fmt(r['last_run']):13s}{_fmt(last):12s}{stale}")
 
 
+def _when(text, tz):
+    """Parse 14:00 (today), 2026-11-02 14:00, or now -> unix seconds."""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    zone = ZoneInfo(tz)
+    if text in (None, "now"):
+        return int(time.time())
+    today = datetime.now(zone)
+    for fmt, dated in (("%Y-%m-%d %H:%M", True), ("%H:%M", False)):
+        try:
+            got = datetime.strptime(text, fmt)
+        except ValueError:
+            continue
+        if not dated:
+            got = got.replace(year=today.year, month=today.month, day=today.day)
+        return int(got.replace(tzinfo=zone).timestamp())
+    raise SystemExit("cannot read time " + repr(text) + "; use HH:MM or YYYY-MM-DD HH:MM")
+
+
+def cmd_label(args, db):
+    """Ground truth from the user. A handful of these in the first days are what turn
+    the published defaults into this room's own measured numbers."""
+    if args.last:
+        end = int(time.time())
+        start = end - args.last * 60
+    else:
+        start, end = _when(args.start, settings.USER_TZ), _when(args.end, settings.USER_TZ)
+    if end <= start:
+        raise SystemExit("that label ends before it starts")
+    db.add_label(args.location, args.kind, args.value, start, end, args.note)
+    print(f"labelled {args.location} {args.kind}={args.value}  "
+          f"{_fmt(start)} -> {_fmt(end)} UTC  ({(end - start) / 60:.0f} min)")
+
+
+def cmd_params(args, db):
+    """What the system currently believes about each room, and how sure it is."""
+    from analysis.room_model import RoomModel, rooms
+    for name in rooms(db):
+        model = RoomModel(db, name)
+        print()
+        print(f"{name}  ({'learned' if model.learned else 'still on defaults'})")
+        for key, value in model.value.items():
+            err = model.stderr.get(key)
+            print(f"  {key:16s}{value:9.3f} {('+/-' + format(err, '.3f')) if err else '':10s}"
+                  f" n={model.n[key]:<4d} {model.basis[key]}")
+        if model.volume_m3:
+            print(f"  volume_m3       {model.volume_m3:9.1f}            inferred; check it with a tape measure")
+        rows = db.decays(name, min_r2=0.9)
+        if rows:
+            vent = sum(1 for r in rows if r["inferred"] == "ventilated")
+            print(f"  {len(rows)} usable decays: {len(rows) - vent} sealed, {vent} ventilated")
+
+
+def cmd_analyse(args, db):
+    out = analysis_human.run(db)
+    print(f"scored {out['scored']} past forecasts | strictness {out['strictness']} "
+          f"(recovery z={out['recovery_z']}) | quiet hours={out['quiet']}")
+    for name, fit in out["fits"].items():
+        extra = " ".join(f"{k}={v}" for k, v in fit.items()
+                         if k in ("c_out", "lambda_sealed", "lambda_open",
+                                  "source_ppm_h", "volume_m3"))
+        print(f"  {name:10s} points={fit['points']:<6d} spikes={fit['spikes']:<4d} "
+              f"decays={fit['decays']:<3d} plateaus={fit['plateaus']:<3d} {extra}")
+    d = out.get("decision")
+    print()
+    print(f"pet: [{d['expression']}] {d['message']}   (the {d['room']}, {d['severity']})"
+          if d else "no indoor data yet, so the pet has nothing to say")
+    if args.associations:
+        print()
+        print("overnight CO2 vs body (exploratory):",
+              analysis_human.night_associations(db))
+
+
 def cmd_dashboard(args, db):
     from dashboard.server import serve
     serve(db, COLLECTORS, args.port)
@@ -121,11 +217,21 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--db", help="database path (default: settings.DB_PATH)")
     sub = ap.add_subparsers(dest="cmd", required=True)
-    p = sub.add_parser("collect"); p.add_argument("--only", nargs="*"); p.set_defaults(fn=cmd_collect)
+    p = sub.add_parser("collect"); p.add_argument("--only", nargs="*")
+    p.add_argument("--no-analysis", action="store_true", help="collect only, skip the analysis loop")
+    p.set_defaults(fn=cmd_collect)
     p = sub.add_parser("once"); p.add_argument("names", nargs="*"); p.set_defaults(fn=cmd_once)
     p = sub.add_parser("backfill"); p.add_argument("--days", type=int, default=7)
     p.add_argument("--only", nargs="*"); p.set_defaults(fn=cmd_backfill)
     p = sub.add_parser("status"); p.set_defaults(fn=cmd_status)
+    p = sub.add_parser("analyse"); p.add_argument("--associations", action="store_true")
+    p.set_defaults(fn=cmd_analyse)
+    p = sub.add_parser("label", help="record ground truth: label bedroom window open --last 60")
+    p.add_argument("location"); p.add_argument("kind", choices=["window", "door", "occupancy", "cooking"])
+    p.add_argument("value"); p.add_argument("--last", type=int, metavar="MIN")
+    p.add_argument("--from", dest="start"); p.add_argument("--to", dest="end", default="now")
+    p.add_argument("--note"); p.set_defaults(fn=cmd_label)
+    p = sub.add_parser("params"); p.set_defaults(fn=cmd_params)
     p = sub.add_parser("dashboard"); p.add_argument("--port", type=int); p.set_defaults(fn=cmd_dashboard)
     p = sub.add_parser("simulate"); p.add_argument("--days", type=int, default=7); p.set_defaults(fn=cmd_simulate)
     args = ap.parse_args()
