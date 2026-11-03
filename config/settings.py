@@ -113,7 +113,9 @@ STALE_AFTER_S = {
     "scd40": 300,
     "open_meteo": 3 * 3600,
     "grid_carbon": 2 * 3600,   # 'actual' trails real time by ~1 h
-    "ultrahuman": 6 * 3600,
+    "ultrahuman": 12 * 3600,   # the ring syncs only when the phone app opens, so a
+                               # half-day lag is normal, not a fault. A real failure
+                               # shows up as a collector error, not as stale data.
     "thames_water": 3600,
     "laqn": 4 * 3600,      # ratification lag means the newest hour often trails
 }

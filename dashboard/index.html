@@ -1,343 +1,623 @@
 <!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Pet system dashboard</title>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Indoor air console</title>
 <script src="/chart.min.js"></script>
 <style>
-:root{--bg:#f4f5f7;--card:#fff;--ink:#1b2430;--mute:#667085;--line:#e3e6eb;--good:#1a7f4b;--warn:#b26a00;--bad:#c0392b;--idle:#8a94a3;
---accent:#2f6fed;--chip:#eef1f6}
-@media (prefers-color-scheme:dark){:root{--bg:#10151c;--card:#182029;--ink:#e6ebf2;--mute:#93a0b2;--line:#2a3441;--good:#3ecf8e;--warn:#f0b34a;--bad:#ff6b5e;--idle:#6f7b8c;--accent:#6ea0ff;--chip:#222c38}}
+:root{
+  --bg:#0c1116; --panel:#141b23; --panel2:#1b242e; --line:#243140;
+  --ink:#e6edf3; --mute:#8b9bab; --dim:#5d6f80;
+  --good:#3fb97f; --warn:#e2a23b; --bad:#e2574c; --cold:#4f93e8;
+  --desk:#4f93e8; --bedroom:#b07ae0; --accent:#3fb97f;
+  --mono:ui-monospace,"SF Mono",Menlo,Consolas,monospace;
+}
 *{box-sizing:border-box}
-body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.45 system-ui,Segoe UI,Roboto,sans-serif}
-header{display:flex;flex-wrap:wrap;gap:12px;align-items:center;padding:14px 20px;border-bottom:1px solid var(--line);background:var(--card);position:sticky;top:0;z-index:5}
-h1{font-size:18px;margin:0;font-weight:650}
-h2{font-size:13px;margin:0 0 10px;text-transform:uppercase;letter-spacing:.06em;color:var(--mute);font-weight:650}
-main{max-width:1320px;margin:0 auto;padding:16px 16px 40px;display:grid;grid-template-columns:repeat(auto-fit,minmax(min(380px,100%),1fr));gap:14px}
-.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px 16px;min-width:0}
-.span2{grid-column:1/-1}
-.pill{padding:3px 10px;border-radius:99px;font-weight:600;font-size:12.5px;background:var(--chip)}
-.pill.good{color:var(--good)}.pill.warn{color:var(--warn)}.pill.bad{color:var(--bad)}.pill.idle{color:var(--idle)}
-.dot{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:6px;background:var(--idle)}
-.dot.good{background:var(--good)}.dot.warn{background:var(--warn)}.dot.bad{background:var(--bad)}
-table{width:100%;border-collapse:collapse;font-size:13px}
-th{text-align:left;color:var(--mute);font-weight:600;padding:5px 8px;border-bottom:1px solid var(--line);white-space:nowrap}
-td{padding:5px 8px;border-bottom:1px solid var(--line);vertical-align:top}
-td.n,th.n{text-align:right;font-variant-numeric:tabular-nums}
-.scroll{overflow-x:auto;max-height:340px;overflow-y:auto}
-.mute{color:var(--mute)}.small{font-size:12px}
-.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px;margin-bottom:12px}
-.tile{background:var(--chip);border-radius:8px;padding:9px 11px}.tile b{display:block;font-size:20px;font-variant-numeric:tabular-nums}
-.bar{height:8px;background:var(--chip);border-radius:6px;overflow:hidden;margin-top:6px}.bar>i{display:block;height:100%;background:var(--accent)}
-button,select,input{font:inherit;color:var(--ink);background:var(--card);border:1px solid var(--line);border-radius:6px;padding:4px 9px}
-button{cursor:pointer}button:hover{border-color:var(--accent)}button:disabled{opacity:.5;cursor:default}
-.charts{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(420px,100%),1fr));gap:14px}
-.chartbox{position:relative;height:210px}.chartbox .empty{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:var(--mute)}
-.chartbox .empty[hidden]{display:none}
-canvas#oled{image-rendering:pixelated;width:100%;max-width:512px;aspect-ratio:2/1;background:#000;border-radius:8px;border:6px solid #222;display:block}
-.row{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
-code{background:var(--chip);padding:1px 5px;border-radius:4px;font-size:12px}
-.err{color:var(--bad)}
-@media(max-width:520px){main{grid-template-columns:1fr}.charts{grid-template-columns:1fr}}
-</style>
-</head>
-<body>
+body{margin:0;background:var(--bg);color:var(--ink);
+  font:13px/1.45 system-ui,-apple-system,Segoe UI,sans-serif}
+h2{font:600 11px/1 system-ui;letter-spacing:.09em;text-transform:uppercase;
+  color:var(--mute);margin:0 0 10px}
+a{color:var(--cold)}
+.wrap{padding:14px;max-width:1700px;margin:0 auto}
+
+/* ---- top bar ---- */
+header{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:14px}
+header h1{font:600 15px/1 system-ui;margin:0;letter-spacing:.02em}
+.pill{padding:3px 9px;border-radius:999px;font:600 11px/1.5 var(--mono);
+  border:1px solid transparent;white-space:nowrap}
+.pill.good{background:#113326;color:#6ee7a8;border-color:#1d5c43}
+.pill.warn{background:#3a2c10;color:#f0c274;border-color:#6b4f1b}
+.pill.bad{background:#3a1715;color:#ff9a90;border-color:#6d2a25}
+.pill.flat{background:var(--panel2);color:var(--mute);border-color:var(--line)}
+.spacer{flex:1}
+select,input,button{background:var(--panel2);color:var(--ink);border:1px solid var(--line);
+  border-radius:6px;padding:5px 8px;font:12px var(--mono)}
+button{cursor:pointer}
+button:hover{border-color:var(--dim)}
+button.go{background:#17382a;border-color:#2b6b4f;color:#8ff0bd}
+
+/* ---- grid ---- */
+.grid{display:grid;grid-template-columns:repeat(12,1fr);gap:12px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:12px}
+.c3{grid-column:span 3}.c4{grid-column:span 4}.c5{grid-column:span 5}
+.c6{grid-column:span 6}.c7{grid-column:span 7}.c8{grid-column:span 8}.c12{grid-column:span 12}
+@media(max-width:1200px){.c3,.c4,.c5,.c6,.c7,.c8{grid-column:span 12}}
+
+/* ---- pet ---- */
+.pet{display:flex;gap:16px;align-items:center}
+.face{flex:0 0 108px}
+.face svg{display:block}
+@keyframes breathe{0%,100%{transform:scale(1)}50%{transform:scale(1.045)}}
+#faceG{transform-origin:60px 60px;animation:breathe 5s ease-in-out infinite}
+.say{font:600 20px/1.25 system-ui}
+.sub{color:var(--mute);font:12px var(--mono);margin-top:5px}
+
+/* ---- room cards ---- */
+.room{display:grid;grid-template-columns:150px 1fr;gap:14px;align-items:start}
+.big{font:700 42px/1 var(--mono);letter-spacing:-.02em}
+.unit{font:600 12px var(--mono);color:var(--mute)}
+.kv{display:grid;grid-template-columns:auto 1fr;gap:3px 10px;font:12px var(--mono)}
+.kv b{color:var(--mute);font-weight:400}
+.spark{height:52px}
+.bar{height:5px;border-radius:3px;background:var(--panel2);overflow:hidden;margin-top:8px}
+.bar i{display:block;height:100%}
+
+/* ---- tables ---- */
+table{width:100%;border-collapse:collapse;font:12px var(--mono)}
+th{text-align:left;color:var(--dim);font-weight:500;padding:3px 7px 5px;
+  border-bottom:1px solid var(--line);white-space:nowrap}
+td{padding:3px 7px;border-bottom:1px solid #1a2129;white-space:nowrap}
+tr:last-child td{border-bottom:none}
+tr:hover td{background:#192029}
+.num{text-align:right}
+.scroll{max-height:230px;overflow:auto}
+.scroll::-webkit-scrollbar{width:8px;height:8px}
+.scroll::-webkit-scrollbar-thumb{background:#2a3744;border-radius:4px}
+.mute{color:var(--mute)}.dim{color:var(--dim)}
+.tag{padding:1px 6px;border-radius:4px;font:600 10px var(--mono);border:1px solid var(--line)}
+.tag.learned{background:#113326;color:#6ee7a8;border-color:#1d5c43}
+.tag.default{background:#22282f;color:var(--mute)}
+.tag.sealed{background:#1a2b3d;color:#8fc0f5}
+.tag.vent{background:#2d2340;color:#cda8f0}
+.chartbox{position:relative;height:230px}
+.chartbox.tall{height:290px}
+.empty{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
+  color:var(--dim);font:12px var(--mono)}
+.empty[hidden]{display:none}
+.row{display:flex;gap:7px;flex-wrap:wrap;align-items:center}
+.hint{color:var(--dim);font-size:11px;margin-top:7px;line-height:1.5}
+.err{color:#ff9a90;font:12px var(--mono)}
+</style></head>
+<body><div class="wrap">
+
 <header>
-  <h1>Pet system dashboard</h1>
-  <span id="overall" class="pill idle">loading…</span>
-  <span class="mute small" id="meta"></span>
-  <span style="flex:1"></span>
-  <label class="small mute">Chart range
-    <select id="range"><option value="6">6 h</option><option value="24" selected>24 h</option><option value="168">7 days</option><option value="336">14 days</option></select>
-  </label>
+  <h1>Indoor air console</h1>
+  <span class="pill flat" id="overall">connecting</span>
+  <span class="pill flat" id="strict"></span>
+  <span class="spacer"></span>
+  <span class="dim" id="meta"></span>
+  <label class="dim">range
+    <select id="range">
+      <option value="6">6 h</option><option value="24" selected>24 h</option>
+      <option value="72">3 d</option><option value="168">7 d</option>
+    </select></label>
+  <button id="refresh">refresh</button>
 </header>
-<main>
-  <section class="card span2"><h2>Collectors</h2><div class="scroll" id="collectors"></div></section>
 
-  <section class="card"><h2>Storage</h2><div id="tiles" class="tiles"></div><div id="week"></div>
-    <h2 style="margin-top:14px">Rows per day (14 d)</h2><div class="chartbox" style="height:170px"><canvas id="perday"></canvas></div></section>
+<div class="grid">
 
-  <section class="card"><h2>Sensor node (ESP32)</h2><div id="devices"></div>
-    <h2 style="margin-top:14px">SCD40 gaps &gt; 5 min (14 d)</h2><div id="gaps" class="scroll" style="max-height:200px"></div></section>
-
-  <section class="card span2"><h2>Live signals</h2><div class="charts" id="charts"></div></section>
-
-  <section class="card"><h2>Pet display</h2>
-    <canvas id="oled" width="128" height="64"></canvas>
-    <div id="displayMeta" class="small mute" style="margin:8px 0"></div>
-    <div class="row"><select id="expr"></select><input id="msg" maxlength="120" placeholder="Test message" value="Test message" style="flex:1;min-width:140px"><button id="setDisplay">Show test state</button></div>
-    <div class="small mute" style="margin-top:6px">Writes a <code>test</code> row to <code>display_log</code>. The pet controller will write <code>live</code> rows to the same table.</div>
-    <div id="displayLog" class="scroll" style="margin-top:8px;max-height:170px"></div></section>
-
-  <section class="card span2"><h2>What the system has learned</h2>
-    <div id="learned"></div>
-    <div class="small mute" style="margin-top:6px">Tell it what was true. A few of these in the
-      first days turn the published defaults into this room&rsquo;s own measured numbers.</div>
-    <div style="margin-top:6px;display:flex;gap:6px;flex-wrap:wrap;align-items:center">
-      <input id="lbRoom" placeholder="room" value="bedroom" size="8">
-      <select id="lbKind"></select>
-      <input id="lbValue" placeholder="open" value="open" size="7">
-      <label class="small mute">last <input id="lbMins" type="number" value="60" min="5" max="1440" size="4"> min</label>
-      <button id="addLabel">Add label</button>
-      <button id="runAnalysis">Analyse now</button>
-      <span class="small mute" id="lbMsg"></span>
+  <section class="card c4"><h2>The pet right now</h2>
+    <div class="pet">
+      <div class="face"><svg viewBox="0 0 120 120" width="108" height="108">
+        <g id="faceG"><circle cx="60" cy="60" r="44" id="fHead" fill="none" stroke-width="3"/>
+        <g id="fEyes"></g><path id="fMouth" fill="none" stroke-width="3" stroke-linecap="round"/>
+        <g id="fBrows" stroke-width="3" stroke-linecap="round"></g></g></svg></div>
+      <div><div class="say" id="petMsg">—</div>
+        <div class="sub" id="petWho"></div>
+        <div class="sub" id="petBasis"></div></div>
     </div>
-    <div id="labels" class="scroll" style="margin-top:8px;max-height:150px"></div>
-    <div id="fcErr" class="small mute" style="margin-top:6px"></div></section>
+    <div class="row" style="margin-top:12px">
+      <button class="go" id="runAnalysis">run analysis</button>
+      <select id="expr"></select>
+      <input id="msg" placeholder="test message" size="14">
+      <button id="setDisplay">push to node</button>
+    </div>
+    <div class="hint" id="petHint"></div>
+  </section>
 
-  <section class="card"><h2>Analysis &amp; events</h2><div id="components"></div>
-    <h2 style="margin-top:14px">Detected events</h2><div id="events" class="scroll" style="max-height:200px"></div>
-    <h2 style="margin-top:14px">Analysis runs</h2><div id="aruns" class="scroll" style="max-height:160px"></div></section>
+  <section class="card c8"><h2>Rooms</h2><div id="rooms"></div></section>
 
-  <section class="card"><h2>Thames Water alerts</h2><div id="alerts"></div>
-    <h2 style="margin-top:14px">Recent collector errors</h2><div id="errors" class="scroll" style="max-height:220px"></div></section>
+  <section class="card c8"><h2>Indoor CO₂ — both rooms, with what you told it</h2>
+    <div class="chartbox tall"><canvas id="chCo2"></canvas>
+      <div class="empty" id="emCo2" hidden>no data in this range</div></div>
+    <div class="hint">Shaded bands are your labels: blue = someone in the room, violet = window open.
+      Dotted lines mark 1000 and 1400 ppm.</div></section>
 
-  <section class="card"><h2>Configuration</h2><div id="config"></div></section>
+  <section class="card c4"><h2>Air-change rate per decay</h2>
+    <div class="chartbox tall"><canvas id="chDecay"></canvas>
+      <div class="empty" id="emDecay" hidden>no decays fitted yet</div></div>
+    <div class="hint">Every empty-room decay the system found, as air changes per hour.
+      A window should sit several times higher than a sealed room — that gap is what the
+      sealed/ventilated split is read from.</div></section>
 
-  <section class="card span2"><h2>Stored metrics</h2>
-    <div class="row" style="margin-bottom:8px"><input id="filter" placeholder="Filter source / metric…" style="min-width:240px"></div>
-    <div class="scroll" id="metrics"></div></section>
-</main>
+  <section class="card c7"><h2>What it has worked out</h2>
+    <div id="learned"></div></section>
+
+  <section class="card c5"><h2>Overnight exposure vs the morning after</h2>
+    <div id="nights"></div>
+    <div class="hint">Measured over the sleep window the ring actually recorded, not an
+      assumed bedtime. Associations here are exploratory and drive nothing.</div></section>
+
+  <section class="card c5"><h2>Wearable</h2>
+    <div id="bodyNow"></div>
+    <div class="hint" id="syncHint"></div>
+    <div class="scroll" style="margin-top:10px;max-height:190px" id="sleepTable"></div></section>
+
+  <section class="card c7"><h2>Heart rate &amp; HRV</h2>
+    <div class="chartbox"><canvas id="chBody"></canvas>
+      <div class="empty" id="emBody" hidden>no ring data in this range</div></div>
+    <div class="hint">Shaded spans are the sleep windows the ring recorded; those are the
+      windows overnight CO₂ exposure is measured over.</div></section>
+
+  <section class="card c5"><h2>Tell it what was true</h2>
+    <div class="row">
+      <select id="lbRoom"></select>
+      <select id="lbKind"></select>
+      <input id="lbValue" value="open" size="8">
+      <label class="dim">last <input id="lbMins" type="number" value="60" min="5" max="1440" style="width:62px"> min</label>
+      <button class="go" id="addLabel">add label</button>
+      <span class="dim" id="lbMsg"></span>
+    </div>
+    <div class="scroll" style="margin-top:9px;max-height:200px" id="labels"></div></section>
+
+  <section class="card c7"><h2>Forecast accuracy</h2>
+    <div class="chartbox"><canvas id="chErr"></canvas>
+      <div class="empty" id="emErr" hidden>no forecasts scored yet — they are scored once their target time passes</div></div>
+    <div class="hint">Mean absolute error of CO₂ forecasts, by the day they were issued.
+      Each one was written down before its outcome was known.</div></section>
+
+  <section class="card c4"><h2>Sensor nodes</h2><div id="devices"></div></section>
+  <section class="card c4"><h2>Collectors</h2><div class="scroll" id="collectors"></div></section>
+  <section class="card c4"><h2>Storage</h2><div id="storage"></div></section>
+
+  <section class="card c6"><h2>Events &amp; analysis runs</h2>
+    <div class="scroll" id="events"></div></section>
+  <section class="card c6"><h2>Recent errors</h2>
+    <div class="scroll" id="errors"></div></section>
+
+  <section class="card c12"><h2>Configuration</h2><div id="config"></div></section>
+</div></div>
 
 <script>
 const $ = s => document.querySelector(s);
-const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
-const t = ts => ts ? new Date(ts*1000).toLocaleString([], {month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'}) : '–';
-const ago = ts => { if(!ts) return '–'; const s = Math.max(0, Date.now()/1000 - ts);
-  return s<90 ? Math.round(s)+' s ago' : s<5400 ? Math.round(s/60)+' min ago' : s<172800 ? (s/3600).toFixed(1)+' h ago' : Math.round(s/86400)+' d ago'; };
-const dur = s => s==null ? '–' : s<90 ? Math.round(s)+' s' : s<5400 ? Math.round(s/60)+' min' : (s/3600).toFixed(1)+' h';
-const num = (v,d=1) => v==null ? '–' : Math.abs(v)>=1000 ? Math.round(v).toLocaleString() : (+v).toFixed(d).replace(/\.0+$/,'');
-const bytes = b => b<1e6 ? (b/1e3).toFixed(0)+' kB' : (b/1e6).toFixed(1)+' MB';
-const table = (head, rows, cls=[]) => '<table><tr>'+head.map((h,i)=>`<th class="${cls[i]||''}">${h}</th>`).join('')+'</tr>'+
-  rows.map(r=>'<tr>'+r.map((c,i)=>`<td class="${cls[i]||''}">${c}</td>`).join('')+'</tr>').join('')+'</table>';
-const empty = msg => `<div class="mute">${msg}</div>`;
-const post = (url, body) => fetch(url, {method:'POST', headers:{'X-Requested-With':'dashboard','Content-Type':'application/json'}, body:JSON.stringify(body||{})}).then(r=>r.json());
-let S = null, perDayChart = null;
-
-function health(h){ return `<span class="dot ${h}"></span>`; }
-
-function renderCollectors(){
-  $('#collectors').innerHTML = table(
-    ['Collector','Status','Every','Last run','Last OK','Newest data','24 h ok / err','Latency p50 / p95',''],
-    S.collectors.map(c => [`${health(c.health)}<b>${esc(c.name)}</b>`,
-      `<span class="${c.health==='bad'?'err':'mute'}">${esc(c.why)}</span>${c.fail_streak>1?` <b class="err">(${c.fail_streak} failures in a row)</b>`:''}`,
-      dur(c.interval_s), ago(c.last_run), ago(c.last_ok),
-      c.newest_data ? `${ago(c.newest_data)} <span class="mute small">(limit ${dur(c.stale_limit_s)})</span>` : '–',
-      `${c.ok_24h} / <span class="${c.err_24h?'err':''}">${c.err_24h}</span>`,
-      c.p50_ms==null ? '–' : `${c.p50_ms} / ${c.p95_ms} ms`,
-      c.can_run ? `<button data-run="${c.name}">Run now</button>` : '<span class="mute small">runs continuously</span>']));
-  document.querySelectorAll('[data-run]').forEach(b => b.onclick = async () => {
-    b.disabled = true; b.textContent = 'Running…';
-    const r = await post('/api/run/'+b.dataset.run);
-    b.textContent = r.status==='ok' ? `ok, ${r.rows} rows` : (r.status||'error'); if(r.error) b.title = r.error;
-    setTimeout(refresh, 600);
-  });
+const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const t = u => u ? new Date(u*1000).toLocaleString([], {month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'}) : '—';
+const hm = u => u ? new Date(u*1000).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'}) : '—';
+const ago = u => { if(!u) return '—'; const s = Date.now()/1000-u;
+  return s<90?`${s|0}s`:s<5400?`${s/60|0}m`:s<172800?`${s/3600|0}h`:`${s/86400|0}d`; };
+const n1 = v => v==null||isNaN(v) ? '—' : (+v).toFixed(1);
+const n0 = v => v==null||isNaN(v) ? '—' : Math.round(v).toLocaleString();
+function table(head, rows){
+  if(!rows.length) return '<span class="dim">nothing yet</span>';
+  return `<table><thead><tr>${head.map(h=>`<th>${esc(h)}</th>`).join('')}</tr></thead><tbody>`
+    + rows.map(r=>`<tr>${r.map(c=>`<td>${c==null?'<span class="dim">—</span>':c}</td>`).join('')}</tr>`).join('')
+    + '</tbody></table>';
 }
-
-function renderStorage(){
-  const st = S.storage, w = st.week, tb = st.tables;
-  $('#tiles').innerHTML = [
-    ['Observations', st.observations.toLocaleString()], ['Forecast rows', st.forecast_rows.toLocaleString()],
-    ['Database size', bytes(st.db_bytes)], ['Collector runs', tb.collector_runs.toLocaleString()],
-    ['Sleep nights', tb.sleep_sessions], ['Raw payloads', tb.raw_responses],
-    ['Flagged partial / suspect', `${st.partial} / ${st.suspect}`], ['Overflow alerts', tb.overflow_alerts.toLocaleString()],
-  ].map(([k,v]) => `<div class="tile"><span class="mute small">${k}</span><b>${v}</b></div>`).join('');
-  const pct = Math.min(100, 100*w.days/w.target_days);
-  $('#week').innerHTML = w.rows
-    ? `<div class="small">SCD40 coverage: <b>${w.days.toFixed(2)} of ${w.target_days} days</b> <span class="mute">(first reading ${t(w.first)}, ${w.rows.toLocaleString()} rows)</span></div><div class="bar"><i style="width:${pct}%"></i></div>`
-    : `<div class="small mute">No SCD40 readings yet — the ${w.target_days}-day collection window has not started.</div>`;
-  $('#gaps').innerHTML = st.gaps.length ? table(['From','To','Length'], st.gaps.map(g=>[t(g.gap_start),t(g.gap_end),dur(g.gap_s)]))
-    : empty(w.rows ? 'No gaps longer than 5 minutes.' : 'No SCD40 data yet.');
-  const days = [...new Set(st.per_day.map(r=>r.d))].sort(), srcs = [...new Set(st.per_day.map(r=>r.source))];
-  const pal = ['#2f6fed','#1a9e6a','#d98c1f','#c0507a','#7a5fd0'];
-  const data = {labels: days.map(d=>new Date(d*86400000).toISOString().slice(5,10)),
-    datasets: srcs.map((s,i)=>({label:s, backgroundColor:pal[i%pal.length], data:days.map(d=>(st.per_day.find(r=>r.d===d&&r.source===s)||{}).n||0)}))};
-  if(typeof Chart==='undefined') return;
-  if(perDayChart){ perDayChart.data = data; perDayChart.update('none'); }
-  else perDayChart = new Chart($('#perday'), {type:'bar', data, options:{responsive:true, maintainAspectRatio:false,
-    scales:{x:{stacked:true,grid:{display:false}}, y:{stacked:true}}, plugins:{legend:{labels:{boxWidth:10}}}}});
+async function post(path, body){
+  try{ const r = await fetch(path, {method:'POST',
+    headers:{'Content-Type':'application/json','X-Requested-With':'dashboard'},
+    body:JSON.stringify(body)}); return await r.json(); }
+  catch(e){ return {error:String(e)}; }
 }
+const co2Colour = v => v==null ? 'var(--dim)' : v>=1400 ? 'var(--bad)' : v>=1000 ? 'var(--warn)'
+                     : v>=800 ? '#b9c74a' : 'var(--good)';
+const roomColour = r => r==='bedroom' ? getComputedStyle(document.body).getPropertyValue('--bedroom')
+                                      : getComputedStyle(document.body).getPropertyValue('--desk');
 
-function renderDevices(){
-  const be = S.config.scd40_backend;
-  $('#devices').innerHTML = (S.devices.length ? table(['Device','Status','Last contact','From','Accepted / rejected','Last batch','Backlog age'],
-    S.devices.map(d => { const live = Date.now()/1000 - d.last_seen < 300;
-      return [`<b>${esc(d.device)}</b>`, `${health(live?'good':'bad')}${live?'online':'offline'}`, ago(d.last_seen), esc(d.remote_addr||'–'),
-        `${d.accepted_total.toLocaleString()} / <span class="${d.rejected_total?'err':''}">${d.rejected_total}</span>`,
-        d.last_batch ?? '–', dur(d.oldest_age_s)]; }))
-    : empty(be==='http' ? 'No ESP32 has contacted the ingest endpoint yet. Check WiFi, token and firewall (TCP '+S.config.ingest_port+').'
-                        : `SCD40 backend is <code>${esc(be)}</code>; the ESP32 ingest path is not in use.`));
-}
+let S = null, R = null, N = null;
 
-function renderComponents(){
-  const badge = s => `<span class="pill ${s==='implemented'?'good':s==='error'?'bad':'idle'}">${s}</span>`;
-  $('#components').innerHTML = Object.entries(S.components).map(([dir, items]) =>
-    `<div class="small" style="margin-bottom:6px"><b>${dir}/</b> ` + items.map(i=>`${esc(i.file)} ${badge(i.status)}`).join(' &nbsp; ')+'</div>').join('');
-  $('#events').innerHTML = S.events.length ? table(['Start','Type','Severity','Conf.','Key'],
-    S.events.map(e=>[t(e.event_start), esc(e.event_type), esc(e.severity), e.confidence==null?'–':e.confidence.toFixed(2), `<span class="small mute">${esc(e.dedupe_key)}</span>`]))
-    : empty('No events detected yet (analysis not run, or nothing met the rules).');
-  $('#aruns').innerHTML = S.analysis_runs.length ? table(['Module','When','Duration','Status','Events'],
-    S.analysis_runs.map(r=>[esc(r.module), ago(r.started_at), r.duration_ms+' ms', `<span class="${r.status==='error'?'err':''}">${r.status}</span>`, r.n_events]), ['','','n','','n'])
-    : empty('No analysis runs recorded yet.');
-}
-
-function renderMisc(){
-  $('#alerts').innerHTML = S.alerts.length ? table(['When','Overflow','Type'], S.alerts.map(a=>[t(a.event_ts), esc(a.location_name), esc(a.alert_type)]))
-    : empty(S.config.secrets_present.THAMES_CLIENT_ID ? 'No alerts stored yet.' : 'Thames Water credentials are not set — collector is skipped.');
-  $('#errors').innerHTML = S.errors.length ? table(['When','Collector','Error'], S.errors.map(e=>[ago(e.started_at), esc(e.collector), `<span class="err small">${esc(e.error)}</span>`]))
-    : empty('No errors recorded.');
-  const c = S.config;
-  $('#config').innerHTML = table(['Setting','Value'], [
-    ['SCD40 backend', `<code>${esc(c.scd40_backend)}</code>`],
-    ['Locations', Object.entries(c.locations).map(([k,v])=>`${esc(k)}: ${v[0].toFixed(4)}, ${v[1].toFixed(4)}`).join('<br>')],
-    ['Poll intervals', Object.entries(c.intervals_s).map(([k,v])=>`${esc(k)} ${dur(v)}`).join(' · ')],
-    ['Staleness limits', Object.entries(c.stale_after_s).map(([k,v])=>`${esc(k)} ${dur(v)}`).join(' · ')],
-    ['Secrets in .env', Object.entries(c.secrets_present).map(([k,v])=>`<span class="${v?'':'err'}">${v?'✓':'✗'} ${k}</span>`).join('<br>')],
-    ['Database', `<code>${esc(S.storage.db_path)}</code>`]]);
-  const q = $('#filter').value.toLowerCase();
-  const rows = S.storage.metrics.filter(m => !q || (m.source+' '+m.metric).toLowerCase().includes(q));
-  $('#metrics').innerHTML = table(['Source','Metric','Location','Kind','Rows','Completeness','First','Last','Last value'],
-    rows.map(m=>[esc(m.source), `<b>${esc(m.metric)}</b>`, esc(m.location), esc(m.kind), m.n.toLocaleString(),
-      m.completeness==null?'<span class="mute">–</span>':`<span class="${m.completeness<0.9?'err':''}">${(100*m.completeness).toFixed(1)}%</span>`,
-      t(m.first_ts), t(m.last_ts), `${num(m.last_value,2)} <span class="mute small">${esc(m.unit||'')}</span>`]), ['','','','','n','n','','','n']);
-}
-
-/* ---------- pet display preview (128x64 mono OLED mock) ---------- */
-function drawFace(ctx, ex){
-  ctx.strokeStyle = ctx.fillStyle = '#9ff0ff'; ctx.lineWidth = 2; ctx.lineCap = 'round';
-  const eye = (x,y,w=7,h=10) => ctx.fillRect(x,y,w,h);
-  const arc = (x,y,r,a,b,ccw) => { ctx.beginPath(); ctx.arc(x,y,r,a,b,ccw); ctx.stroke(); };
-  const line = (a,b,c,d) => { ctx.beginPath(); ctx.moveTo(a,b); ctx.lineTo(c,d); ctx.stroke(); };
-  if(ex==='happy'){ arc(18,26,6,Math.PI,0); arc(46,26,6,Math.PI,0); arc(32,38,10,0.1,Math.PI-0.1); }
-  else if(ex==='sleepy'){ line(12,28,24,28); line(40,28,52,28); line(28,46,36,46); ctx.font='bold 9px monospace'; ctx.fillText('z',54,18); ctx.fillText('z',58,10); }
-  else if(ex==='alert'){ eye(14,16,10,16); eye(40,16,10,16); arc(32,46,5,0,Math.PI*2); }
-  else if(ex==='concerned'){ eye(15,25,7,10); eye(42,25,7,10); line(11,21,24,16); line(53,21,40,16); line(25,49,31,47); line(31,47,39,49); }
-  else if(ex==='sad'){ eye(15,24,7,10); eye(42,24,7,10); line(11,20,24,16); line(53,20,40,16); arc(32,54,10,Math.PI*1.15,Math.PI*1.85); ctx.fillRect(18,37,2,6); }
-  else { eye(15,22,7,12); eye(42,22,7,12); line(24,46,40,46); }
-}
-function renderLearned(){
-  const byRoom = {};
-  (S.params||[]).forEach(p=>{ (byRoom[p.location] = byRoom[p.location] || []).push(p); });
-  const decays = {};
-  (S.decays||[]).forEach(d=>{ decays[d.location] = (decays[d.location]||[]).concat(
-    [`${d.n} ${esc(d.inferred||'?')} (mean ${d.mean_lambda}/h)`]); });
-  const rooms = Object.keys(byRoom);
-  $('#learned').innerHTML = rooms.length ? rooms.map(r=>{
-    const rows = byRoom[r].map(p=>[esc(p.param),
-      p.value==null?'-':(+p.value).toFixed(p.param==='c_out'||p.param==='source_ppm_h'?1:3),
-      p.stderr==null?'':'±'+(+p.stderr).toFixed(3), p.n, esc(p.unit||''), ago(p.fitted_at)]);
-    return `<div style="margin-bottom:8px"><b>${esc(r)}</b> <span class="small mute">`
-      + (decays[r] ? decays[r].join(' · ') : 'no usable decays yet') + `</span>`
-      + table(['parameter','value','± s.e.','n','unit','fitted'], rows) + `</div>`;
-  }).join('') : '<span class="small mute">Nothing learned yet — the analysis needs indoor data.</span>';
-  $('#labels').innerHTML = (S.labels||[]).length
-    ? table(['Room','What','Value','From','To'], S.labels.map(l=>[esc(l.location), esc(l.kind),
-        esc(l.value), t(l.start_ts), t(l.end_ts)]))
-    : '<span class="small mute">No labels yet.</span>';
-  $('#fcErr').textContent = (S.forecast_error||[]).length
-    ? 'Forecast error (mean absolute, ppm): ' + S.forecast_error.map(
-        f=>`${f.day} @${f.horizon_s/60}min n=${f.n} MAE ${f.mae}`).join('  |  ')
-    : 'No scored forecasts yet — they are scored once their target time passes.';
-  if(!$('#lbKind').options.length) (S.label_kinds||[]).forEach(k=>$('#lbKind').add(new Option(k,k)));
-}
-
-function renderDisplay(){
-  const cv = $('#oled'), ctx = cv.getContext('2d'), cur = S.display[0];
-  cv.width = 128; cv.height = 64; ctx.fillStyle = '#000'; ctx.fillRect(0,0,128,64);
-  drawFace(ctx, cur ? cur.expression : 'neutral');
-  ctx.fillStyle = '#9ff0ff'; ctx.font = '8px monospace';
-  const words = (cur ? cur.message : 'No display state').split(' '); let line = '', y = 12;
-  for(const w of words){ const tryL = line ? line+' '+w : w;
-    if(ctx.measureText(tryL).width > 60 && line){ ctx.fillText(line, 66, y); y += 10; line = w; } else line = tryL; }
-  if(y < 62) ctx.fillText(line, 66, y);
-  $('#displayMeta').innerHTML = cur
-    ? `Current: <b>${esc(cur.expression)}</b> · <span class="pill ${cur.mode==='live'?'good':'warn'}">${cur.mode}</span> · set ${ago(cur.ts)}${cur.task?` · task: ${esc(cur.task)}`:''}${cur.event_id?` · event #${cur.event_id}`:''}`
-    : 'No display state recorded yet — the pet controller is not built. Use the test controls to preview an expression.';
-  $('#displayLog').innerHTML = S.display.length ? table(['When','Expression','Message','Mode'], S.display.map(d=>[ago(d.ts), esc(d.expression), esc(d.message), d.mode])) : '';
-}
-
-/* ---------- live-signal charts ---------- */
-const CHARTS = [
-  {id:'co2', title:'Indoor CO₂ (ppm)', lines:[1000,1500], series:[{m:'co2_ppm', loc:'desk', label:'CO₂ desk'},{m:'co2_ppm', loc:'bedroom', label:'CO₂ bedroom'}]},
-  {id:'indoor', title:'Indoor temperature (°C) and humidity (%)', series:[{m:'indoor_temp_c', loc:'desk', label:'Temp desk'},{m:'indoor_rh_pct', loc:'desk', label:'RH desk', axis:'y1'},
-      {m:'indoor_temp_c', loc:'bedroom', label:'Temp bedroom'},{m:'indoor_rh_pct', loc:'bedroom', label:'RH bedroom', axis:'y1'}]},
-  {id:'air', title:'Outdoor air quality (µg/m³): CAMS model cell vs LAQN analysers', series:[{m:'pm2_5',loc:'home',label:'PM2.5 model'},{m:'pm2_5',loc:'KC1',label:'PM2.5 KC1'},{m:'no2',loc:'home',label:'NO₂ model'},{m:'no2',loc:'KC5',label:'NO₂ KC5'}]},
-  {id:'wx', title:'Outdoor temperature (°C) and wind (m/s)', series:[{m:'outdoor_temp_c',loc:'home',label:'Temp °C'},{m:'wind_ms',loc:'home',label:'Wind m/s',axis:'y1'}]},
-  {id:'carbon', title:'Grid carbon intensity (gCO₂/kWh)', series:[{m:'carbon_actual_gco2_kwh',loc:'GB',label:'Actual (GB)'},
-      {m:'carbon_forecast_gco2_kwh',loc:'London',label:'Forecast (London)',kind:'forecast',ahead:48,dash:true}]},
-  {id:'body', title:'Wearable: heart rate (bpm) and HRV (ms)', series:[{m:'hr_bpm',loc:'user',label:'HR'},{m:'hrv_ms',loc:'user',label:'HRV',axis:'y1'}]},
-  {id:'thames', title:'Thames Water overflows discharging', series:[{m:'overflows_discharging',loc:'thames_region',label:'Discharging'}]},
-];
-const charts = {};
-function buildCharts(){
-  $('#charts').innerHTML = CHARTS.map(c=>`<div><div class="small mute" style="margin-bottom:4px"><b>${c.title}</b></div><div class="chartbox"><canvas id="ch_${c.id}"></canvas><div class="empty" id="em_${c.id}" hidden>No data in this range</div></div></div>`).join('');
-  const colors = ['#2f6fed','#d98c1f','#1a9e6a','#c0507a'];
-  for(const c of CHARTS){
-    const dual = c.series.some(s=>s.axis);
-    charts[c.id] = new Chart($('#ch_'+c.id), {type:'line', data:{datasets:[]}, options:{
-      responsive:true, maintainAspectRatio:false, animation:false, parsing:false, interaction:{mode:'nearest',axis:'x',intersect:false},
-      elements:{point:{radius:0}, line:{borderWidth:1.6}},
-      scales:{x:{type:'linear', ticks:{maxTicksLimit:7, callback:v=>new Date(v).toLocaleString([], {month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'})}},
-              y:{position:'left'}, ...(dual?{y1:{position:'right', grid:{drawOnChartArea:false}}}:{})},
-      plugins:{legend:{labels:{boxWidth:10}}, tooltip:{callbacks:{title:i=>new Date(i[0].parsed.x).toLocaleString()}}}}});
-    charts[c.id]._colors = colors;
+/* ---------------- the face ---------------- */
+function drawFace(expr, co2){
+  const ink = {happy:'#6ee7a8', neutral:'#9fb3c6', concerned:'#f0c274',
+               alert:'#ff9a90', sleepy:'#9a8fd0', sad:'#8fb0d8'}[expr] || '#9fb3c6';
+  $('#fHead').setAttribute('stroke', ink);
+  const eyes = $('#fEyes'), brows = $('#fBrows'), mouth = $('#fMouth');
+  eyes.innerHTML = ''; brows.innerHTML = ''; eyes.setAttribute('fill', ink);
+  mouth.setAttribute('stroke', ink); brows.setAttribute('stroke', ink);
+  const ex = 16, ey = 12;
+  if(expr === 'sleepy'){
+    eyes.innerHTML = [-1,1].map(s=>`<path d="M${60+s*ex-7},${60-ey} q7,6 14,0" fill="none"
+      stroke="${ink}" stroke-width="3" stroke-linecap="round"/>`).join('');
+  } else if(expr === 'alert'){
+    eyes.innerHTML = [-1,1].map(s=>`<circle cx="${60+s*ex}" cy="${60-ey}" r="6.5" fill="none"
+      stroke="${ink}" stroke-width="3"/>`).join('');
+  } else {
+    eyes.innerHTML = [-1,1].map(s=>`<circle cx="${60+s*ex}" cy="${60-ey}" r="4.2"/>`).join('');
   }
+  if(expr === 'happy')      mouth.setAttribute('d','M44,72 q16,16 32,0');
+  else if(expr === 'sad')   mouth.setAttribute('d','M44,80 q16,-16 32,0');
+  else if(expr === 'alert') mouth.setAttribute('d','M50,78 q10,10 20,0 q-10,6 -20,0');
+  else                      mouth.setAttribute('d','M46,76 L74,76');
+  if(expr === 'concerned' || expr === 'sad')
+    brows.innerHTML = [-1,1].map(s=>`<path d="M${60+s*ex-s*9},${60-ey-14} L${60+s*ex+s*5},${60-ey-8}"/>`).join('');
+  // breathing rate tracks the air: calm when it is good, quick when it is not
+  const secs = co2 == null ? 5 : Math.max(1.6, 6.5 - (co2-450)/300);
+  $('#faceG').style.animationDuration = secs.toFixed(2)+'s';
 }
-async function refreshCharts(){
-  const hours = $('#range').value;
-  await Promise.all(CHARTS.map(async c => {
-    const sets = await Promise.all(c.series.map(async (s,i) => {
-      const q = new URLSearchParams({metric:s.m, location:s.loc, hours, kind:s.kind||'observed', ahead:s.ahead||0});
-      const r = await fetch('/api/series?'+q).then(r=>r.json()).catch(()=>({points:[]}));
-      return {label:s.label, yAxisID:s.axis||'y', borderColor:charts[c.id]._colors[i], backgroundColor:charts[c.id]._colors[i],
-              borderDash:s.dash?[5,4]:[], data:(r.points||[]).map(p=>({x:p[0]*1000,y:p[1]}))};
+
+/* ---------------- rooms ---------------- */
+function renderRooms(){
+  if(!R){ return; }
+  $('#strict').textContent = `strictness ${R.strictness.toFixed(2)}`
+    + (R.recovery_z==null ? '' : ` · recovery z ${R.recovery_z}`) + (R.quiet ? ' · quiet hours' : '');
+  $('#strict').className = 'pill ' + (R.strictness < 0.98 ? 'warn' : 'flat');
+
+  if(!R.rooms.length){ $('#rooms').innerHTML = '<span class="dim">no indoor data yet</span>'; return; }
+  $('#rooms').innerHTML = `<div class="grid" style="gap:12px">` + R.rooms.map(r=>{
+    const col = roomColour(r.room);
+    if(r.stale) return `<div class="c6"><div class="row"><b style="color:${col}">${esc(r.room)}</b>
+      <span class="pill bad">no reading</span></div>
+      <div class="sub">the sensor has gone quiet — check the node</div></div>`;
+    const pct = Math.min(100, Math.max(2, (r.co2-400)/1600*100));
+    const toWarn = r.minutes_to_warn, toHigh = r.minutes_to_high;
+    return `<div class="c6">
+      <div class="row" style="justify-content:space-between">
+        <b style="color:${col}">${esc(r.room)}</b>
+        <span class="pill ${r.severity==='high'?'bad':r.severity==='warn'?'warn':'good'}">${esc(r.expression)}</span>
+      </div>
+      <div class="room" style="margin-top:8px">
+        <div>
+          <div class="big" style="color:${co2Colour(r.co2)}">${n0(r.co2)}</div>
+          <div class="unit">ppm CO₂ &nbsp;<span style="color:${r.trend_ppm_h>20?'var(--warn)':'var(--mute)'}">
+            ${r.trend_ppm_h>0?'▲':'▼'} ${n0(Math.abs(r.trend_ppm_h))}/h</span></div>
+          <div class="bar"><i style="width:${pct}%;background:${co2Colour(r.co2)}"></i></div>
+        </div>
+        <div class="kv">
+          <b>temp</b><span>${n1(r.t_in)} °C &nbsp;<span class="dim">out ${n1(r.t_out)}</span></span>
+          <b>humidity</b><span>${n1(r.rh)==='—'?'—':n1(r.rh)+' %'}
+            ${r.pm25==null?'':`&nbsp;<span class="dim">outdoor PM2.5 ${n1(r.pm25)}</span>`}</span>
+          <b>occupied</b><span>${r.occupied ? 'yes — CO₂ is climbing' : 'no — it is clearing'}</span>
+          <b>hits 1000</b><span>${toWarn==null?'<span class="dim">not on this path</span>':n0(toWarn)+' min'}</span>
+          <b>hits 1400</b><span>${toHigh==null?'<span class="dim">not on this path</span>':n0(toHigh)+' min'}</span>
+          <b>clears to 800</b><span>${r.clear_minutes==null?'<span class="dim">—</span>':n0(r.clear_minutes)+' min with a window'}</span>
+          <b>purge cost</b><span>${r.purge_cost?('−'+n1(r.purge_cost)+' °C for 10 min'):'<span class="dim">—</span>'}</span>
+          <b>model</b><span>${r.learned?'<span class="tag learned">learned</span>':'<span class="tag default">still on defaults</span>'}
+            ${r.volume_m3?`<span class="dim">· ${n0(r.volume_m3)} m³ inferred</span>`:''}</span>
+        </div>
+      </div>
+      <div class="hint">${esc(r.message)}</div></div>`;
+  }).join('') + `</div>`;
+}
+
+/* ---------------- learned parameters ---------------- */
+const PRETTY = {c_out:'outdoor baseline', lambda_sealed:'air changes, sealed',
+  lambda_open:'air changes, ventilated', source_ppm_h:'CO₂ source, one person',
+  tau_t_h:'thermal time constant'};
+function renderLearned(){
+  if(!R || !R.rooms.length){ $('#learned').innerHTML = '<span class="dim">nothing learned yet</span>'; return; }
+  const counts = {};
+  (S?.decays||[]).forEach(d=>{ (counts[d.location] = counts[d.location]||[]).push(
+    `${d.n} ${esc(d.inferred||'?')} @ ${d.mean_lambda}/h`); });
+  $('#learned').innerHTML = R.rooms.map(r=>{
+    const rows = Object.entries(r.params).map(([k,p])=>[
+      esc(PRETTY[k]||k),
+      `<span style="color:${p.basis==='learned'?'var(--ink)':'var(--dim)'}">${
+        k==='c_out'||k==='source_ppm_h' ? n0(p.value) : (+p.value).toFixed(3)}</span>`,
+      p.stderr==null?null:'±'+(+p.stderr).toFixed(3),
+      `<span class="num">${p.n}</span>`,
+      `<span class="tag ${p.basis}">${p.basis}</span>`]);
+    return `<div style="margin-bottom:12px">
+      <div class="row" style="margin-bottom:5px">
+        <b style="color:${roomColour(r.room)}">${esc(r.room)}</b>
+        <span class="dim">${counts[r.room]?counts[r.room].join(' · '):'no usable decays yet'}</span></div>
+      ${table(['parameter','value','± s.e.','n','basis'], rows)}</div>`;
+  }).join('');
+}
+
+/* ---------------- nights ---------------- */
+function renderNights(){
+  const rows = (N?.nights||[]).slice().reverse().map(x=>[
+    esc(x.day), `${hm(x.start)}–${hm(x.end)}`, `<span class="num">${x.hours}</span>`,
+    `<span class="num" style="color:${co2Colour(x.mean)}">${n0(x.mean)}</span>`,
+    `<span class="num">${n0(x.peak)}</span>`,
+    `<span class="num">${x.above1400_h}</span>`,
+    `<span class="num">${n0(x.dose)}</span>`,
+    `<span class="num">${x.hrv==null?'—':n0(x.hrv)}</span>`,
+    `<span class="num">${x.recovery==null?'—':n0(x.recovery)}</span>`]);
+  $('#nights').innerHTML = table(
+    ['night','asleep','h','mean','peak','h>1400','ppm·h','HRV','recovery'], rows);
+}
+
+/* ---------------- charts ---------------- */
+Chart.defaults.color = '#8b9bab';
+Chart.defaults.borderColor = '#243140';
+Chart.defaults.font.family = 'ui-monospace, Menlo, Consolas, monospace';
+Chart.defaults.font.size = 10;
+const base = extra => ({responsive:true, maintainAspectRatio:false, animation:false,
+  parsing:false, interaction:{mode:'nearest',axis:'x',intersect:false},
+  elements:{point:{radius:0}, line:{borderWidth:1.7, tension:.18}},
+  plugins:{legend:{labels:{boxWidth:9,boxHeight:9,padding:10}},
+    tooltip:{callbacks:{title:i=>new Date(i[0].parsed.x).toLocaleString()}}}, ...extra});
+
+/* paint the labelled periods behind the CO2 trace */
+const labelBands = {id:'bands', beforeDatasetsDraw(c){
+  const bands = c.options.plugins.bands?.items || []; if(!bands.length) return;
+  const {ctx, chartArea:a, scales:{x}} = c; ctx.save();
+  bands.forEach(b=>{
+    const x0 = x.getPixelForValue(b.from*1000), x1 = x.getPixelForValue(b.to*1000);
+    if(x1 < a.left || x0 > a.right) return;
+    ctx.fillStyle = b.colour;
+    ctx.fillRect(Math.max(x0,a.left), a.top, Math.min(x1,a.right)-Math.max(x0,a.left), a.height);
+  });
+  ctx.restore();
+}};
+Chart.register(labelBands);
+
+const charts = {};
+function mkCharts(){
+  charts.co2 = new Chart($('#chCo2'), {type:'line', data:{datasets:[]}, options: base({
+    scales:{x:{type:'linear', ticks:{maxTicksLimit:8, callback:v=>new Date(v).toLocaleString([],
+      {month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'})}},
+      y:{title:{display:true,text:'ppm'}, suggestedMin:400}},
+    plugins:{bands:{items:[]}, legend:{labels:{boxWidth:9,boxHeight:9,padding:10}},
+      tooltip:{callbacks:{title:i=>new Date(i[0].parsed.x).toLocaleString()}}}})});
+
+  charts.decay = new Chart($('#chDecay'), {type:'scatter', data:{datasets:[]}, options: base({
+    elements:{point:{radius:5}},
+    scales:{x:{type:'linear', ticks:{maxTicksLimit:5, callback:v=>new Date(v).toLocaleDateString([],
+      {month:'short',day:'numeric'})}},
+      y:{type:'logarithmic', title:{display:true,text:'air changes / hour'}}},
+    plugins:{legend:{labels:{boxWidth:9,boxHeight:9,padding:10}},
+      tooltip:{callbacks:{label:i=>{const d=i.raw.d;
+        return `${d.location} ${d.inferred} · λ=${(+d.lambda_h).toFixed(3)}/h · r²=${(+d.r2).toFixed(3)}`
+          + ` · ${Math.round(d.c_start)}→${Math.round(d.c_end)} ppm`;}}}}})});
+
+  charts.body = new Chart($('#chBody'), {type:'line', data:{datasets:[]}, options: base({
+    scales:{x:{type:'linear', ticks:{maxTicksLimit:7, callback:v=>new Date(v).toLocaleString([],
+      {month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'})}},
+      y:{position:'left', title:{display:true,text:'bpm'}},
+      y1:{position:'right', title:{display:true,text:'ms'}, grid:{drawOnChartArea:false}}},
+    plugins:{bands:{items:[]}, legend:{labels:{boxWidth:9,boxHeight:9,padding:10}},
+      tooltip:{callbacks:{title:i=>new Date(i[0].parsed.x).toLocaleString()}}}})});
+
+  charts.err = new Chart($('#chErr'), {type:'bar', data:{datasets:[]}, options: base({
+    parsing:true, scales:{x:{type:'category'}, y:{title:{display:true,text:'MAE ppm'}}},
+    plugins:{legend:{labels:{boxWidth:9,boxHeight:9,padding:10}},tooltip:{}}})});
+}
+
+async function drawCo2(){
+  const hours = +$('#range').value;
+  const rooms = (R?.rooms||[]).map(r=>r.room);
+  const sets = [];
+  for(const room of (rooms.length?rooms:['desk','bedroom'])){
+    const q = new URLSearchParams({metric:'co2_ppm', location:room, hours, kind:'observed'});
+    const d = await fetch('/api/series?'+q).then(r=>r.json()).catch(()=>({points:[]}));
+    const col = roomColour(room);
+    sets.push({label:room, borderColor:col, backgroundColor:col,
+      data:(d.points||[]).map(p=>({x:p[0]*1000,y:p[1]}))});
+  }
+  const all = sets.flatMap(s=>s.data);
+  if(all.length){
+    const x0 = all[0].x, x1 = all[all.length-1].x;
+    [1000,1400].forEach(v=>sets.push({label:v+' ppm', borderColor:'#e2574c66', borderDash:[3,4],
+      borderWidth:1, pointRadius:0, data:[{x:x0,y:v},{x:x1,y:v}]}));
+  }
+  const since = Date.now()/1000 - hours*3600;
+  charts.co2.options.plugins.bands.items = (S?.labels||[])
+    .filter(l=>l.end_ts > since && (l.kind==='occupancy' || l.kind==='window'))
+    .map(l=>({from:l.start_ts, to:l.end_ts,
+      colour: l.kind==='window' && l.value==='open' ? 'rgba(176,122,224,.16)'
+            : l.value==='present' ? 'rgba(79,147,232,.13)' : 'rgba(255,255,255,.03)'}));
+  charts.co2.data.datasets = sets;
+  charts.co2.update('none');
+  $('#emCo2').hidden = all.length > 1;
+}
+
+function drawDecay(){
+  const ev = S?.decay_events || [];
+  const groups = {};
+  ev.forEach(d=>{ const k = `${d.location} ${d.inferred||'?'}`;
+    (groups[k] = groups[k]||[]).push({x:d.start_ts*1000, y:d.lambda_h, d}); });
+  charts.decay.data.datasets = Object.entries(groups).map(([k, pts])=>{
+    const vent = k.includes('ventilated');
+    const col = roomColour(k.split(' ')[0]);
+    return {label:k, data:pts, backgroundColor: vent ? col : col+'66',
+      borderColor: col, pointStyle: vent ? 'triangle' : 'circle', pointRadius: vent ? 7 : 5};
+  });
+  charts.decay.update('none');
+  $('#emDecay').hidden = ev.length > 0;
+}
+
+function drawErr(){
+  const fe = S?.forecast_error || [];
+  const days = [...new Set(fe.map(f=>f.day))].sort();
+  const hz = [...new Set(fe.map(f=>f.horizon_s))].sort((a,b)=>a-b);
+  charts.err.data.labels = days;
+  charts.err.data.datasets = hz.map((h,i)=>({
+    label:(h/60)+' min ahead',
+    backgroundColor:['#4f93e8','#b07ae0','#3fb97f'][i%3],
+    data: days.map(d=>{ const m = fe.find(f=>f.day===d && f.horizon_s===h); return m ? m.mae : null; })}));
+  charts.err.update('none');
+  $('#emErr').hidden = fe.length > 0;
+}
+
+const BODY = {daily_recovery_index:['recovery', ''], daily_sleep_hrv_ms:['sleep HRV','ms'],
+  daily_sleep_rhr_bpm:['resting HR','bpm']};
+function renderBody(){
+  const b = S?.body; if(!b){ return; }
+  const rows = Object.entries(BODY).map(([k,[name,unit]])=>{
+    const l = b.latest[k], base = b.baseline[k];
+    if(!l) return [name, null, null, null, null];
+    const d = base==null ? null : l.value - base;
+    const better = k==='daily_sleep_rhr_bpm' ? -1 : 1;
+    const col = d==null ? 'var(--mute)' : d*better >= 0 ? 'var(--good)' : 'var(--warn)';
+    return [name,
+      `<b>${n1(l.value)}</b> <span class="dim">${unit}</span>`,
+      `<span class="dim">${n1(base)}</span>`,
+      d==null ? null : `<span style="color:${col}">${d>0?'+':''}${n1(d)}</span>`,
+      `<span class="dim">${b.n_days[k]} d</span>`];
+  });
+  $('#bodyNow').innerHTML = table(['','today','your baseline','vs','over'], rows)
+    + `<div class="row" style="margin-top:9px">
+        <span class="pill flat">${n0(b.steps_today)} steps today</span>
+        <span class="pill ${b.sync_age_s==null?'bad':b.sync_age_s>12*3600?'warn':'good'}">
+          ring synced ${b.sync_age_s==null?'never':ago(b.newest_sample)+' ago'}</span></div>`;
+  $('#syncHint').textContent = b.sync_age_s > 6*3600
+    ? 'The ring only reaches the cloud when the phone app opens, so a lag of several hours is normal. Open the app to pull it forward.'
+    : 'The collector polls every 30 minutes; the ring itself is what sets how fresh this can be.';
+  $('#sleepTable').innerHTML = table(['night','asleep','hours','deep','rem','eff %','score'],
+    (b.sleep||[]).map(x=>[esc(x.day), `${hm(x.bedtime_start)}–${hm(x.bedtime_end)}`,
+      `<span class="num">${n1((x.total_sleep_s||0)/3600)}</span>`,
+      `<span class="num">${x.deep_s==null?'—':n1(x.deep_s/3600)}</span>`,
+      `<span class="num">${x.rem_s==null?'—':n1(x.rem_s/3600)}</span>`,
+      `<span class="num">${n0(x.efficiency_pct)}</span>`,
+      `<span class="num">${n0(x.sleep_score)}</span>`]));
+}
+
+async function drawBody(){
+  const hours = +$('#range').value;
+  const sets = [];
+  for(const [metric, label, axis, col] of [['hr_bpm','heart rate','y','#e2574c'],
+                                           ['hrv_ms','HRV','y1','#3fb97f']]){
+    const q = new URLSearchParams({metric, location:'user', hours, kind:'observed'});
+    const d = await fetch('/api/series?'+q).then(r=>r.json()).catch(()=>({points:[]}));
+    sets.push({label, yAxisID:axis, borderColor:col, backgroundColor:col,
+      data:(d.points||[]).map(p=>({x:p[0]*1000,y:p[1]}))});
+  }
+  const since = Date.now()/1000 - hours*3600;
+  charts.body.options.plugins.bands.items = (S?.body?.sleep||[])
+    .filter(x=>x.bedtime_end > since)
+    .map(x=>({from:x.bedtime_start, to:x.bedtime_end, colour:'rgba(176,122,224,.13)'}));
+  charts.body.data.datasets = sets;
+  charts.body.update('none');
+  $('#emBody').hidden = sets.some(s=>s.data.length > 1);
+}
+
+/* ---------------- system panels ---------------- */
+function renderSystem(){
+  $('#devices').innerHTML = table(['node','seen','ip','accepted','rejected','backlog'],
+    (S.devices||[]).map(d=>{
+      const quiet = S.now - d.last_seen > 300;
+      return [`<b style="color:${roomColour(d.device.endsWith('2')?'bedroom':'desk')}">${esc(d.device)}</b>`,
+        `<span class="${quiet?'err':''}">${ago(d.last_seen)} ago</span>`, esc(d.remote_addr),
+        `<span class="num">${n0(d.accepted_total)}</span>`,
+        `<span class="num ${d.rejected_total?'err':''}">${d.rejected_total}</span>`,
+        d.oldest_age_s==null?null:`<span class="num">${d.oldest_age_s}s</span>`];
     }));
-    for(const l of (c.lines||[])) { const all = sets.flatMap(s=>s.data); if(all.length) sets.push({label:l+' ppm', borderColor:'#c0392b66', borderDash:[3,3], borderWidth:1,
-      data:[{x:all[0].x,y:l},{x:all[all.length-1].x,y:l}], yAxisID:'y'}); }
-    charts[c.id].data.datasets = sets; charts[c.id].update('none');
-    $('#em_'+c.id).hidden = sets.some(s=>s.data.length>1 && !String(s.label).endsWith('ppm'));
-  }));
+
+  $('#collectors').innerHTML = table(['collector','state','every','newest data','runs'],
+    (S.collectors||[]).map(c=>[esc(c.name),
+      `<span class="pill ${c.health==='good'?'good':c.health==='warn'?'warn':'bad'}">${esc(c.health)}</span>`,
+      c.interval_s ? (c.interval_s/60|0)+'m' : '—',
+      c.newest_data ? ago(c.newest_data)+' ago' : '<span class="dim">—</span>',
+      c.fail_streak ? `<span class="err">${c.fail_streak} failing</span>` : 'ok']));
+
+  const st = S.storage || {};
+  $('#storage').innerHTML = table(['','' ], [
+    ['observations', `<b>${n0(st.observations)}</b>`],
+    ['forecast rows', n0(st.forecast_rows)],
+    ['flagged suspect', n0(st.suspect)],
+    ['database', ((st.db_bytes||0)/1048576).toFixed(1)+' MB'],
+    ['indoor record', `${st.week?st.week.days:0} of ${st.week?st.week.target_days:7} days`]]);
+
+  const evs = (S.events||[]).slice(0,8).map(e=>[t(e.event_start), esc(e.event_type),
+    `<span class="pill ${e.severity==='high'?'bad':'warn'}">${esc(e.severity)}</span>`, esc(e.location)]);
+  const runs = (S.analysis_runs||[]).slice(0,6).map(r=>[t(r.started_at),
+    esc(r.module), `${r.duration_ms|0} ms`, esc(r.note)]);
+  $('#events').innerHTML = (evs.length ? table(['when','event','severity','room'], evs)
+      : '<span class="dim">no events detected yet</span>')
+    + '<div style="height:9px"></div>' + table(['analysis run','module','took','decision'], runs);
+
+  $('#errors').innerHTML = table(['when','collector','error'],
+    (S.errors||[]).slice(0,8).map(e=>[t(e.started_at), esc(e.collector),
+      `<span class="err">${esc((e.error||'').slice(0,90))}</span>`]));
+
+  const cf = S.config || {};
+  $('#config').innerHTML = table(['setting','value'], [
+    ['collecting', (cf.collectors_enabled||[]).join(', ')],
+    ['ultrahuman metrics', (cf.ultrahuman_metrics||[]).join(', ')],
+    ['LAQN sites', (cf.laqn_sites||[]).join(', ')],
+    ['home', Object.entries(cf.locations||{}).map(([k,v])=>`${k} ${v[0].toFixed(4)}, ${v[1].toFixed(4)}`).join(' · ')],
+    ['SCD40 backend', esc(cf.scd40_backend)+' on port '+cf.ingest_port],
+    ['secrets present', Object.entries(cf.secrets_present||{})
+      .map(([k,v])=>`<span class="${v?'':'err'}">${v?'✓':'✗'} ${esc(k)}</span>`).join(' &nbsp; ')],
+    ['database', `<span class="dim">${esc(cf.db_path||(S.storage||{}).db_path)}</span>`]]);
+}
+
+function renderLabels(){
+  $('#labels').innerHTML = table(['room','what','value','from','to'],
+    (S.labels||[]).map(l=>[`<span style="color:${roomColour(l.location)}">${esc(l.location)}</span>`,
+      esc(l.kind), `<b>${esc(l.value)}</b>`, t(l.start_ts), t(l.end_ts)]));
+  const rooms = (R?.rooms||[]).map(r=>r.room);
+  if(rooms.length && !$('#lbRoom').options.length) rooms.forEach(r=>$('#lbRoom').add(new Option(r,r)));
+  if(!$('#lbKind').options.length) (S.label_kinds||[]).forEach(k=>$('#lbKind').add(new Option(k,k)));
+  if(!$('#expr').options.length) (S.expressions||[]).forEach(e=>$('#expr').add(new Option(e,e)));
 }
 
 function overall(){
-  const hs = S.collectors.map(c=>c.health);
-  const nodeBad = S.config.scd40_backend==='http' && (!S.devices.length || S.devices.some(d => Date.now()/1000 - d.last_seen > 300));
-  const bad = hs.includes('bad'), warn = hs.includes('warn') || nodeBad;
-  const el = $('#overall'); el.className = 'pill ' + (bad?'bad':warn?'warn':'good');
-  el.textContent = bad ? 'Problems' : warn ? 'Attention' : 'All collectors healthy';
-  if (S.config.scd40_backend==='sim') { el.className='pill warn'; el.textContent='SIMULATED SCD40 DATA'; }
-  $('#meta').textContent = 'Updated ' + new Date().toLocaleTimeString() + ' · auto-refresh 10 s';
+  const hs = (S.collectors||[]).map(c=>c.health);
+  const nodeBad = (S.devices||[]).some(d=>S.now - d.last_seen > 300) || !(S.devices||[]).length;
+  const el = $('#overall');
+  const bad = hs.includes('bad') || nodeBad, warn = hs.includes('warn');
+  el.className = 'pill ' + (bad?'bad':warn?'warn':'good');
+  el.textContent = bad ? 'needs attention' : warn ? 'degraded' : 'all healthy';
+  $('#meta').textContent = 'updated ' + new Date().toLocaleTimeString();
 }
 
-async function refresh(){
-  try { S = await fetch('/api/state').then(r=>r.json()); } catch(e){ $('#overall').className='pill bad'; $('#overall').textContent='Dashboard server unreachable'; return; }
+/* ---------------- refresh loops ---------------- */
+async function refreshState(){
+  try{ S = await fetch('/api/state').then(r=>r.json()); }
+  catch(e){ $('#overall').className='pill bad'; $('#overall').textContent='server unreachable'; return; }
   const errs = [];
-  for (const f of [renderCollectors, renderStorage, renderDevices, renderComponents, renderMisc, renderDisplay, renderLearned, overall])
-    try { f(); } catch(e) { errs.push(f.name+': '+e.message); console.error(f.name, e); }
-  if (errs.length) { $('#overall').className='pill bad'; $('#overall').textContent='Display error'; $('#meta').textContent=errs.join(' | '); }
-  if(!$('#expr').options.length) S.expressions.forEach(e=>$('#expr').add(new Option(e,e)));
+  for(const f of [renderSystem, renderLabels, renderLearned, renderBody, overall, drawDecay, drawErr])
+    try{ f(); }catch(e){ errs.push(f.name+': '+e.message); console.error(f.name, e); }
+  if(errs.length){ $('#meta').innerHTML = `<span class="err">${esc(errs.join(' | '))}</span>`; }
 }
+async function refreshRooms(){
+  try{ R = await fetch('/api/rooms').then(r=>r.json()); }catch(e){ return; }
+  try{ renderRooms(); renderLearned(); }catch(e){ console.error(e); }
+  const lead = R.rooms.find(r=>!r.stale) || R.rooms[0];
+  if(lead){
+    drawFace(lead.expression, lead.stale ? null : lead.co2);
+    $('#petMsg').textContent = lead.message;
+    $('#petWho').textContent = `${lead.room} · ${lead.severity}`
+      + (R.quiet ? ' · quiet hours, it will report in the morning' : '');
+    $('#petBasis').textContent = lead.learned
+      ? 'speaking from this room’s own measured numbers'
+      : 'still on published defaults — needs more decays';
+    $('#petHint').textContent = R.rooms.filter(r=>!r.stale)
+      .map(r=>`${r.room}: ${n0(r.co2)} ppm, ${r.occupied?'filling':'clearing'}`).join('   ·   ');
+  }
+}
+async function refreshNights(){
+  try{ N = await fetch('/api/nights').then(r=>r.json()); renderNights(); }catch(e){ console.error(e); }
+}
+async function refreshAll(){ await refreshState(); await refreshRooms();
+  await drawCo2().catch(console.error); await drawBody().catch(console.error);
+  await refreshNights(); }
+
 $('#addLabel').onclick = async () => {
-  const end = Math.floor(Date.now()/1000), mins = Math.max(5, +$('#lbMins').value || 60);
-  const r = await post('/api/label', {location:$('#lbRoom').value.trim(), kind:$('#lbKind').value,
-    value:$('#lbValue').value.trim(), start_ts:end - mins*60, end_ts:end});
+  const end = Math.floor(Date.now()/1000), mins = Math.max(5, +$('#lbMins').value||60);
+  const r = await post('/api/label', {location:$('#lbRoom').value, kind:$('#lbKind').value,
+    value:$('#lbValue').value.trim(), start_ts:end-mins*60, end_ts:end});
   $('#lbMsg').textContent = r && r.ok ? 'saved' : 'rejected';
-  refresh();
+  refreshState().then(drawCo2);
 };
 $('#runAnalysis').onclick = async () => {
-  $('#lbMsg').textContent = 'running...';
-  const r = await post('/api/analyse', {});
-  $('#lbMsg').textContent = r && r.decision
-    ? `${r.decision.expression}: ${r.decision.message}` : 'no indoor data yet';
-  refresh();
+  $('#lbMsg').textContent = ''; $('#petMsg').textContent = 'thinking…';
+  await post('/api/analyse', {}); refreshAll();
 };
-$('#setDisplay').onclick = async () => { await post('/api/display', {expression:$('#expr').value, message:$('#msg').value}); refresh(); };
-$('#range').onchange = refreshCharts; $('#filter').oninput = () => S && renderMisc();
-try { buildCharts(); } catch(e) { console.error(e); $('#charts').innerHTML = '<div class="err">Charts unavailable: '+esc(e.message)+'</div>'; }
-refresh().then(() => refreshCharts().catch(console.error));
-setInterval(refresh, 10000); setInterval(refreshCharts, 60000);
-</script>
-</body>
-</html>
+$('#setDisplay').onclick = async () => {
+  await post('/api/display', {expression:$('#expr').value, message:$('#msg').value||'test'});
+  refreshState();
+};
+$('#refresh').onclick = refreshAll;
+$('#range').onchange = () => { drawCo2().catch(console.error); drawBody().catch(console.error); };
+
+try{ mkCharts(); }catch(e){ console.error(e);
+  document.querySelectorAll('.chartbox').forEach(b=>b.innerHTML='<div class="empty">charts unavailable</div>'); }
+refreshAll();
+setInterval(refreshState, 10000);
+setInterval(refreshRooms, 15000);
+setInterval(() => { drawCo2().catch(console.error); drawBody().catch(console.error); }, 60000);
+setInterval(refreshNights, 300000);
+</script></body></html>

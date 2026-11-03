@@ -130,13 +130,14 @@ def room_state(db, location, model, now, strict):
         trend = float(np.polyfit(hours, recent.to_numpy(float), 1)[0])
 
     t_in = features.at(features.series(db, "indoor_temp_c", location, start, now), now)
+    rh = features.at(features.series(db, "indoor_rh_pct", location, start, now), now)
     t_out = features.at(features.series(db, "outdoor_temp_c", "home", start, now), now)
     pm25 = features.at(features.series(db, "pm2_5", "home", start, now), now)
     occupied = trend > 20.0                       # CO2 climbing means someone is in it
 
     state.update({
         "stale": False, "co2": latest, "trend_ppm_h": round(trend, 1), "occupied": occupied,
-        "t_in": t_in, "t_out": t_out, "pm25": pm25,
+        "t_in": t_in, "rh": rh, "t_out": t_out, "pm25": pm25,
         "minutes_to_warn": model.time_to(THRESH["warn"] * strict, latest, occupied),
         "minutes_to_high": model.time_to(THRESH["high"] * strict, latest, occupied),
         "clear_minutes": model.time_to(THRESH["fresh"], latest, False, ventilated=True),

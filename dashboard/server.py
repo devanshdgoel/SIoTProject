@@ -155,6 +155,7 @@ def full_state(db, collectors):
             "alerts": _rows(c, "SELECT * FROM overflow_alerts ORDER BY event_ts DESC LIMIT 10"),
             "errors": _rows(c, "SELECT collector, started_at, error FROM collector_runs "
                                "WHERE status='error' ORDER BY started_at DESC LIMIT 10"),
+            "body": body_state(c, now),
             "components": component_state(),
             "config": {
                 "scd40_backend": settings.SCD40_BACKEND, "ingest_port": settings.INGEST_PORT,
@@ -171,6 +172,9 @@ def full_state(db, collectors):
                                "FROM room_params ORDER BY location, param"),
             "labels": _rows(c, "SELECT location, kind, value, start_ts, end_ts, note "
                                "FROM labels ORDER BY start_ts DESC LIMIT 12"),
+            "decay_events": _rows(c, "SELECT location, start_ts, end_ts, lambda_h, stderr, r2, "
+                                     "c_start, c_end, c_out, delta_t_c, wind_ms, inferred, labelled "
+                                     "FROM decay_events ORDER BY start_ts DESC LIMIT 80"),
             "decays": _rows(c, "SELECT location, COUNT(*) n, "
                                "ROUND(AVG(lambda_h), 2) mean_lambda, inferred "
                                "FROM decay_events WHERE r2>=0.9 GROUP BY location, inferred"),
@@ -179,6 +183,98 @@ def full_state(db, collectors):
                                        "FROM predictions WHERE actual IS NOT NULL "
                                        "GROUP BY day, horizon_s ORDER BY day DESC LIMIT 14"),
         }
+
+
+def body_state(c, now):
+    """The wearable in one object: today's scalars against the user's own baseline,
+    the last few nights, and how long ago the ring last reached the cloud.
+
+    The baseline is a median of this person's own recent days rather than any
+    population figure - it is what the strictness multiplier is measured against."""
+    import statistics
+    out = {"latest": {}, "baseline": {}, "n_days": {}}
+    for metric in ("daily_recovery_index", "daily_sleep_hrv_ms", "daily_sleep_rhr_bpm"):
+        rows = c.execute("SELECT ts, value FROM observations WHERE source='ultrahuman' "
+                         "AND metric=? AND value IS NOT NULL AND ts>? ORDER BY ts",
+                         (metric, now - 30 * 86400)).fetchall()
+        if not rows:
+            continue
+        values = [r["value"] for r in rows]
+        out["latest"][metric] = {"value": values[-1], "ts": rows[-1]["ts"]}
+        out["baseline"][metric] = round(statistics.median(values), 1)
+        out["n_days"][metric] = len(values)
+    newest = c.execute("SELECT MAX(ts) t FROM observations WHERE source='ultrahuman' "
+                       "AND metric='hr_bpm'").fetchone()["t"]
+    out["newest_sample"] = newest
+    out["sync_age_s"] = None if not newest else now - newest
+    today = c.execute("SELECT SUM(value) s FROM observations WHERE source='ultrahuman' "
+                      "AND metric='steps' AND ts>?", (now - now % 86400,)).fetchone()["s"]
+    out["steps_today"] = int(today) if today else 0
+    out["sleep"] = _rows(c, "SELECT day, bedtime_start, bedtime_end, total_sleep_s, deep_s, "
+                            "rem_s, efficiency_pct, sleep_score, avg_body_temp_c, toss_turns "
+                            "FROM sleep_sessions ORDER BY day DESC LIMIT 8")
+    return out
+
+
+def rooms_state(db):
+    """Live per-room snapshot: what the sensors say, what the model believes, and
+    where it thinks the room is heading. Computed on request rather than stored,
+    so the page always reflects the parameters as they stand right now."""
+    from analysis import analysis_human as ah
+    from analysis.room_model import RoomModel, rooms
+
+    now = int(time.time())
+    quiet = ah.quiet_now(now)
+    strict, z = ah.strictness(db, now)
+    out = {"now": now, "quiet": quiet, "strictness": strict, "recovery_z": z,
+           "thresholds": ah.THRESH, "rooms": []}
+    for name in rooms(db):
+        model = RoomModel(db, name)
+        st = ah.room_state(db, name, model, now, strict)
+        expr, msg, sev = ah.decide(dict(st, quiet=quiet))
+        traj = [] if st.get("stale") else model.forward(
+            st["co2"], 180, st.get("occupied", False))
+        out["rooms"].append({**st, "expression": expr, "message": msg, "severity": sev,
+                             "trajectory": traj, "learned": model.learned,
+                             "volume_m3": model.volume_m3,
+                             "params": {k: {"value": v, "stderr": model.stderr[k],
+                                            "n": model.n[k], "basis": model.basis[k]}
+                                        for k, v in model.value.items()}})
+    return out
+
+
+def nights_state(db, limit=14):
+    """Overnight exposure per night, over the sleep window the ring actually
+    measured, paired with that morning's recovery figures."""
+    import pandas as pd
+
+    from analysis import features
+
+    now = int(time.time())
+    step_h = features.GRID_S / 3600.0
+    out = []
+    for start, end, day in features.night_windows(db, now - 40 * 86400, now)[-limit:]:
+        seg = features.series(db, "co2_ppm", "bedroom", start - 600, end + 600)
+        seg = seg.loc[pd.Timestamp(start, unit="s", tz="UTC"):
+                      pd.Timestamp(end, unit="s", tz="UTC")].dropna()
+        if seg.size < 6:
+            continue
+        with db.conn() as c:
+            def daily(metric):
+                row = c.execute("SELECT value FROM observations WHERE metric=? AND "
+                                "location='user' AND DATE(ts,'unixepoch')=? LIMIT 1",
+                                (metric, day)).fetchone()
+                return row["value"] if row else None
+            hrv, recovery = daily("daily_sleep_hrv_ms"), daily("daily_recovery_index")
+        out.append({"day": day, "start": start, "end": end,
+                    "hours": round((end - start) / 3600, 1),
+                    "mean": round(float(seg.mean())), "peak": round(float(seg.max())),
+                    "rise": round(float(seg.iloc[-1] - seg.iloc[0])),
+                    "above1000_h": round(float((seg > 1000).sum()) * step_h, 1),
+                    "above1400_h": round(float((seg > 1400).sum()) * step_h, 1),
+                    "dose": round(float((seg - 800).clip(lower=0).sum()) * step_h),
+                    "hrv": hrv, "recovery": recovery})
+    return out
 
 
 def series(db, q):
@@ -236,6 +332,10 @@ def make_handler(db, collectors):
                     return self._send(200, CHART_JS.read_bytes(), "application/javascript")
                 if u.path == "/api/state":
                     return self._send(200, full_state(db, collectors))
+                if u.path == "/api/rooms":
+                    return self._send(200, rooms_state(db))
+                if u.path == "/api/nights":
+                    return self._send(200, {"nights": nights_state(db)})
                 if u.path == "/api/series":
                     return self._send(200, series(db, parse_qs(u.query)))
             except KeyError:
