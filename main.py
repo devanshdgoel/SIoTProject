@@ -284,6 +284,54 @@ def cmd_preflight(args, db):
     print("ready to flash" if ok else "fix the FAIL lines above before flashing")
 
 
+def cmd_offset(args, db):
+    """Compare two sensors standing in the same air.
+
+    Two SCD40s typically disagree by tens of ppm, which is within their spec but
+    not within the precision this project needs: without this number a difference
+    between rooms cannot be told apart from a difference between units. The median
+    is used rather than the mean so a single disturbed minute cannot move it, and
+    the first `--settle` minutes are dropped because a sensor that has just been
+    carried into a different room is still equilibrating."""
+    import statistics
+    end = int(time.time())
+    start = end - args.last * 60
+    rows = db.labels(kind="occupancy")
+    for lb in rows:
+        if lb["value"] == "colocated":
+            start, end = lb["start_ts"], min(lb["end_ts"], end)
+    start += args.settle * 60
+    with db.conn() as c:
+        pairs = c.execute(
+            "SELECT a.ts, a.value, b.value FROM observations a JOIN observations b "
+            "ON a.ts=b.ts AND b.source='scd40' AND b.metric=a.metric AND b.location=? "
+            "WHERE a.source='scd40' AND a.metric=? AND a.location=? AND a.ts BETWEEN ? AND ? "
+            "ORDER BY a.ts", (args.b, args.metric, args.a, start, end)).fetchall()
+    if len(pairs) < 10:
+        print(f"only {len(pairs)} paired minutes after the settling window - leave them "
+              f"side by side longer, or lower --settle")
+        return
+    diffs = sorted(r[1] - r[2] for r in pairs)
+    med = statistics.median(diffs)
+    q1, q3 = diffs[len(diffs) // 4], diffs[3 * len(diffs) // 4]
+    print(f"{args.metric}: {args.a} minus {args.b}, {_fmt(pairs[0]['ts'])} -> {_fmt(pairs[-1]['ts'])} UTC")
+    print(f"  n={len(diffs)} paired minutes")
+    print(f"  median {med:+.1f}   IQR {q1:+.1f} to {q3:+.1f}   range {diffs[0]:+.1f} to {diffs[-1]:+.1f}")
+    # Is the difference still travelling? Compare the first third of the window with
+    # the last, in time order. A real offset is steady; a sensor that has just been
+    # carried into a different room drifts in one direction while it equilibrates.
+    ordered = [r[1] - r[2] for r in pairs]
+    third = max(3, len(ordered) // 3)
+    drift = statistics.median(ordered[-third:]) - statistics.median(ordered[:third])
+    print(f"  drift across the window {drift:+.1f} (first third to last)")
+    if q3 - q1 > 25:
+        print("  the spread is wide: they are probably not yet in the same air")
+    elif abs(drift) > 15:
+        print("  still equilibrating: leave them together longer before trusting this")
+    else:
+        print(f"  usable: subtract {med:+.1f} from {args.a} to put it on the same scale as {args.b}")
+
+
 def cmd_dashboard(args, db):
     from dashboard.server import serve
     serve(db, COLLECTORS, args.port)
@@ -321,6 +369,11 @@ def main():
     p.add_argument("--note"); p.set_defaults(fn=cmd_label)
     p = sub.add_parser("params"); p.set_defaults(fn=cmd_params)
     p = sub.add_parser("preflight"); p.set_defaults(fn=cmd_preflight)
+    p = sub.add_parser("offset", help="compare two sensors standing in the same air")
+    p.add_argument("--a", default="desk"); p.add_argument("--b", default="bedroom")
+    p.add_argument("--metric", default="co2_ppm"); p.add_argument("--last", type=int, default=120)
+    p.add_argument("--settle", type=int, default=20, help="minutes to drop after a move")
+    p.set_defaults(fn=cmd_offset)
     p = sub.add_parser("dashboard"); p.add_argument("--port", type=int); p.set_defaults(fn=cmd_dashboard)
     p = sub.add_parser("simulate"); p.add_argument("--days", type=int, default=7); p.set_defaults(fn=cmd_simulate)
     args = ap.parse_args()

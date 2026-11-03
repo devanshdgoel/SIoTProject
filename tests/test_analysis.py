@@ -193,3 +193,48 @@ def test_full_pass_writes_a_face_a_forecast_and_an_event(db):
 def test_a_pass_with_no_indoor_data_is_quiet_rather_than_broken(db):
     out = analysis_human.run(db, now=T0)
     assert out["rooms"] == {} and "decision" not in out
+
+
+def test_a_clamped_baseline_is_not_passed_off_as_measured(db):
+    """A room that never reaches outdoor air gives a 5th percentile pinned at the
+    clamp. That is a guess, not a measurement, so it must keep using the default
+    until enough decays actually settle - one settled decay is not enough."""
+    import time
+    now = int(time.time()) // 300 * 300
+    rows = []
+    for i in range(60):                       # an hour of stuffy air, never airing out
+        rows.append(Observation("scd40", "co2_ppm", "stuffy", now - (60 - i) * 60,
+                                1500.0 + (i % 5), "measured", "ppm"))
+    r = CollectResult("scd40"); r.observations = rows
+    db.save_result(r)
+
+    learn(db, "stuffy", days=1, now=now)
+    stored = db.params("stuffy")["c_out"]
+    assert stored["value"] == 650.0           # pinned at the clamp
+    assert stored["n"] == 0                   # ...and therefore not trusted
+    assert RoomModel(db, "stuffy").basis["c_out"] == "default"
+
+
+def test_a_decay_broken_by_one_noisy_sample_stays_one_measurement():
+    """A twelve-hour decay interrupted by a single wobble is worth far more whole
+    than as the fragments it would otherwise become, which disagree with each other."""
+    idx = pd.date_range("2026-11-03", periods=60, freq="5min", tz="UTC")
+    clean = pd.Series(430 + 2000 * np.exp(-0.35 * np.arange(60) * 5 / 60.0), index=idx)
+    nudged = clean.copy()
+    nudged.iloc[30] += 25.0                     # someone walks past, one sample up
+
+    whole = features.decay_windows(clean, 430.0)
+    split = features.decay_windows(nudged, 430.0)
+    assert len(whole) == 1 and len(split) == 1  # the wobble does not end the run
+    assert (split[0][1] - split[0][0]).total_seconds() > 4 * 3600
+
+    fit = features.best_decay_fit(nudged.loc[split[0][0]:split[0][1]], 430.0)
+    assert fit["lambda_h"] == pytest.approx(0.35, rel=0.1)
+
+
+def test_a_long_interruption_does_end_the_run():
+    idx = pd.date_range("2026-11-03", periods=60, freq="5min", tz="UTC")
+    s = pd.Series(430 + 2000 * np.exp(-0.35 * np.arange(60) * 5 / 60.0), index=idx)
+    s.iloc[25:35] = s.iloc[25]                  # half an hour flat: the room was reoccupied
+    runs = features.decay_windows(s, 430.0)
+    assert len(runs) == 2

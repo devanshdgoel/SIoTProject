@@ -114,18 +114,27 @@ def outdoor_baseline(co2, q=0.05, lo=380.0, hi=650.0):
     return float(min(max(float(v.quantile(q)), lo), hi))
 
 
-def _runs(mask):
-    """Contiguous True stretches of a boolean Series as (start_index, end_index)."""
-    out, start, prev = [], None, None
+def _runs(mask, bridge=0):
+    """True stretches of a boolean Series as (start_index, end_index).
+
+    `bridge` absorbs short interruptions. A genuine decay is occasionally broken by
+    one sample that fails the test - a door held open for a moment, or noise where
+    the curve has gone flat - and splitting there turns a single long measurement
+    into several poor short ones. The twelve-hour decay of an empty room is worth
+    far more than the six fragments it would otherwise become."""
+    out, start, last_true, misses = [], None, None, 0
     for ts, ok in mask.items():
-        if ok and start is None:
-            start = ts
-        elif not ok and start is not None:
-            out.append((start, prev))
-            start = None
-        prev = ts
+        if ok:
+            if start is None:
+                start = ts
+            last_true, misses = ts, 0
+        elif start is not None:
+            misses += 1
+            if misses > bridge:
+                out.append((start, last_true))
+                start, misses = None, 0
     if start is not None:
-        out.append((start, prev))
+        out.append((start, last_true))
     return out
 
 
@@ -146,7 +155,7 @@ def decay_windows(co2, c_out, min_minutes=20, min_drop=100.0, min_excess=150.0,
     ceiling = -min_rate_h * (smooth - c_out).clip(lower=1.0) * step / 3600.0
     falling = (smooth.diff() <= ceiling).fillna(False)
     keep = []
-    for a, b in _runs(falling):
+    for a, b in _runs(falling, bridge=2):      # ride out up to ten minutes of wobble
         seg = co2.loc[a:b].dropna()
         if seg.size < 4 or seg.size * step < min_minutes * 60:
             continue

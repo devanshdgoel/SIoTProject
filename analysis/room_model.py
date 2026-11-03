@@ -135,14 +135,17 @@ def learn(db, location, days=14, now=None):
         fit = features.fit_asymptote(co2.loc[trimmed["start"]:trimmed["end"]], c_out)
         if fit is not None and fit["r2"] >= 0.95:
             tails.append(fit["c_inf"])
-    if len(tails) >= 2:
+    refined = len(tails) >= 2
+    if refined:
         c_out = float(np.median(tails))
         method = f"asymptote of {len(tails)} deep decays"
     # If the percentile had to be clamped and no decay settled, the room was never
     # observed near outdoor air. The clamp is then a guess wearing a measurement's
     # clothes, so it is stored with n=0 and the published default keeps being used.
+    # One usable asymptote is not a refinement: the branch above needs two before it
+    # replaces the percentile, so a single tail must not make the clamp look trusted.
     clamped = not 380.0 <= float(co2.dropna().quantile(0.05)) <= 650.0
-    trusted = 0 if (clamped and not tails) else int(co2.dropna().size)
+    trusted = 0 if (clamped and not refined) else int(co2.dropna().size)
     db.set_param(location, "c_out", c_out, None, trusted, "ppm",
                  {"method": method, "clamped": clamped})
     summary["c_out"] = round(c_out, 1)
@@ -172,6 +175,12 @@ def learn(db, location, days=14, now=None):
         lams.append(fit["lambda_h"])
         marks.append(rows[-1]["labelled"])
 
+    # decay_events is derived, not a log: every fit in it must share the c_out that
+    # produced it. Rows from an earlier run used a different baseline, so re-fitting
+    # replaces them instead of accumulating a mixture nobody can interpret.
+    with db.conn() as conn:
+        conn.execute("DELETE FROM decay_events WHERE location=? AND start_ts>=?",
+                     (location, start))
     if rows:
         cut = split_point(lams)
         for row, state in zip(rows, classify(lams, marks, cut)):
