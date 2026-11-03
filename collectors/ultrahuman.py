@@ -4,7 +4,8 @@ ultrahuman.py
 Retrieves personal health and recovery data from the Ultrahuman partner API.
 The API returns a whole local day per call (no "now" endpoint), so each poll
 fetches today and yesterday and relies on idempotent storage: intraday series
-(HR, HRV, skin temperature, steps; ~6 min resolution) become observations,
+(HR, HRV, steps; ~6 min resolution) become observations, filtered to the
+metrics in settings.ULTRAHUMAN_METRICS,
 the night's sleep session goes to its own table (it defines the "overnight"
 window used by the analysis), and daily scalars (resting HR, recovery index...)
 are stored against the start of their day.
@@ -78,14 +79,20 @@ def _sleep_row(day, obj, now):
     }
 
 
-def parse_day(day, payload, now=None):
-    """One day's API payload -> CollectResult (pure function; unit-testable offline)."""
+def parse_day(day, payload, now=None, keep=None):
+    """One day's API payload -> CollectResult (pure function; unit-testable offline).
+
+    `keep` limits which metrics are stored (settings.ULTRAHUMAN_METRICS by default):
+    the ring returns far more than the air-quality question needs, and the API
+    serves history, so anything skipped can be backfilled later if it turns out to
+    matter. The sleep session is always kept - it defines the overnight window."""
+    keep = settings.ULTRAHUMAN_METRICS if keep is None else keep
     now = now or int(time.time())
     result = CollectResult(SOURCE)
     metrics = ((payload.get("data") or {}).get("metrics") or {}).get(day) or []
     for m in metrics:
         typ, obj = m.get("type"), m.get("object") or {}
-        if typ in SERIES:
+        if typ in SERIES and SERIES[typ][0] in keep:
             metric, unit = SERIES[typ]
             for p in obj.get("values") or []:
                 if p.get("value") is not None and p.get("timestamp"):
@@ -95,7 +102,7 @@ def parse_day(day, payload, now=None):
                     result.observations.append(Observation(
                         SOURCE, metric, LOCATION, int(p["timestamp"]), v, "measured", unit,
                         quality="suspect" if suspect else "ok", retrieved_at=now))
-        elif typ in DAILY and obj.get("value") is not None:
+        elif typ in DAILY and DAILY[typ] in keep and obj.get("value") is not None:
             result.observations.append(Observation(
                 SOURCE, DAILY[typ], LOCATION, int(obj["day_start_timestamp"]), float(obj["value"]),
                 "measured", "", retrieved_at=now))

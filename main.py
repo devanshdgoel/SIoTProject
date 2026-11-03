@@ -20,9 +20,11 @@ Week 1 commands (collection only):
 
 import argparse
 import logging
+import os
 import threading
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 
 from analysis import analysis_human
 from collectors import grid_carbon, laqn, open_meteo, scd40, thames_water, ultrahuman
@@ -30,7 +32,9 @@ from collectors.base import run_collector
 from config import settings
 from storage.database import Database
 
-COLLECTORS = {
+# Every collector the project has. What actually runs is the subset named in
+# settings.COLLECTORS_ENABLED, so a source can be parked without deleting it.
+ALL_COLLECTORS = {
     "scd40": scd40,
     "open_meteo": open_meteo,
     "grid_carbon": grid_carbon,
@@ -38,6 +42,8 @@ COLLECTORS = {
     "thames_water": thames_water,
     "laqn": laqn,
 }
+COLLECTORS = {n: m for n, m in ALL_COLLECTORS.items() if n in settings.COLLECTORS_ENABLED}
+PARKED = [n for n in ALL_COLLECTORS if n not in COLLECTORS]
 log = logging.getLogger("siot")
 
 
@@ -66,7 +72,38 @@ def _analysis_loop(db, stop):
         stop.wait(max(0.0, settings.ANALYSIS_INTERVAL_S - (time.time() - t0)))
 
 
+def _catch_up(db):
+    """On start, pull whatever happened while this host was off.
+
+    Every API here serves history, so a gap only costs you data if nobody asks for
+    it. A normal poll looks back about two days, which covers an overnight sleep but
+    not a weekend, so the first request after a gap is widened to match. The width
+    comes from what is already stored rather than from a guess, and storage is
+    idempotent, so an unnecessary catch-up is harmless.
+
+    scd40 has no backfill and needs none: the node holds 48 h in RAM and uploads the
+    backlog itself once this host answers again."""
+    obs, _ = db.status_summary()
+    newest = {}
+    for r in obs:
+        newest[r["source"]] = max(newest.get(r["source"], 0), r["last_ts"] or 0)
+    now = time.time()
+    for name, module in COLLECTORS.items():
+        if not hasattr(module, "backfill"):
+            continue
+        last = newest.get(getattr(module, "SOURCE", name))
+        gap_h = (now - last) / 3600 if last else None
+        if gap_h is not None and gap_h <= 3:
+            continue                                  # a normal poll already covers this
+        days = 7 if gap_h is None else min(30, int(gap_h // 24) + 2)
+        status, n, err = run_collector(name, lambda d, m=module, k=days: m.backfill(k, d), db)
+        log.info("catch-up %-12s %-7s rows=%-6d (%s, %d day window) %s", name, status, n,
+                 "no data yet" if gap_h is None else f"{gap_h:.1f} h gap", days, err or "")
+
+
 def cmd_collect(args, db):
+    if not args.no_catchup:
+        _catch_up(db)
     stop = threading.Event()
     threads = [threading.Thread(target=_job_loop, args=(n, m, db, stop), name=n, daemon=True)
                for n, m in COLLECTORS.items() if not args.only or n in args.only]
@@ -117,11 +154,12 @@ def cmd_status(args, db):
         newest[r["source"]] = max(newest.get(r["source"], 0), r["last_ts"])
     print(f"\n{'collector':14s}{'runs':>6s}{'ok':>6s}{'err':>5s}{'skip':>6s}{'avg ms':>8s}  {'last run':13s}{'newest data':12s}")
     for r in runs:
-        mod = COLLECTORS.get(r["collector"])
+        mod = ALL_COLLECTORS.get(r["collector"])   # parked ones still have stored data
         last = newest.get(getattr(mod, "SOURCE", r["collector"]))
         stale = " STALE" if last and now - last > settings.STALE_AFTER_S.get(r["collector"], 3600) else ""
         print(f"{r['collector']:14s}{r['n']:6d}{r['ok']:6d}{r['err']:5d}{r['skipped']:6d}"
               f"{(r['avg_ms'] or 0):8.0f}  {_fmt(r['last_run']):13s}{_fmt(last):12s}{stale}")
+    _parked_note()
 
 
 def _when(text, tz):
@@ -197,6 +235,55 @@ def cmd_analyse(args, db):
               analysis_human.night_associations(db))
 
 
+def _parked_note():
+    if PARKED:
+        print()
+        print(f"parked, not collecting: {', '.join(PARKED)}"
+              "   (set COLLECTORS=... in .env to change)")
+
+
+def cmd_preflight(args, db):
+    """Check the things that silently break a flash or an overnight run.
+
+    Each one has cost real debugging time: a token that drifted out of step with
+    .env, an IP the laptop no longer has, a missing display library that stops the
+    sketch compiling at all."""
+    import re
+    import socket
+    sec = settings.BASE_DIR / "firmware" / "esp32_scd40" / "secrets.h"
+    ok = True
+
+    def check(label, passed, detail=""):
+        nonlocal ok
+        ok = ok and passed
+        print(f"  {'PASS' if passed else 'FAIL'}  {label:38s}{detail}")
+
+    print(f"host: {db.path}")
+    check("SCD40 backend is http", settings.SCD40_BACKEND == "http", settings.SCD40_BACKEND)
+    check("INGEST_TOKEN set in .env", bool(os.getenv("INGEST_TOKEN")))
+    if not sec.exists():
+        check("firmware secrets.h exists", False, "copy secrets.example.h to secrets.h")
+        return
+    text = sec.read_text(encoding="utf-8")
+    grab = lambda k: (re.search(r'#define\s+' + k + r'\s+"([^"]*)"', text) or [None, None])[1]  # noqa: E731
+    node = re.search(r"#define\s+NODE\s+(\d+)", text)
+    check("secrets.h NODE switch present", bool(node), f"NODE {node.group(1)}" if node else "")
+    check("firmware token matches .env", grab("INGEST_TOKEN") == os.getenv("INGEST_TOKEN"))
+    url = grab("INGEST_URL") or ""
+    host = (re.search(r"http://([^:/]+)", url) or [None, None])[1]
+    mine = {a[4][0] for a in socket.getaddrinfo(socket.gethostname(), None)}
+    check("ingest IP is one of ours", host in mine, f"{host}  (this laptop: {sorted(mine)})")
+    libs = Path(os.path.expanduser("~/Documents/Arduino/libraries"))
+    have = [d.name for d in libs.iterdir()] if libs.exists() else []
+    needs_oled = "#define HAS_OLED    1" in text
+    check("U8g2 installed (display nodes)", any("u8g2" in d.lower() for d in have) or not needs_oled)
+    print()
+    print(f"collecting: {', '.join(COLLECTORS)}")
+    if PARKED:
+        print(f"parked:     {', '.join(PARKED)}")
+    print("ready to flash" if ok else "fix the FAIL lines above before flashing")
+
+
 def cmd_dashboard(args, db):
     from dashboard.server import serve
     serve(db, COLLECTORS, args.port)
@@ -219,6 +306,7 @@ def main():
     sub = ap.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("collect"); p.add_argument("--only", nargs="*")
     p.add_argument("--no-analysis", action="store_true", help="collect only, skip the analysis loop")
+    p.add_argument("--no-catchup", action="store_true", help="skip the gap backfill on start")
     p.set_defaults(fn=cmd_collect)
     p = sub.add_parser("once"); p.add_argument("names", nargs="*"); p.set_defaults(fn=cmd_once)
     p = sub.add_parser("backfill"); p.add_argument("--days", type=int, default=7)
@@ -232,6 +320,7 @@ def main():
     p.add_argument("--from", dest="start"); p.add_argument("--to", dest="end", default="now")
     p.add_argument("--note"); p.set_defaults(fn=cmd_label)
     p = sub.add_parser("params"); p.set_defaults(fn=cmd_params)
+    p = sub.add_parser("preflight"); p.set_defaults(fn=cmd_preflight)
     p = sub.add_parser("dashboard"); p.add_argument("--port", type=int); p.set_defaults(fn=cmd_dashboard)
     p = sub.add_parser("simulate"); p.add_argument("--days", type=int, default=7); p.set_defaults(fn=cmd_simulate)
     args = ap.parse_args()

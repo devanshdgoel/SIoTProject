@@ -159,6 +159,9 @@ def full_state(db, collectors):
             "config": {
                 "scd40_backend": settings.SCD40_BACKEND, "ingest_port": settings.INGEST_PORT,
                 "intervals_s": settings.INTERVALS, "locations": settings.LOCATIONS,
+                "collectors_enabled": settings.COLLECTORS_ENABLED,
+                "ultrahuman_metrics": settings.ULTRAHUMAN_METRICS,
+                "laqn_sites": settings.LAQN_SITES,
                 "stale_after_s": settings.STALE_AFTER_S,
                 "secrets_present": {k: bool(os.getenv(k)) for k in SECRETS},
             },

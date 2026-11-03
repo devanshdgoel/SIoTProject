@@ -198,8 +198,23 @@ def test_sim_backend_refuses_real_database(db, monkeypatch):
 def test_ultrahuman_flags_implausible_readings():
     payload = {"data": {"metrics": {"d": [{"type": "temp", "object": {"values": [
         {"value": 33.0, "timestamp": 1}, {"value": 14.8, "timestamp": 2}]}}]}}}
-    q = {o.ts: o.quality for o in ultrahuman.parse_day("d", payload).observations}
+    keep = ["skin_temp_c"]      # explicit: this metric is not in the default set
+    q = {o.ts: o.quality for o in ultrahuman.parse_day("d", payload, keep=keep).observations}
     assert q == {1: "ok", 2: "suspect"}
+
+
+def test_ultrahuman_stores_only_the_metrics_we_asked_for():
+    """The ring returns far more than the air-quality question needs. Anything
+    skipped can be backfilled later, because the API serves history."""
+    payload = {"data": {"metrics": {"d": [
+        {"type": "hr", "object": {"values": [{"value": 62, "timestamp": 1}]}},
+        {"type": "temp", "object": {"values": [{"value": 33.0, "timestamp": 1}]}},
+        {"type": "recovery_index", "object": {"value": 71, "day_start_timestamp": 0}},
+        {"type": "movement_index", "object": {"value": 55, "day_start_timestamp": 0}},
+    ]}}}
+    keep = ["hr_bpm", "daily_recovery_index"]
+    got = {o.metric for o in ultrahuman.parse_day("d", payload, keep=keep).observations}
+    assert got == {"hr_bpm", "daily_recovery_index"}        # temp and movement dropped
 
 
 def test_laqn_unwraps_dotnet_json_and_maps_species():
@@ -305,3 +320,43 @@ def test_a_full_48_hour_backlog_is_accepted_batch_after_batch(db):
     assert total == 2880                                      # not one reading refused
     assert len(b.drain()) == 2880
     b.server.shutdown()
+
+
+def test_catch_up_matches_its_window_to_the_gap(tmp_path, monkeypatch):
+    """What happens when the laptop was shut. Every API here serves history, so the
+    only thing that loses data is nobody asking for it; the first request after a
+    gap has to be as wide as the gap."""
+    import time
+    import main
+    asked = []
+
+    class Fake:
+        SOURCE = "fake"
+
+        @staticmethod
+        def backfill(days, db=None):
+            asked.append(days)
+            return CollectResult("fake")
+
+    class Pushed:           # like scd40: no backfill, the node holds its own backlog
+        SOURCE = "pushed"
+
+    monkeypatch.setattr(main, "COLLECTORS", {"fake": Fake, "pushed": Pushed})
+
+    def db_last_seen(age_s):
+        db = Database(tmp_path / f"c{age_s}.db")
+        if age_s is not None:
+            r = CollectResult("fake")
+            r.observations = [Observation("fake", "m", "l", int(time.time()) - age_s,
+                                          1.0, "measured")]
+            db.save_result(r)
+        return db
+
+    main._catch_up(db_last_seen(None))
+    assert asked == [7]                       # nothing stored at all: pull a week
+    main._catch_up(db_last_seen(600))
+    assert asked == [7]                       # ten minutes old: the normal poll covers it
+    main._catch_up(db_last_seen(3 * 86400))
+    assert asked == [7, 5]                    # three-day gap: ask for five days
+    main._catch_up(db_last_seen(400 * 86400))
+    assert asked[-1] == 30                    # capped, so a stale database cannot stall startup

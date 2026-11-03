@@ -68,6 +68,25 @@ SCD40_LOCATION = "desk"       # default room for a node that does not say which 
 # the dashboard draws it, and the node's OLED renders it (firmware/esp32_scd40).
 EXPRESSIONS = ["neutral", "happy", "concerned", "alert", "sleepy", "sad"]
 
+# --- Which collectors run ---------------------------------------------------
+# Everything stays importable and testable; this only decides what the scheduler
+# starts. grid_carbon and thames_water are off because the current question is
+# indoor air and the body's response to it, and neither feeds that. Both APIs
+# serve history, so re-enabling and backfilling loses nothing.
+COLLECTORS_ENABLED = [c.strip() for c in
+                      os.getenv("COLLECTORS", "scd40,open_meteo,laqn,ultrahuman").split(",")
+                      if c.strip()]
+
+# Ultrahuman metrics worth storing for the air-quality question: the overnight
+# response variables, plus steps and heart rate as the activity confounder and a
+# presence hint. skin_temp_c is dropped (mostly off-finger artefacts) along with
+# the general activity indices. The API serves history, so a backfill brings any
+# of them back if the analysis later needs them.
+ULTRAHUMAN_METRICS = [c.strip() for c in os.getenv(
+    "ULTRAHUMAN_METRICS",
+    "hr_bpm,hrv_ms,steps,daily_sleep_hrv_ms,daily_sleep_rhr_bpm,daily_recovery_index"
+).split(",") if c.strip()]
+
 # --- Polling intervals (seconds) -------------------------------------------
 INTERVALS = {
     "scd40": SCD40_WINDOW_S,   # the job itself blocks for the averaging window
