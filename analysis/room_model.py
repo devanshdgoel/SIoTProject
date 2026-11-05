@@ -224,6 +224,31 @@ def learn(db, location, days=14, now=None):
                                               if r["inferred"] == state and r["labelled"])})
                 summary[param] = (round(med, 3), n)
 
+    # Source term from occupied rises. A room filling toward its ceiling gives the
+    # source and the air-change rate from one curve, and unlike a plateau it does not
+    # have to reach steady state first - which this bedroom never does overnight.
+    rises = []
+    for a, b in features.occupied_windows(db, location, labels, start, now):
+        if features.label_at(labels, (a + b) // 2, "window") == "open":
+            continue
+        seg = co2.loc[pd.Timestamp(a, unit="s", tz="UTC"):
+                      pd.Timestamp(b, unit="s", tz="UTC")].dropna()
+        fit = features.fit_rise(seg, c_out)
+        if fit is not None and fit["r2"] >= 0.90:
+            rises.append(fit)
+    if rises:
+        med, err, n = _robust([r["source_ppm_h"] for r in rises])
+        db.set_param(location, "source_ppm_h", med, err, n, "ppm/h",
+                     {"from": f"{n} occupied rise(s)",
+                      "ceilings": [round(r["ceiling"]) for r in rises],
+                      "lambda_from_rise": [round(r["lambda_h"], 3) for r in rises]})
+        volume = CO2_PER_PERSON_LH * 1000.0 / med
+        db.set_param(location, "volume_m3", volume, None, n, "m3",
+                     {"assumes": "one seated adult at 18.7 L/h; compare with a tape measure"})
+        summary["rises"] = n
+        summary["source_ppm_h"] = (round(med, 1), n)
+        summary["volume_m3"] = round(volume, 1)
+
     lam_sealed = db.params(location).get("lambda_sealed")
     lam_for_source = float(lam_sealed["value"]) if lam_sealed else DEFAULTS["lambda_sealed"][0]
     # A plateau only measures a source if somebody was producing one. An empty room
@@ -232,7 +257,7 @@ def learn(db, location, days=14, now=None):
     # invented a 325 cubic metre bedroom before this check existed. With no occupancy
     # labels at all, the honest answer is to measure nothing.
     sources = []
-    for a, b in features.plateau_windows(co2, c_out):
+    for a, b in ([] if rises else features.plateau_windows(co2, c_out)):
         mid = int((a.timestamp() + b.timestamp()) / 2)
         if features.label_at(labels, mid, "occupancy") != "present":
             continue

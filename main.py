@@ -332,6 +332,45 @@ def cmd_offset(args, db):
         print(f"  usable: subtract {med:+.1f} from {args.a} to put it on the same scale as {args.b}")
 
 
+def cmd_ventilate(args, db):
+    """What tonight looks like under each option, and the cheapest moment to air out."""
+    from analysis import ventilation
+    plan = ventilation.plan_night(db, args.room, hours=args.hours)
+    if "error" in plan:
+        raise SystemExit(plan["error"])
+    print(f"{args.room}: now {plan['start_ppm']} ppm, outdoor baseline {plan['c_out']} ppm")
+    print(f"  one sleeper puts out {plan['source_ppm_h']} ppm/h into "
+          f"{plan['volume_m3'] and round(plan['volume_m3'])} m3 ({plan['source_basis']})")
+    print(f"  next {plan['hours']:.0f} h outdoors: {plan['t_out_forecast']} C, "
+          f"PM2.5 {plan['pm25_forecast']}")
+    print()
+    print(f"  {'option':24s}{'rate/h':>9s}{'heads to':>10s}{'peak':>7s}"
+          f"{'h>1400':>8s}{'heat':>7s}")
+    for o in plan["options"]:
+        if o["lambda_h"] is None:
+            print(f"  {o['name']:24s}{'?':>9s}   {o['note']}")
+            continue
+        print(f"  {o['name']:24s}{o['lambda_h']:9.2f}{o['ceiling']:10d}{o['peak']:7d}"
+              f"{o['hours_over'][1400]:8.1f}"
+              f"{('-' + str(o['heat_cost_c']) + 'C') if o['heat_cost_c'] else '-':>7s}")
+    print()
+    print("  to hold the night below:  " + "   ".join(
+        f"{t} ppm needs {v}/h" for t, v in plan["needed"].items()))
+
+    purge = ventilation.plan_purge(db, args.room, horizon_h=args.horizon)
+    b = purge.get("best")
+    print()
+    if b:
+        print(f"  cheapest airing in the next {args.horizon:.0f} h "
+              f"({purge['evaluated']} options tried):")
+        print(f"    in {b['in_minutes']} min, for {b['duration_min']} min "
+              f"-> clears {b['clears_ppm']} ppm, costs {b['heat_cost_c']} C "
+              f"(outdoor {b['t_out']} C, PM2.5 {b['pm25']})")
+        print(f"    using the open-window rate {purge['lambda_open']}/h ({purge['basis']})")
+    else:
+        print("  no airing in the next window would leave the room warm enough")
+
+
 def cmd_dashboard(args, db):
     from dashboard.server import serve
     serve(db, COLLECTORS, args.port)
@@ -368,6 +407,9 @@ def main():
     p.add_argument("--from", dest="start"); p.add_argument("--to", dest="end", default="now")
     p.add_argument("--note"); p.set_defaults(fn=cmd_label)
     p = sub.add_parser("params"); p.set_defaults(fn=cmd_params)
+    p = sub.add_parser("ventilate", help="tonight under each option, and when to air out")
+    p.add_argument("--room", default="bedroom"); p.add_argument("--hours", type=float, default=8.0)
+    p.add_argument("--horizon", type=float, default=12.0); p.set_defaults(fn=cmd_ventilate)
     p = sub.add_parser("preflight"); p.set_defaults(fn=cmd_preflight)
     p = sub.add_parser("offset", help="compare two sensors standing in the same air")
     p.add_argument("--a", default="desk"); p.add_argument("--b", default="bedroom")

@@ -278,3 +278,37 @@ def test_offset_uses_the_most_recent_co_location(db, monkeypatch):
     out = "\n".join(printed)
     assert "n=60 paired minutes" in out          # not the empty range the bug gave
     assert "-20.0" in out            # desk reads 20 ppm below bedroom, by construction
+
+
+def test_where_a_night_ends_up_barely_depends_on_where_it_starts(db):
+    """The point the window test made: the overnight ceiling is outdoor + source/lambda,
+    and a room slept in for two or three time constants forgets its starting value."""
+    from analysis import ventilation
+
+    c_out, source, lam = 356.0, 900.0, 0.26
+    high = ventilation.trajectory(835, 9 * 60, lam, source, c_out, occupied=True)
+    low = ventilation.trajectory(379, 9 * 60, lam, source, c_out, occupied=True)
+    gap_at_dawn = high[-1][1] - low[-1][1]
+    assert 450 > gap_at_dawn > 0                     # they started 456 ppm apart
+    assert gap_at_dawn < 60                          # and arrive within 60 of each other
+    assert abs(high[-1][1] - (c_out + source / lam)) < 500   # both heading for the ceiling
+
+
+def test_the_rate_a_target_needs_is_the_inverse_of_the_headroom(db):
+    from analysis import ventilation
+
+    need = ventilation.lambda_needed(900.0, 356.0, 1400.0)
+    assert need == pytest.approx(900.0 / (1400.0 - 356.0), rel=1e-6)
+    # holding a room at its own outdoor level would take infinite exchange
+    assert ventilation.lambda_needed(900.0, 356.0, 300.0) is None
+
+
+def test_a_shut_window_is_charged_no_heat(db):
+    from analysis import ventilation
+
+    db.set_param("x", "lambda_sealed", 0.3, None, 9, "1/h")
+    db.set_param("x", "tau_t_h", 6.0, None, 4, "h")
+    model = RoomModel(db, "x")
+    assert ventilation._extra_cooling(model, 21.0, 9.0, 480, 0.3) == 0.0
+    assert ventilation._extra_cooling(model, 21.0, 9.0, 480, 3.0) > 1.0
+    assert ventilation._extra_cooling(model, 15.0, 18.0, 480, 3.0) == 0.0   # warmer outside

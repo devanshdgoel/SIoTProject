@@ -233,7 +233,14 @@ class HttpBackend:
         now = time.time()
         if not (now - self.MAX_AGE_S <= ts <= now + self.MAX_FUTURE_S):
             return 0
-        if not (350 <= co2 <= 10000 and -10 <= t <= 60 and 0 <= rh <= 100):
+        # The CO2 floor is 250, not 350. These sensors run on their factory
+        # calibration with self-calibration off, and this pair reads roughly 60 ppm
+        # below true outdoor air - so a fully ventilated room lands near 350 and a
+        # 350 floor censors exactly the readings the outdoor baseline is measured
+        # from. It silently deleted 51 minutes of the first window-open test and
+        # pinned the lowest stored value at precisely 350.0. A genuinely faulty
+        # reading is 0 or negative, which 250 still rejects.
+        if not (250 <= co2 <= 10000 and -10 <= t <= 60 and 0 <= rh <= 100):
             return 0
         self.queue.put((ts, co2, co2_max, t, rh, n, room))
         return 1

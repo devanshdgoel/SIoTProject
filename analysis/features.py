@@ -291,6 +291,57 @@ def fit_asymptote(seg, c_out_guess, min_drop=50.0, settle=0.25):
             "r2": 1.0 - resid / total if total > 0 else 0.0}
 
 
+def fit_rise(seg, c_out):
+    """Fit an occupied room filling up, with the ceiling left free.
+
+    C(t) = C_inf + (C0 - C_inf)*exp(-lambda*t), so one curve yields both the air-change
+    rate and the level the room is heading for; the source follows as
+    lambda*(C_inf - C_out).
+
+    This is strictly better than waiting for a plateau. A bedroom with a time constant
+    of three or four hours and a sleeper in it for eight never actually reaches steady
+    state - it is still climbing at dawn - so the plateau method measures nothing,
+    while the rise is the richest curve in the whole record."""
+    seg = seg.dropna()
+    if seg.size < 24:
+        return None
+    hours = (seg.index - seg.index[0]).total_seconds().to_numpy() / 3600.0
+    y = seg.to_numpy(dtype=float)
+    if y[-1] - y[0] < 200.0:
+        return None
+
+    def model(t, c_inf, c0, rate):
+        return c_inf + (c0 - c_inf) * np.exp(-rate * t)
+
+    try:
+        popt, pcov = optimize.curve_fit(
+            model, hours, y, p0=[max(y[-1] * 1.3, y[-1] + 200), y[0], 0.3],
+            bounds=([y[-1], c_out - 50, 0.02], [20000.0, y[0] + 200, 10.0]), maxfev=20000)
+    except (RuntimeError, ValueError, TypeError):
+        return None
+    c_inf, _, rate = popt
+    total = float(np.sum((y - y.mean()) ** 2))
+    r2 = 1.0 - float(np.sum((y - model(hours, *popt)) ** 2)) / total if total > 0 else 0.0
+    source = rate * (c_inf - c_out)
+    if source <= 0 or not np.isfinite(source):
+        return None
+    return {"lambda_h": float(rate), "stderr": float(np.sqrt(pcov[2][2])),
+            "ceiling": float(c_inf), "source_ppm_h": float(source), "r2": r2}
+
+
+def occupied_windows(db, location, labels, start, end):
+    """Periods the room is believed occupied, as (start_ts, end_ts).
+
+    Two sources of evidence, both measured rather than assumed: spans the user
+    labelled `occupancy=present`, and the sleep windows the ring recorded. A sleep
+    window is only a candidate - the room still has to show a real rise before it is
+    used - so a night spent elsewhere simply fails the test instead of inventing one."""
+    spans = [(lb["start_ts"], lb["end_ts"]) for lb in labels
+             if lb["kind"] == "occupancy" and lb["value"] == "present"]
+    spans += [(a, b) for a, b, _day in night_windows(db, start, end)]
+    return sorted(set(spans))
+
+
 def at(s, ts, tol_s=5400):
     """Value of a series nearest a timestamp, or None if nothing is close enough."""
     if s is None:

@@ -268,3 +268,19 @@ def test_catch_up_matches_its_window_to_the_gap(tmp_path, monkeypatch):
     assert asked == [7, 5]                    # three-day gap: ask for five days
     main._catch_up(db_last_seen(400 * 86400))
     assert asked[-1] == 30                    # capped, so a stale database cannot stall startup
+
+
+def test_a_well_ventilated_room_is_not_rejected_as_a_fault(db):
+    """A sensor on its factory calibration reads tens of ppm below true outdoor air,
+    so a fully aired room lands in the 340s. The old 350 floor threw those readings
+    away - censoring the very measurements the outdoor baseline comes from - while
+    still having to reject a dead sensor reporting zero."""
+    import time
+    b = scd40.HttpBackend(db, port=0, token="secret")
+    now = int(time.time()) // 60 * 60
+    base = {"co2_max": 400, "t": 18.0, "rh": 55, "n": 12}
+    assert b.accept({**base, "ts": now, "co2": 345}) == 1       # aired room, kept
+    assert b.accept({**base, "ts": now - 60, "co2": 255}) == 1  # extreme but plausible
+    assert b.accept({**base, "ts": now - 120, "co2": 0}) == 0   # dead sensor, rejected
+    assert b.accept({**base, "ts": now - 180, "co2": 240}) == 0
+    b.server.shutdown()
