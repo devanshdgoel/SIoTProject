@@ -27,7 +27,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from analysis import analysis_human
-from collectors import grid_carbon, laqn, open_meteo, scd40, thames_water, ultrahuman
+from collectors import open_meteo, scd40, ultrahuman
 from collectors.base import run_collector
 from config import settings
 from storage.database import Database
@@ -37,10 +37,7 @@ from storage.database import Database
 ALL_COLLECTORS = {
     "scd40": scd40,
     "open_meteo": open_meteo,
-    "grid_carbon": grid_carbon,
     "ultrahuman": ultrahuman,
-    "thames_water": thames_water,
-    "laqn": laqn,
 }
 COLLECTORS = {n: m for n, m in ALL_COLLECTORS.items() if n in settings.COLLECTORS_ENABLED}
 PARKED = [n for n in ALL_COLLECTORS if n not in COLLECTORS]
@@ -296,10 +293,13 @@ def cmd_offset(args, db):
     import statistics
     end = int(time.time())
     start = end - args.last * 60
-    rows = db.labels(kind="occupancy")
-    for lb in rows:
-        if lb["value"] == "colocated":
-            start, end = lb["start_ts"], min(lb["end_ts"], end)
+    # The most recent co-location wins. Narrowing the window across every label in
+    # turn, as this once did, leaves `start` on the newest and `end` on the oldest,
+    # which is an empty range and reports no paired minutes at all.
+    colocated = [lb for lb in db.labels(kind="occupancy") if lb["value"] == "colocated"]
+    if colocated:
+        last = colocated[-1]                      # db.labels() returns them in time order
+        start, end = last["start_ts"], min(last["end_ts"], end)
     start += args.settle * 60
     with db.conn() as c:
         pairs = c.execute(

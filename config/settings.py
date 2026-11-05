@@ -39,18 +39,6 @@ FORECAST_HORIZON_H = 24        # forecast rows stored per poll
 ULTRAHUMAN_URL = "https://partner.ultrahuman.com/api/v1/partner/daily_metrics"
 USER_TZ = "Europe/London"
 
-# --- Thames Water (needs THAMES_CLIENT_ID / THAMES_CLIENT_SECRET in .env) --
-THAMES_API_ROOT = "https://prod-tw-opendata-app.uk-e1.cloudhub.io/data/STE/v1"
-
-# --- LAQN (London Air Quality Network; no API key) --------------------------
-# Reference analysers run by Imperial's ERG. Open-Meteo's air quality is a ~11 km
-# CAMS model cell, so these measured sites are what local air actually looks like.
-LAQN_API_ROOT = "https://api.erg.ic.ac.uk/AirQuality"
-# Site codes to pull; `python -m collectors.laqn` lists the sites nearest home.
-# KC1 North Kensington is the urban-background reference (has PM2.5);
-# KC5 Earl's Court is kerbside (NO2 and PM10 only) and much closer.
-LAQN_SITES = [c.strip().upper() for c in os.getenv("LAQN_SITES", "KC1,KC5").split(",") if c.strip()]
-
 # --- SCD40 -----------------------------------------------------------------
 # backend: "adafruit" (I2C on a Raspberry Pi), "serial" (Pico/Arduino/ESP over
 # USB, CSV lines "co2,temp_c,rh"), or "sim" (synthetic, for development).
@@ -70,11 +58,11 @@ EXPRESSIONS = ["neutral", "happy", "concerned", "alert", "sleepy", "sad"]
 
 # --- Which collectors run ---------------------------------------------------
 # Everything stays importable and testable; this only decides what the scheduler
-# starts. grid_carbon and thames_water are off because the current question is
-# indoor air and the body's response to it, and neither feeds that. Both APIs
-# serve history, so re-enabling and backfilling loses nothing.
+# starts. The city-scale collectors (grid carbon, Thames overflows, LAQN) live in
+# archive/london_side with a note on why and how to bring them back; the question
+# here is indoor air and the body's response to it, and none of them feed that.
 COLLECTORS_ENABLED = [c.strip() for c in
-                      os.getenv("COLLECTORS", "scd40,open_meteo,laqn,ultrahuman").split(",")
+                      os.getenv("COLLECTORS", "scd40,open_meteo,ultrahuman").split(",")
                       if c.strip()]
 
 # Ultrahuman metrics worth storing for the air-quality question: the overnight
@@ -91,10 +79,7 @@ ULTRAHUMAN_METRICS = [c.strip() for c in os.getenv(
 INTERVALS = {
     "scd40": SCD40_WINDOW_S,   # the job itself blocks for the averaging window
     "open_meteo": 1800,        # hourly model output; 30 min guarantees freshness
-    "grid_carbon": 900,        # NESO updates each half hour
     "ultrahuman": 1800,        # ring syncs via phone, so sub-30-min polling gains nothing
-    "thames_water": 600,
-    "laqn": 1800,              # hourly analyser means, revised as they are ratified
 }
 
 # --- Analysis --------------------------------------------------------------
@@ -112,10 +97,7 @@ WEEK_TARGET_DAYS = 7
 STALE_AFTER_S = {
     "scd40": 300,
     "open_meteo": 3 * 3600,
-    "grid_carbon": 2 * 3600,   # 'actual' trails real time by ~1 h
     "ultrahuman": 12 * 3600,   # the ring syncs only when the phone app opens, so a
                                # half-day lag is normal, not a fault. A real failure
                                # shows up as a collector error, not as stale data.
-    "thames_water": 3600,
-    "laqn": 4 * 3600,      # ratification lag means the newest hour often trails
 }

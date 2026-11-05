@@ -535,7 +535,6 @@ function renderSystem(){
   $('#config').innerHTML = table(['setting','value'], [
     ['collecting', (cf.collectors_enabled||[]).join(', ')],
     ['ultrahuman metrics', (cf.ultrahuman_metrics||[]).join(', ')],
-    ['LAQN sites', (cf.laqn_sites||[]).join(', ')],
     ['home', Object.entries(cf.locations||{}).map(([k,v])=>`${k} ${v[0].toFixed(4)}, ${v[1].toFixed(4)}`).join(' · ')],
     ['SCD40 backend', esc(cf.scd40_backend)+' on port '+cf.ingest_port],
     ['secrets present', Object.entries(cf.secrets_present||{})

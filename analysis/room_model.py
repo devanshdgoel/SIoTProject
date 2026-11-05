@@ -125,6 +125,30 @@ def learn(db, location, days=14, now=None):
     # Outdoor CO2 as this sensor reads it. The low percentile of the record is only a
     # starting guess: in a room that is rarely left empty for long it sits well above
     # the truth. Refine it to the asymptote the deep decays are actually heading for.
+    labels = db.labels(location=location, start=start, end=now)
+
+    # room_params is derived, like decay_events: each run recomputes every parameter
+    # from scratch over its window, so last run's values are cleared rather than left
+    # behind. Without this a parameter that can no longer be measured keeps its old
+    # number for ever - which is how a bedroom went on claiming 325 cubic metres,
+    # from a source term measured before occupancy was required.
+    with db.conn() as conn:
+        conn.execute("DELETE FROM room_params WHERE location=?", (location,))
+
+    # Best evidence first. An empty room with the window open has equilibrated with
+    # the air outside, so what the sensor reads then IS outdoor CO2 as that sensor
+    # reads it - calibration offset included, which is the number the model wants.
+    # Nothing is fitted; it is simply observed. The first half hour is skipped while
+    # the room is still flushing.
+    direct = []
+    for lb in labels:
+        if lb["kind"] != "window" or lb["value"] != "open":
+            continue
+        seg = co2.loc[pd.Timestamp(lb["start_ts"] + 1800, unit="s", tz="UTC"):
+                      pd.Timestamp(lb["end_ts"], unit="s", tz="UTC")].dropna()
+        if seg.size >= 6:
+            direct.append(float(seg.quantile(0.25)))
+
     c_out = features.outdoor_baseline(co2)
     method = "5th percentile of this sensor's own record"
     tails = []
@@ -136,7 +160,10 @@ def learn(db, location, days=14, now=None):
         if fit is not None and fit["r2"] >= 0.95:
             tails.append(fit["c_inf"])
     refined = len(tails) >= 2
-    if refined:
+    if direct:
+        c_out, refined = float(np.median(direct)), True
+        method = f"measured directly during {len(direct)} labelled window-open period(s)"
+    elif refined:
         c_out = float(np.median(tails))
         method = f"asymptote of {len(tails)} deep decays"
     # If the percentile had to be clamped and no decay settled, the room was never
@@ -144,7 +171,7 @@ def learn(db, location, days=14, now=None):
     # clothes, so it is stored with n=0 and the published default keeps being used.
     # One usable asymptote is not a refinement: the branch above needs two before it
     # replaces the percentile, so a single tail must not make the clamp look trusted.
-    clamped = not 380.0 <= float(co2.dropna().quantile(0.05)) <= 650.0
+    clamped = not 250.0 <= float(co2.dropna().quantile(0.05)) <= 700.0
     trusted = 0 if (clamped and not refined) else int(co2.dropna().size)
     db.set_param(location, "c_out", c_out, None, trusted, "ppm",
                  {"method": method, "clamped": clamped})
@@ -154,7 +181,6 @@ def learn(db, location, days=14, now=None):
     temp_out = features.series(db, "outdoor_temp_c", "home", start, now)
     wind = features.series(db, "wind_ms", "home", start, now)
     temp_in = features.series(db, "indoor_temp_c", location, start, now)
-    labels = db.labels(location=location, start=start, end=now)
 
     rows, lams, marks = [], [], []
     for a, b in features.decay_windows(co2, c_out):
@@ -200,9 +226,17 @@ def learn(db, location, days=14, now=None):
 
     lam_sealed = db.params(location).get("lambda_sealed")
     lam_for_source = float(lam_sealed["value"]) if lam_sealed else DEFAULTS["lambda_sealed"][0]
+    # A plateau only measures a source if somebody was producing one. An empty room
+    # holding steady is not at an occupied equilibrium - it is sitting at whatever
+    # the rest of the flat is at, with its door open - and reading a source off that
+    # invented a 325 cubic metre bedroom before this check existed. With no occupancy
+    # labels at all, the honest answer is to measure nothing.
     sources = []
     for a, b in features.plateau_windows(co2, c_out):
-        if features.label_at(labels, int(a.timestamp()), "window") == "open":
+        mid = int((a.timestamp() + b.timestamp()) / 2)
+        if features.label_at(labels, mid, "occupancy") != "present":
+            continue
+        if features.label_at(labels, mid, "window") == "open":
             continue                      # an open-window plateau would use the wrong lambda
         sources.append(lam_for_source * (float(co2.loc[a:b].mean()) - c_out))
     med, err, n = _robust(sources)

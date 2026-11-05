@@ -31,7 +31,7 @@ INDEX = Path(__file__).with_name("index.html")
 CHART_JS = Path(__file__).with_name("chart.min.js")   # Chart.js 4.4.1, bundled so the page works offline
 EXPRESSIONS = settings.EXPRESSIONS      # shared with the node firmware
 LABEL_KINDS = ["window", "door", "occupancy", "cooking"]
-SECRETS = ["ULTRAHUMAN_TOKEN", "THAMES_CLIENT_ID", "THAMES_CLIENT_SECRET", "INGEST_TOKEN"]
+SECRETS = ["ULTRAHUMAN_TOKEN", "INGEST_TOKEN"]
 COMPONENT_DIRS = ["collectors", "analysis", "pet", "actions"]
 
 
@@ -162,7 +162,6 @@ def full_state(db, collectors):
                 "intervals_s": settings.INTERVALS, "locations": settings.LOCATIONS,
                 "collectors_enabled": settings.COLLECTORS_ENABLED,
                 "ultrahuman_metrics": settings.ULTRAHUMAN_METRICS,
-                "laqn_sites": settings.LAQN_SITES,
                 "stale_after_s": settings.STALE_AFTER_S,
                 "secrets_present": {k: bool(os.getenv(k)) for k in SECRETS},
             },

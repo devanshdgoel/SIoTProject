@@ -102,7 +102,7 @@ def despike(s, k=4.0):
     return s.mask(bad, straight), int(bad.sum())
 
 
-def outdoor_baseline(co2, q=0.05, lo=380.0, hi=650.0):
+def outdoor_baseline(co2, q=0.05, lo=250.0, hi=700.0):
     """Outdoor CO2 as this particular sensor sees it: the low tail of its own record.
 
     An empty or open room tends towards outdoor air, so the 5th percentile is that
@@ -218,7 +218,7 @@ def fit_decay(seg, c_out):
     return out
 
 
-def best_decay_fit(seg, c_out, offsets=(0.0, 0.15, 0.30, 0.45)):
+def best_decay_fit(seg, c_out, offsets=(0.0, 0.15, 0.30, 0.45), min_excess=15.0):
     """Fit a decay, allowing its start to be trimmed, and keep the best-conditioned one.
 
     A detected window often begins before the room really started emptying: the flat
@@ -226,6 +226,18 @@ def best_decay_fit(seg, c_out, offsets=(0.0, 0.15, 0.30, 0.45)):
     exponential drawn through such a regime change fits neither part of it. Trying a
     few start offsets and keeping the highest R-squared recovers the decay that is
     actually in the data, and reports the segment it was measured over."""
+    # Trim the tail first. The logarithm needs headroom above the baseline, so once a
+    # decay has arrived within a few ppm of it the remaining samples carry no rate
+    # information and one of them going slightly negative discards the whole event.
+    # That is how the first deliberate window-open test was nearly lost: the room
+    # settled below the baseline the model was still assuming.
+    thin = (seg - c_out) <= min_excess
+    if bool(thin.any()):
+        cut = seg.index.get_loc(thin.idxmax())
+        seg = seg.iloc[:cut]
+    if seg.size < 6:
+        return None
+
     best = None
     for frac in offsets:
         part = seg.iloc[int(len(seg) * frac):]

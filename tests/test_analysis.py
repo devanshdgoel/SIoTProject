@@ -21,7 +21,7 @@ def db(tmp_path):
     return Database(tmp_path / "t.db")
 
 
-def simulate(db, location="bedroom", days=3, seed=0, **truth):
+def simulate(db, location="bedroom", days=3, seed=0, label=True, **truth):
     """A room obeying dC/dt = S - lambda(C - C_out), sampled every minute.
 
     Occupied 23-07 and 09-12 and 14-18; the window is open 12-14 while empty. That
@@ -48,6 +48,15 @@ def simulate(db, location="bedroom", days=3, seed=0, **truth):
     result = CollectResult("scd40")
     result.observations = obs
     db.save_result(result)
+    # The simulation knows when the room was occupied and when the window was open,
+    # so it supplies that as ground truth the way the user would. Without occupancy
+    # labels the source term is deliberately not measurable.
+    for d in range(days) if label else ():
+        base = T0 + d * 86400
+        for h0, h1 in ((0, 7), (9, 12), (14, 18), (23, 24)):
+            db.add_label(location, "occupancy", "present", base + h0 * 3600, base + h1 * 3600)
+        db.add_label(location, "occupancy", "absent", base + 7 * 3600, base + 9 * 3600)
+        db.add_label(location, "window", "open", base + 12 * 3600, base + 14 * 3600)
     return T0 + days * 86400
 
 
@@ -70,7 +79,9 @@ def test_learns_the_physics_that_generated_the_room(db):
 
 
 def test_a_room_that_is_never_opened_does_not_invent_a_second_cluster(db):
-    now = simulate(db, location="desk", days=3, lam_open=0.5)   # "open" is no different
+    # No labels here on purpose: this exercises the inference path, where the split
+    # has to be read out of the data alone and must refuse to find one.
+    now = simulate(db, location="desk", days=3, lam_open=0.5, label=False)
     learn(db, "desk", days=4, now=now)
     rows = db.decays("desk")
     assert rows and all(r["inferred"] == "sealed" for r in rows)
@@ -210,7 +221,7 @@ def test_a_clamped_baseline_is_not_passed_off_as_measured(db):
 
     learn(db, "stuffy", days=1, now=now)
     stored = db.params("stuffy")["c_out"]
-    assert stored["value"] == 650.0           # pinned at the clamp
+    assert stored["value"] == 700.0           # pinned at the clamp
     assert stored["n"] == 0                   # ...and therefore not trusted
     assert RoomModel(db, "stuffy").basis["c_out"] == "default"
 
@@ -238,3 +249,32 @@ def test_a_long_interruption_does_end_the_run():
     s.iloc[25:35] = s.iloc[25]                  # half an hour flat: the room was reoccupied
     runs = features.decay_windows(s, 430.0)
     assert len(runs) == 2
+
+
+def test_offset_uses_the_most_recent_co_location(db, monkeypatch):
+    """Narrowing the window across every co-location label in turn left `start` on
+    the newest and `end` on the oldest, which is an empty range reporting no paired
+    minutes — exactly when a fresh measurement had just been taken."""
+    import argparse
+    import time
+
+    import main
+
+    now = int(time.time()) // 60 * 60
+    db.add_label("bedroom", "occupancy", "colocated", now - 40 * 3600, now - 39 * 3600, "old")
+    db.add_label("bedroom", "occupancy", "colocated", now - 3600, now - 60, "new")
+    rows = []
+    for i in range(60):
+        ts = now - 3600 + i * 60
+        rows.append(Observation("scd40", "co2_ppm", "desk", ts, 700.0 + i * 0.1, "measured", "ppm"))
+        rows.append(Observation("scd40", "co2_ppm", "bedroom", ts, 720.0 + i * 0.1, "measured", "ppm"))
+    r = CollectResult("scd40"); r.observations = rows
+    db.save_result(r)
+
+    printed = []
+    monkeypatch.setattr("builtins.print", lambda *a, **k: printed.append(" ".join(map(str, a))))
+    main.cmd_offset(argparse.Namespace(a="desk", b="bedroom", metric="co2_ppm",
+                                       last=120, settle=0), db)
+    out = "\n".join(printed)
+    assert "n=60 paired minutes" in out          # not the empty range the bug gave
+    assert "-20.0" in out            # desk reads 20 ppm below bedroom, by construction
