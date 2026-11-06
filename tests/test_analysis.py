@@ -621,3 +621,88 @@ def test_the_detector_finds_a_night_in_the_bedroom(db):
                                       co2, now - 86400, now)
     assert found, "a six-hour climb should be reported as somebody being there"
     assert found[0]["end_ts"] - found[0]["start_ts"] > 3 * 3600
+
+
+# ---------------------------------------------------------------- standardised fits
+def test_a_departure_is_where_filling_turns_into_clearing():
+    """Anchoring on the event rather than on a threshold crossing is what makes two
+    measurements comparable: same delay after the event, same span."""
+    idx = pd.date_range("2026-11-03", periods=72, freq="5min", tz="UTC")
+    up = 500 + np.arange(36) * 40.0                       # three hours filling
+    down = up[-1] - np.arange(36) * 30.0                  # three hours clearing
+    s = pd.Series(np.concatenate([up, down]), index=idx)
+
+    found = features.departures(s)
+    assert len(found) == 1
+    assert abs((found[0] - idx[35]).total_seconds()) <= 900   # within a few samples
+
+
+def test_the_standardised_fit_always_has_the_same_geometry(db):
+    idx = pd.date_range("2026-11-03", periods=96, freq="5min", tz="UTC")
+    hours = np.arange(96) * 5 / 60.0
+    rise = 500 + np.arange(24) * 50.0
+    peak_at = idx[23]
+    decay = 400 + (rise[-1] - 400) * np.exp(-0.5 * (hours[24:] - hours[24]))
+    s = pd.Series(np.concatenate([rise, decay]), index=idx)
+
+    fit = features.departure_decay(s, 400.0, peak_at)
+    assert fit is not None
+    assert fit["lambda_h"] == pytest.approx(0.5, rel=0.15)
+    # the window starts exactly the configured delay after the departure
+    offset = (fit["start"] - peak_at).total_seconds() / 60
+    assert features.DEPARTURE_OFFSET_MIN <= offset < features.DEPARTURE_OFFSET_MIN + 10
+    span = (fit["end"] - fit["start"]).total_seconds() / 60
+    assert span == pytest.approx(features.DEPARTURE_WINDOW_MIN, abs=10)
+
+
+def test_the_weather_fit_refuses_until_it_has_enough(db):
+    from analysis.room_model import fit_weather
+
+    db.save_decays([{"location": "r", "start_ts": 100 * i, "end_ts": 100 * i + 50,
+                     "lambda_h": 0.4, "r2": 0.99, "method": "departure",
+                     "inferred": "sealed", "wind_ms": 3.0, "delta_t_c": 10.0}
+                    for i in range(3)])
+    out = fit_weather(db, "r")
+    assert "c" not in out and out["n"] == 3        # three points, three coefficients
+
+
+def test_the_weather_fit_recovers_coefficients_it_was_given(db):
+    """lambda^2 = a + b*dT + c*v^2 is linear in the coefficients, so a room built to
+    obey it should hand them back."""
+    from analysis.room_model import fit_weather, predicted_lambda
+
+    a, b, c = 0.05, 0.004, 0.012
+    rows = []
+    for i, (wind, dT) in enumerate([(1.0, 8.0), (2.5, 11.0), (4.0, 9.0), (5.5, 12.0),
+                                    (3.0, 10.0), (6.5, 8.5), (1.5, 13.0), (5.0, 9.5)]):
+        lam = math.sqrt(a + b * dT + c * wind ** 2)
+        rows.append({"location": "r", "start_ts": 1000 * i, "end_ts": 1000 * i + 500,
+                     "lambda_h": lam, "r2": 0.99, "method": "departure",
+                     "inferred": "sealed", "wind_ms": wind, "delta_t_c": dT})
+    db.save_decays(rows)
+
+    out = fit_weather(db, "r")
+    assert out["n"] == 8 and out["r2"] > 0.99
+    assert out["c"] == pytest.approx(c, rel=0.05)      # the wind term, recovered
+    assert out["b"] == pytest.approx(b, abs=0.004)
+    assert predicted_lambda(out, 4.0, 10.0) == pytest.approx(
+        math.sqrt(a + b * 10 + c * 16), rel=0.05)
+
+
+def test_threshold_windows_do_not_duplicate_a_standardised_one(db):
+    """One physical event must produce one row, measured the better way."""
+    now = int(time.time()) // 300 * 300
+    rows, value = [], 500.0
+    for i in range(144):
+        ts = now - (144 - i) * 300
+        value = value + 55.0 if i < 48 else 400 + (value - 400) * math.exp(-0.5 * 5 / 60)
+        rows.append(Observation("scd40", "co2_ppm", "solo", ts, round(value, 1),
+                                "measured", "ppm"))
+    r = CollectResult("scd40"); r.observations = rows
+    db.save_result(r)
+    learn(db, "solo", days=2, now=now)
+
+    spans = [(d["start_ts"], d["end_ts"], d["method"]) for d in db.decays("solo")]
+    for i, (a1, b1, _m1) in enumerate(spans):
+        for a2, b2, _m2 in spans[i + 1:]:
+            assert not (a1 <= b2 and a2 <= b1), f"overlapping rows {spans}"

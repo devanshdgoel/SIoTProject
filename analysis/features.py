@@ -429,6 +429,49 @@ def occupancy_prior(db, location, start, end, step_s=GRID_S):
             "spell_min": round(spell_min), "runs": len(runs)}
 
 
+DEPARTURE_OFFSET_MIN = 20     # let the room settle after the door closes
+DEPARTURE_WINDOW_MIN = 60     # then measure over a fixed span, every time
+
+
+def departures(co2, rise_ppm_h=60.0, fall_ppm_h=-40.0, min_gap_s=5400):
+    """Moments a room stopped filling and began clearing - i.e. the last person left.
+
+    Anchoring on this rather than on a threshold crossing gives every measurement the
+    same geometry: the same delay after the event, over the same span. Threshold-found
+    windows vary in length and in how far into the decay they start, so their results
+    are not strictly comparable with each other. These are."""
+    if co2.dropna().size < 24:
+        return []
+    smooth = co2.rolling(5, center=True, min_periods=2).median()
+    slope = smooth.diff() * 3600.0 / GRID_S
+    rising = (slope > rise_ppm_h).to_numpy()
+    falling = (slope < fall_ppm_h).to_numpy()
+    out = []
+    for i in range(6, len(co2) - 6):
+        if rising[i - 6:i].sum() >= 4 and falling[i:i + 6].sum() >= 4:
+            when = co2.index[i]
+            if not out or (when - out[-1]).total_seconds() > min_gap_s:
+                out.append(when)
+    return out
+
+
+def departure_decay(co2, c_out, when, offset_min=DEPARTURE_OFFSET_MIN,
+                    window_min=DEPARTURE_WINDOW_MIN):
+    """Air-change rate measured over a fixed span after a departure, or None.
+
+    The offset exists because the minute somebody walks out the room is still mixing;
+    starting immediately measures the mixing as well as the leak."""
+    start = when + pd.Timedelta(minutes=offset_min)
+    seg = co2.loc[start:start + pd.Timedelta(minutes=window_min)].dropna()
+    if seg.size < 8:
+        return None
+    fit = fit_decay(seg, c_out)
+    if fit is None:
+        return None
+    fit["start"], fit["end"] = seg.index[0], seg.index[-1]
+    return fit
+
+
 def at(s, ts, tol_s=5400):
     """Value of a series nearest a timestamp, or None if nothing is close enough."""
     if s is None:

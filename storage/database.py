@@ -38,7 +38,8 @@ class Database:
 
         Additive only: a column that is missing is appended, nothing is dropped or
         rewritten, so running against an older database never loses anything."""
-        for table, column, decl in (("labels", "people", "INTEGER"),):
+        for table, column, decl in (("labels", "people", "INTEGER"),
+                                    ("decay_events", "method", "TEXT")):
             have = {r[1] for r in c.execute(f"PRAGMA table_info({table})")}
             if column not in have:
                 c.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")

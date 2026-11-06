@@ -183,22 +183,42 @@ def learn(db, location, days=14, now=None):
     wind = features.series(db, "wind_ms", "home", start, now)
     temp_in = features.series(db, "indoor_temp_c", location, start, now)
 
+    def record(fit, a, b, method):
+        mid = int((a.timestamp() + b.timestamp()) / 2)
+        t_in, t_out = features.at(temp_in, mid), features.at(temp_out, mid)
+        return {"location": location, "start_ts": int(a.timestamp()),
+                "end_ts": int(b.timestamp()), "lambda_h": fit["lambda_h"],
+                "stderr": fit.get("stderr"), "r2": fit["r2"],
+                "c_start": float(co2.loc[a:b].iloc[0]), "c_end": float(co2.loc[a:b].iloc[-1]),
+                "c_out": c_out,
+                "delta_t_c": None if t_in is None or t_out is None else t_in - t_out,
+                "wind_ms": features.at(wind, mid), "method": method,
+                "labelled": features.label_at(labels, mid, "window")}
+
     rows, lams, marks = [], [], []
+
+    # Standardised measurements first. Every one of these starts the same delay after
+    # somebody left and runs for the same span, so they are comparable with each other
+    # in a way that threshold-found windows are not - which is what makes them usable
+    # for tracking how the rate moves with the weather.
+    taken = []
+    for when in features.departures(co2):
+        fit = features.departure_decay(co2, c_out, when)
+        if fit is None or fit["r2"] < MIN_R2:
+            continue
+        rows.append(record(fit, fit["start"], fit["end"], "departure"))
+        taken.append((fit["start"], fit["end"]))
+        lams.append(fit["lambda_h"])
+        marks.append(rows[-1]["labelled"])
+
     for a, b in features.decay_windows(co2, c_out):
+        if any(a <= end and start <= b for start, end in taken):
+            continue                             # already measured, and measured better
         fit = features.best_decay_fit(co2.loc[a:b], c_out)
         if fit is None or fit["r2"] < MIN_R2:
             continue
         a, b = fit["start"], fit["end"]          # the trimmed span the fit actually used
-        mid = int((a.timestamp() + b.timestamp()) / 2)
-        t_in, t_out = features.at(temp_in, mid), features.at(temp_out, mid)
-        rows.append({"location": location, "start_ts": int(a.timestamp()),
-                     "end_ts": int(b.timestamp()), "lambda_h": fit["lambda_h"],
-                     "stderr": fit.get("stderr"), "r2": fit["r2"],
-                     "c_start": float(co2.loc[a:b].iloc[0]), "c_end": float(co2.loc[a:b].iloc[-1]),
-                     "c_out": c_out,
-                     "delta_t_c": None if t_in is None or t_out is None else t_in - t_out,
-                     "wind_ms": features.at(wind, mid),
-                     "labelled": features.label_at(labels, mid, "window")})
+        rows.append(record(fit, a, b, "window"))
         lams.append(fit["lambda_h"])
         marks.append(rows[-1]["labelled"])
 
@@ -304,6 +324,65 @@ def learn(db, location, days=14, now=None):
                      {"from": "indoor temperature decay while ventilating"})
         summary["tau_t_h"] = (round(med, 2), n)
     return summary
+
+
+MIN_WEATHER_FITS = 6          # below this the three coefficients are not identifiable
+
+
+def fit_weather(db, location, min_r2=0.90):
+    """How this room's air-change rate moves with the weather.
+
+    Infiltration is driven by two pressures - the stack effect from the indoor to
+    outdoor temperature difference, and wind on the outside of the building. They add
+    in quadrature rather than linearly, because pressures combine as energies and flow
+    goes as the square root of pressure. So the form is
+
+        lambda = sqrt(a + b*|dT| + c*v^2)
+
+    which squares into an ordinary linear regression of lambda^2 on |dT| and v^2. The
+    functional form is derived, not chosen to fit.
+
+    Only standardised, departure-anchored measurements are used. Threshold-found
+    windows differ in length and in how far into a decay they begin, so pooling them
+    would put the measurement geometry into the residuals alongside the weather.
+
+    Returns None - and stores nothing - until there are enough of them. With three
+    coefficients and a handful of points the fit would be meaningless however good its
+    r-squared looked."""
+    usable = [r for r in db.decays(location, min_r2=min_r2)
+              if (r["method"] == "departure" and r["inferred"] == "sealed"
+                  and r["wind_ms"] is not None and r["delta_t_c"] is not None)]
+    if len(usable) < MIN_WEATHER_FITS:
+        return {"n": len(usable), "need": MIN_WEATHER_FITS,
+                "note": "not enough standardised measurements yet"}
+
+    lam = np.array([r["lambda_h"] for r in usable], dtype=float)
+    wind = np.array([r["wind_ms"] for r in usable], dtype=float)
+    dT = np.abs(np.array([r["delta_t_c"] for r in usable], dtype=float))
+    design = np.column_stack([np.ones_like(lam), dT, wind ** 2])
+    coef, *_ = np.linalg.lstsq(design, lam ** 2, rcond=None)
+    predicted = design @ coef
+    resid = lam ** 2 - predicted
+    dof = max(1, len(lam) - 3)
+    cov = float(np.sum(resid ** 2)) / dof * np.linalg.pinv(design.T @ design)
+    err = np.sqrt(np.clip(np.diag(cov), 0, None))
+    total = float(np.sum((lam ** 2 - np.mean(lam ** 2)) ** 2))
+    out = {"n": len(lam), "a": float(coef[0]), "b": float(coef[1]), "c": float(coef[2]),
+           "stderr": [float(e) for e in err],
+           "r2": 1 - float(np.sum(resid ** 2)) / total if total > 0 else 0.0,
+           "wind_range": [round(float(wind.min()), 1), round(float(wind.max()), 1)],
+           "dT_range": [round(float(dT.min()), 1), round(float(dT.max()), 1)]}
+    db.set_param(location, "lambda_wind_c", out["c"], out["stderr"][2], len(lam),
+                 "(1/h)^2 per (m/s)^2", out)
+    return out
+
+
+def predicted_lambda(fit, wind, delta_t):
+    """The air-change rate the fitted relationship expects, or None without a fit."""
+    if not fit or "c" not in fit:
+        return None
+    value = fit["a"] + fit["b"] * abs(delta_t) + fit["c"] * wind ** 2
+    return float(np.sqrt(value)) if value > 0 else None
 
 
 class RoomModel:

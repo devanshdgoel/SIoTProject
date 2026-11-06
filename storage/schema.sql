@@ -184,6 +184,7 @@ CREATE TABLE IF NOT EXISTS decay_events (
     wind_ms   REAL,
     labelled  TEXT,                       -- window state from labels, if one covers it
     inferred  TEXT,                       -- sealed | ventilated, from the fitted value
+    method    TEXT,                       -- departure (standardised) | window (threshold-found)
     PRIMARY KEY (location, start_ts)
 );
 
