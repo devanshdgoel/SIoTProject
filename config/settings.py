@@ -56,13 +56,21 @@ SCD40_LOCATION = "desk"       # default room for a node that does not say which 
 # the dashboard draws it, and the node's OLED renders it (firmware/esp32_scd40).
 EXPRESSIONS = ["neutral", "happy", "concerned", "alert", "sleepy", "sad"]
 
+# --- AURN (DEFRA reference analysers; no API key) ---------------------------
+# Measured outdoor air, against Open-Meteo's ~11 km CAMS model cell. Each pollutant
+# at a site is its own station id; `python -m collectors.aurn` lists the nearest.
+# 786074 Westminster and 962 North Kensington are urban background; 1033 Marylebone
+# Road is kerbside, which brackets a flat on a busy road between the two characters.
+AURN_API_ROOT = "https://uk-air.defra.gov.uk/sos-ukair/api/v1"
+AURN_STATIONS = [s.strip() for s in os.getenv("AURN_STATIONS", "786074,962,1033").split(",") if s.strip()]
+
 # --- Which collectors run ---------------------------------------------------
 # Everything stays importable and testable; this only decides what the scheduler
 # starts. The city-scale collectors (grid carbon, Thames overflows, LAQN) live in
 # archive/london_side with a note on why and how to bring them back; the question
 # here is indoor air and the body's response to it, and none of them feed that.
 COLLECTORS_ENABLED = [c.strip() for c in
-                      os.getenv("COLLECTORS", "scd40,open_meteo,ultrahuman").split(",")
+                      os.getenv("COLLECTORS", "scd40,open_meteo,ultrahuman,aurn").split(",")
                       if c.strip()]
 
 # Ultrahuman metrics worth storing for the air-quality question: the overnight
@@ -79,7 +87,8 @@ ULTRAHUMAN_METRICS = [c.strip() for c in os.getenv(
 INTERVALS = {
     "scd40": SCD40_WINDOW_S,   # the job itself blocks for the averaging window
     "open_meteo": 1800,        # hourly model output; 30 min guarantees freshness
-    "ultrahuman": 1800,        # ring syncs via phone, so sub-30-min polling gains nothing
+    "ultrahuman": 1800,
+    "aurn": 1800,             # hourly analyser means, published with a lag        # ring syncs via phone, so sub-30-min polling gains nothing
 }
 
 # --- Analysis --------------------------------------------------------------
@@ -97,6 +106,7 @@ WEEK_TARGET_DAYS = 7
 STALE_AFTER_S = {
     "scd40": 300,
     "open_meteo": 3 * 3600,
+    "aurn": 6 * 3600,         # ratification lag means the newest hour often trails
     "ultrahuman": 12 * 3600,   # the ring syncs only when the phone app opens, so a
                                # half-day lag is normal, not a fault. A real failure
                                # shows up as a collector error, not as stale data.

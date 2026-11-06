@@ -27,7 +27,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from analysis import analysis_human
-from collectors import open_meteo, scd40, ultrahuman
+from collectors import aurn, open_meteo, scd40, ultrahuman
 from collectors.base import run_collector
 from config import settings
 from storage.database import Database
@@ -38,6 +38,7 @@ ALL_COLLECTORS = {
     "scd40": scd40,
     "open_meteo": open_meteo,
     "ultrahuman": ultrahuman,
+    "aurn": aurn,
 }
 COLLECTORS = {n: m for n, m in ALL_COLLECTORS.items() if n in settings.COLLECTORS_ENABLED}
 PARKED = [n for n in ALL_COLLECTORS if n not in COLLECTORS]
@@ -188,8 +189,9 @@ def cmd_label(args, db):
         start, end = _when(args.start, settings.USER_TZ), _when(args.end, settings.USER_TZ)
     if end <= start:
         raise SystemExit("that label ends before it starts")
-    db.add_label(args.location, args.kind, args.value, start, end, args.note)
-    print(f"labelled {args.location} {args.kind}={args.value}  "
+    db.add_label(args.location, args.kind, args.value, start, end, args.note, args.people)
+    who = f" ({args.people} people)" if args.people else ""
+    print(f"labelled {args.location} {args.kind}={args.value}{who}  "
           f"{_fmt(start)} -> {_fmt(end)} UTC  ({(end - start) / 60:.0f} min)")
 
 
@@ -405,7 +407,9 @@ def main():
     p.add_argument("location"); p.add_argument("kind", choices=["window", "door", "occupancy", "cooking"])
     p.add_argument("value"); p.add_argument("--last", type=int, metavar="MIN")
     p.add_argument("--from", dest="start"); p.add_argument("--to", dest="end", default="now")
-    p.add_argument("--note"); p.set_defaults(fn=cmd_label)
+    p.add_argument("--note")
+    p.add_argument("--people", type=int, help="how many, for an occupancy label")
+    p.set_defaults(fn=cmd_label)
     p = sub.add_parser("params"); p.set_defaults(fn=cmd_params)
     p = sub.add_parser("ventilate", help="tonight under each option, and when to air out")
     p.add_argument("--room", default="bedroom"); p.add_argument("--hours", type=float, default=8.0)

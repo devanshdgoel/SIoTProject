@@ -155,13 +155,19 @@ def active_room(db, names, quiet):
     return "desk" if "desk" in names else names[0]
 
 
-def forecast_rows(model, state, now):
-    """Forecasts for the fixed horizons, written before the outcome is known."""
+def forecast_rows(model, state, now, prior=None):
+    """Forecasts for the fixed horizons, written before the outcome is known.
+
+    The prior is what stops a two-hour forecast assuming you sit still for two hours.
+    Without it this over-predicted by more than a thousand ppm, every time, in the
+    same direction - and a biased forecast makes the whole learning curve worthless."""
     if state.get("stale"):
         return []
     out = []
     for horizon in HORIZONS_S:
-        path = model.forward(state["co2"], horizon / 60.0, state["occupied"])
+        path = model.forward(state["co2"], horizon / 60.0, state["occupied"],
+                             prior=(prior or {}).get("prior"), now=now,
+                             persistence_min=(prior or {}).get("persistence_min", 60.0))
         if not path:
             continue
         value = path[-1][1]
@@ -191,8 +197,10 @@ def run(db, now=None, relearn_days=14):
         out["fits"][name] = learn(db, name, relearn_days, now)
         models[name] = RoomModel(db, name)
         states[name] = room_state(db, name, models[name], now, strict)
+        profile = features.occupancy_prior(db, name, now - relearn_days * 86400, now)
+        states[name]["has_prior"] = profile is not None
         out["rooms"][name] = states[name]
-        db.add_predictions(forecast_rows(models[name], states[name], now))
+        db.add_predictions(forecast_rows(models[name], states[name], now, profile))
 
     focus = active_room(db, names, quiet)
     if focus is None:

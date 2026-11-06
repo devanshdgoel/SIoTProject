@@ -1,7 +1,9 @@
 """Analysis tests. The room is simulated from known physics, so the fits can be
 checked against the truth that generated them rather than against themselves."""
 
+import datetime as dt
 import math
+import time
 
 import numpy as np
 import pandas as pd
@@ -312,3 +314,232 @@ def test_a_shut_window_is_charged_no_heat(db):
     assert ventilation._extra_cooling(model, 21.0, 9.0, 480, 0.3) == 0.0
     assert ventilation._extra_cooling(model, 21.0, 9.0, 480, 3.0) > 1.0
     assert ventilation._extra_cooling(model, 15.0, 18.0, 480, 3.0) == 0.0   # warmer outside
+
+
+# ---------------------------------------------------------------- event rules
+def _series(now, values, step=300):
+    return [(now - (len(values) - 1 - i) * step, v) for i, v in enumerate(values)]
+
+
+def test_a_single_spike_is_not_an_event():
+    from analysis import event_rules as er
+    rule = er.Rule("co2", "co2_ppm", enter=1000, exit_at=850, persistence_s=900)
+    now = 1_793_000_000
+    a = er.assess(rule, _series(now, [700, 700, 1500, 700, 700]), now)
+    assert not a.on and "not yet persistent" in a.reason
+
+
+def test_it_fires_only_once_the_condition_has_held():
+    from analysis import event_rules as er
+    rule = er.Rule("co2", "co2_ppm", enter=1000, exit_at=850, persistence_s=900)
+    now = 1_793_000_000
+    a = er.assess(rule, _series(now, [1100] * 6), now)
+    assert a.on and a.fire and 0 < a.confidence <= 1
+
+
+def test_hysteresis_leaves_no_value_to_chatter_on():
+    from analysis import event_rules as er
+    rule = er.Rule("co2", "co2_ppm", enter=1000, exit_at=850, persistence_s=900)
+    now = 1_793_000_000
+    # sitting between the two levels: once on, it stays on. It was announced ten
+    # minutes ago, so it holds the state quietly rather than repeating itself.
+    held = er.assess(rule, _series(now, [920] * 6), now, was_on=True, last_fired_at=now - 600)
+    assert held.on and not held.fire
+    # and from off, that same value does not turn it on
+    assert not er.assess(rule, _series(now, [920] * 6), now, was_on=False).on
+    # only falling past the release level clears it
+    assert not er.assess(rule, _series(now, [800] * 6), now, was_on=True).on
+
+
+def test_a_cooldown_stops_it_repeating_itself():
+    from analysis import event_rules as er
+    rule = er.Rule("co2", "co2_ppm", enter=1000, exit_at=850, persistence_s=900,
+                   cooldown_s=3600)
+    now = 1_793_000_000
+    quiet = er.assess(rule, _series(now, [1100] * 6), now, was_on=True, last_fired_at=now - 600)
+    assert quiet.on and not quiet.fire and "said" in quiet.reason
+    later = er.assess(rule, _series(now, [1100] * 6), now, was_on=False, last_fired_at=now - 7200)
+    assert later.fire
+
+
+def test_a_dead_sensor_produces_nothing():
+    from analysis import event_rules as er
+    rule = er.Rule("co2", "co2_ppm", enter=1000, exit_at=850, stale_after_s=900)
+    now = 1_793_000_000
+    stale = er.assess(rule, _series(now - 7200, [1800] * 6), now)
+    assert stale.stale and not stale.on and not stale.fire
+
+
+def test_confidence_rises_with_margin_and_completeness():
+    from analysis import event_rules as er
+    rule = er.Rule("co2", "co2_ppm", enter=1000, exit_at=850, persistence_s=900)
+    now = 1_793_000_000
+    barely = er.assess(rule, _series(now, [1005] * 6), now)
+    clearly = er.assess(rule, _series(now, [2000] * 6), now)
+    assert clearly.confidence > barely.confidence
+
+
+# ---------------------------------------------------------------- replay
+def test_replay_shows_only_what_had_arrived(db, tmp_path):
+    """The whole point: a view of the database as it stood at some past moment,
+    judged on when each row was stored rather than the time it describes."""
+    import time as _time
+    from analysis import replay
+
+    now = int(_time.time()) // 300 * 300
+    rows = []
+    for age_h in (5, 3, 1):
+        rows.append(Observation("scd40", "co2_ppm", "bedroom", now - age_h * 3600,
+                                700.0 + age_h, "measured", "ppm",
+                                retrieved_at=now - age_h * 3600))
+    # a value about the past that was only stored just now: it must stay hidden
+    rows.append(Observation("scd40", "co2_ppm", "bedroom", now - 4 * 3600, 999.0,
+                            "measured", "ppm", retrieved_at=now))
+    r = CollectResult("scd40"); r.observations = rows
+    db.save_result(r)
+
+    with replay.AsOf(db, tmp_path / "replay.db") as view:
+        view.advance_to(now - 2 * 3600)
+        with view.db.conn() as c:
+            seen = [x[0] for x in c.execute("SELECT value FROM observations ORDER BY ts")]
+        assert 999.0 not in seen          # stored later, so invisible at that moment
+        assert len(seen) == 2             # only the 5 h and 3 h old rows had arrived
+
+        view.advance_to(now)
+        with view.db.conn() as c:
+            seen_now = [x[0] for x in c.execute("SELECT value FROM observations")]
+        assert 999.0 in seen_now and len(seen_now) == 4
+
+
+def test_replay_refuses_to_run_backwards(db, tmp_path):
+    import time as _time
+    from analysis import replay
+
+    now = int(_time.time())
+    with replay.AsOf(db, tmp_path / "r2.db") as view:
+        view.advance_to(now)
+        with pytest.raises(ValueError):
+            view.advance_to(now - 3600)
+
+
+def test_replay_leaves_derived_tables_empty(db, tmp_path):
+    """Learned parameters must be re-derived at each step, never inherited, or the
+    replay would be handing the model answers it had not yet earned."""
+    import time as _time
+    from analysis import replay
+
+    now = int(_time.time())
+    db.set_param("bedroom", "lambda_sealed", 0.3, None, 9, "1/h")
+    db.save_decays([{"location": "bedroom", "start_ts": now - 7200,
+                     "end_ts": now - 3600, "lambda_h": 0.3, "r2": 0.99}])
+    with replay.AsOf(db, tmp_path / "r3.db") as view:
+        view.advance_to(now)
+        with view.db.conn() as c:
+            assert c.execute("SELECT COUNT(*) FROM room_params").fetchone()[0] == 0
+            assert c.execute("SELECT COUNT(*) FROM decay_events").fetchone()[0] == 0
+
+
+def test_a_forecast_stops_assuming_you_never_leave(db):
+    """The occupancy bias: the old forecast saw CO2 rising, decided the room was
+    occupied, and then assumed it stayed occupied for the whole horizon. It
+    over-predicted by more than a thousand ppm in the same direction every time,
+    which makes an improving-error curve meaningless."""
+    db.set_param("room", "c_out", 400.0, None, 99, "ppm")
+    db.set_param("room", "lambda_sealed", 0.25, 0.02, 9, "1/h")
+    db.set_param("room", "source_ppm_h", 900.0, 50.0, 5, "ppm/h")
+    model = RoomModel(db, "room")
+
+    # a room that is in fact almost always empty at every hour
+    prior = [0.05] * 24
+    stays = model.forward(800, 120, True)
+    leaves = model.forward(800, 120, True, prior=prior, now=1_793_000_000)
+    assert stays[-1][1] > leaves[-1][1] + 300          # the assumption was costing this much
+    assert leaves[0][1] == pytest.approx(stays[0][1], rel=0.02)   # agree at the first step
+
+    # a room that is in fact always occupied: the prior should barely change anything
+    always = model.forward(800, 120, True, prior=[1.0] * 24, now=1_793_000_000)
+    assert always[-1][1] == pytest.approx(stays[-1][1], rel=0.02)
+
+
+def test_the_occupancy_prior_is_learned_not_assumed(db):
+    """It comes from the room's own testimony - CO2 climbing faster than leakage can
+    explain - plus labels and corroborated sleep windows. Never from a guess about
+    when people are usually in."""
+    from zoneinfo import ZoneInfo
+
+    from config import settings
+
+    zone = ZoneInfo(settings.USER_TZ)
+    now = int(time.time()) // 300 * 300
+    rows, value = [], 500.0
+    for i in range(288 * 4):                       # four days at five minutes
+        ts = now - (288 * 4 - i) * 300
+        hour = dt.datetime.fromtimestamp(ts, zone).hour
+        # occupied 01:00-07:00: filling. Otherwise empty: clearing.
+        value += 55.0 if 1 <= hour < 7 else -35.0
+        value = min(2600.0, max(450.0, value))
+        rows.append(Observation("scd40", "co2_ppm", "room", ts, value, "measured", "ppm"))
+    r = CollectResult("scd40"); r.observations = rows
+    db.save_result(r)
+
+    profile = features.occupancy_prior(db, "room", now - 6 * 86400, now)
+    assert profile is not None and len(profile["prior"]) == 24
+    assert profile["prior"][3] > 0.8               # deep in the occupied stretch
+    assert profile["prior"][14] < 0.2              # mid-afternoon, clearing
+    # and it measures how long a spell lasts rather than assuming a number
+    assert 20.0 <= profile["persistence_min"] <= 360.0
+    assert profile["spell_min"] > 60               # six hours of filling, not minutes
+
+
+def test_two_people_do_not_halve_the_room(db):
+    """A source fitted without the headcount is wrong for one person and for two,
+    and the volume it implies comes out at half the real size. Storing it per person
+    keeps the physics straight whoever is in the room."""
+    now = int(time.time()) // 300 * 300
+    # A room obeying the mass balance with two people in it: source 1600 ppm/h, so
+    # 800 each. It has to be a real saturating rise, not a straight line, because the
+    # curvature is what carries the information the fit reads.
+    c_out, lam, source = 450.0, 0.4, 1600.0
+    ceiling = c_out + source / lam
+    rows = []
+    for i in range(96):
+        ts = now - (96 - i) * 300
+        hours = i * 300 / 3600.0
+        value = ceiling + (500.0 - ceiling) * math.exp(-lam * hours)
+        rows.append(Observation("scd40", "co2_ppm", "pair", ts, round(value, 1),
+                                "measured", "ppm"))
+    r = CollectResult("scd40"); r.observations = rows
+    db.save_result(r)
+    db.add_label("pair", "occupancy", "present", now - 96 * 300, now, "two of us", people=2)
+
+    learn(db, "pair", days=2, now=now)
+    stored = db.params("pair")
+    assert "source_ppm_h" in stored
+    per_person = stored["source_ppm_h"]["value"]
+    assert stored["source_ppm_h"]["unit"] == "ppm/h per person"
+    assert per_person == pytest.approx(800.0, rel=0.25)   # half of 1600, not all of it
+    assert int(stored["typical_people"]["value"]) == 2
+
+    # the model puts the people back when it predicts
+    model = RoomModel(db, "pair")
+    assert model.occupants == 2
+    # One rise is below the count at which a fitted source displaces the default, so
+    # the model is still on its default here - but it must multiply whatever source
+    # it is using by the headcount, which is the behaviour under test.
+    assert model.steady_state(occupied=True) == pytest.approx(
+        model.value["c_out"]
+        + model.value["source_ppm_h"] * 2 / model.value["lambda_sealed"], rel=1e-6)
+    db.set_param("pair", "typical_people", 1, None, 9, "people")
+    assert RoomModel(db, "pair").steady_state(occupied=True) < model.steady_state(occupied=True)
+
+
+def test_an_unlabelled_room_still_assumes_one_person(db):
+    """One is what an occupancy label has always meant, so nothing changes for the
+    bedroom, which is where the measurements are cleanest."""
+    from analysis import features
+    labels = [{"kind": "occupancy", "value": "present", "people": None,
+               "start_ts": 0, "end_ts": 100}]
+    assert features.people_at(labels, 50) == 1
+    labels[0]["people"] = 3
+    assert features.people_at(labels, 50) == 3
+    assert features.people_at(labels, 500) == 1          # outside the label

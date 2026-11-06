@@ -284,3 +284,16 @@ def test_a_well_ventilated_room_is_not_rejected_as_a_fault(db):
     assert b.accept({**base, "ts": now - 120, "co2": 0}) == 0   # dead sensor, rejected
     assert b.accept({**base, "ts": now - 180, "co2": 240}) == 0
     b.server.shutdown()
+
+
+def test_a_second_ingest_server_cannot_quietly_share_the_port(db):
+    """Windows treats SO_REUSEADDR as permission to share a listening socket, so a
+    second collector bound 8765 alongside the first and the nodes' readings were
+    split between two databases with nothing reported. The second bind must fail."""
+    import pytest as _pytest
+    first = scd40.HttpBackend(db, port=0, token="secret")
+    try:
+        with _pytest.raises(OSError):
+            scd40.HttpBackend(db, port=first.port, token="secret")
+    finally:
+        first.server.shutdown()

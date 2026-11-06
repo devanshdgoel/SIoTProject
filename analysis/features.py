@@ -14,6 +14,8 @@ Three jobs.
      the air-change rate follows, and plateaus, from which the CO2 source term does.
 """
 
+import datetime as dt
+
 import numpy as np
 import pandas as pd
 from scipy import optimize, stats
@@ -316,7 +318,12 @@ def fit_rise(seg, c_out):
     try:
         popt, pcov = optimize.curve_fit(
             model, hours, y, p0=[max(y[-1] * 1.3, y[-1] + 200), y[0], 0.3],
-            bounds=([y[-1], c_out - 50, 0.02], [20000.0, y[0] + 200, 10.0]), maxfev=20000)
+            # The starting value is bounded by what was actually seen, not by c_out.
+            # Tying it to the baseline meant that whenever the baseline was still
+            # overestimated - which is exactly when a room has not been aired - the
+            # true start fell outside the bounds and the fit could not run at all.
+            bounds=([y[-1], float(np.min(y)) - 100.0, 0.02],
+                    [20000.0, y[0] + 200.0, 10.0]), maxfev=20000)
     except (RuntimeError, ValueError, TypeError):
         return None
     c_inf, _, rate = popt
@@ -340,6 +347,86 @@ def occupied_windows(db, location, labels, start, end):
              if lb["kind"] == "occupancy" and lb["value"] == "present"]
     spans += [(a, b) for a, b, _day in night_windows(db, start, end)]
     return sorted(set(spans))
+
+
+def occupancy_prior(db, location, start, end, step_s=GRID_S):
+    """How often this room is occupied, by hour of the local day, and for how long.
+
+    Returns {"prior": 24 probabilities, "persistence_min": how long a belief about
+    the present should be trusted, ...}. Evidence is measured, never assumed: spans the user
+    labelled, sleep windows the ring recorded and the room corroborated with a real
+    rise, and otherwise the room's own testimony - CO2 climbing faster than leakage
+    alone can explain means somebody is producing it.
+
+    This exists so a forecast can stop assuming that whoever is in the room now will
+    still be there in two hours. People leave; the long-run pattern knows roughly
+    when."""
+    from zoneinfo import ZoneInfo
+
+    from config import settings
+
+    co2 = series(db, "co2_ppm", location, start, end, step_s).dropna()
+    if co2.size < 48:
+        return None
+    labels = db.labels(location=location, start=start, end=end)
+    secs = co2.index.view("int64") // 1_000_000_000
+    values = co2.to_numpy(float)
+    occ = np.full(len(values), np.nan)
+
+    # weakest evidence first, so stronger evidence overwrites it
+    rise = np.full(len(values), np.nan)
+    rise[1:] = np.diff(values) * 3600.0 / step_s
+    occ[rise > 60.0] = 1.0
+    occ[rise < -30.0] = 0.0
+    # A room resting at its own outdoor level is empty, whatever its slope is doing.
+    # Somebody in it would be pushing it up. Without this, every long flat stretch
+    # after a room has finished clearing counts as no evidence at all, and the hours
+    # a room spends genuinely empty fall back to the average instead of to zero.
+    floor = float(np.nanpercentile(values, 5))
+    occ[(values < floor + 120.0) & ~(rise > 60.0)] = 0.0
+
+    for a, b, _day in night_windows(db, start, end):
+        inside = (secs >= a) & (secs <= b)
+        if inside.sum() >= 12 and values[inside][-1] - values[inside][0] > 200.0:
+            occ[inside] = 1.0
+    for lb in labels:
+        if lb["kind"] != "occupancy" or lb["value"] not in ("present", "absent"):
+            continue
+        occ[(secs >= lb["start_ts"]) & (secs <= lb["end_ts"])] = (
+            1.0 if lb["value"] == "present" else 0.0)
+
+    zone = ZoneInfo(settings.USER_TZ)
+    hours = np.array([dt.datetime.fromtimestamp(int(t), zone).hour for t in secs])
+    prior = []
+    for hour in range(24):
+        seen = occ[(hours == hour) & ~np.isnan(occ)]
+        prior.append(float(seen.mean()) if seen.size >= 3 else None)
+    known = [p for p in prior if p is not None]
+    fallback = float(np.mean(known)) if known else 0.5
+    prior = [fallback if p is None else p for p in prior]
+
+    # How long does somebody stay? Measured, not chosen. Occupied runs are found in
+    # the same evidence, and for a spell of known length the expected time still to
+    # run is half of it - which is the quantity a forecast actually needs.
+    # Bridge short interruptions first. Occupancy evidence flickers - CO2 does not
+    # climb on every single step even with somebody sitting there - and counting raw
+    # runs turns one night's sleep into dozens of ten-minute spells.
+    bridge = max(1, 1800 // step_s)
+    runs, current, missed = [], 0, 0
+    for flag in occ:
+        if flag == 1.0:
+            current += 1 + missed
+            missed = 0
+        elif current:
+            missed += 1
+            if missed > bridge:
+                runs.append(current); current, missed = 0, 0
+    if current:
+        runs.append(current)
+    spell_min = (float(np.median(runs)) * step_s / 60.0) if runs else 120.0
+    persistence = float(min(360.0, max(20.0, spell_min / 2.0)))
+    return {"prior": prior, "persistence_min": persistence,
+            "spell_min": round(spell_min), "runs": len(runs)}
 
 
 def at(s, ts, tol_s=5400):
@@ -372,6 +459,21 @@ def night_windows(db, start=None, end=None):
         rows = c.execute(q + " ORDER BY day", args).fetchall()
     return [(int(r["bedtime_start"]), int(r["bedtime_end"]), r["day"])
             for r in rows if r["bedtime_end"] > r["bedtime_start"]]
+
+
+def people_at(labels, ts, default=1):
+    """How many people the user says were in the room, or `default` if unstated.
+
+    One is the right default: it is what an unannotated occupancy label has always
+    meant, and it keeps a single-occupant room - which is where the measurements are
+    cleanest - behaving exactly as before."""
+    for lb in labels:
+        if lb["kind"] == "occupancy" and lb["value"] == "present" and                 lb["start_ts"] <= ts <= lb["end_ts"]:
+            try:
+                return max(1, int(lb["people"]))
+            except (KeyError, TypeError, ValueError, IndexError):
+                return default
+    return default
 
 
 def label_at(labels, ts, kind):

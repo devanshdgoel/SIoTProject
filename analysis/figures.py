@@ -406,3 +406,92 @@ def main(outdir=None):
 
 if __name__ == "__main__":
     main(sys.argv[1] if len(sys.argv) > 1 else None)
+
+
+def fig_estimators(db, out):
+    """Three independent routes to the same lambda, and what each one looks at.
+
+    The top row shows which samples each method consumes: decay fitting uses only
+    the handful of windows where the room happened to be empty and falling, while
+    the other two use the whole record. The bottom row shows the spectrum each
+    frequency estimate is read from, and the three answers side by side."""
+    from analysis import estimators
+    style()
+    rooms = ["bedroom", "desk"]
+    fig, axes = plt.subplots(3, 2, figsize=(13, 11),
+                             gridspec_kw={"height_ratios": [1.1, 1.0, 0.9]})
+
+    for col, room in enumerate(rooms):
+        res = estimators.compare(db, room, days=14)
+        c_out = res["c_out"]
+        now = int(time.time())
+        co2, _ = features.despike(features.series(db, "co2_ppm", room, now - 14 * 86400, now))
+        co2 = co2.dropna()
+
+        # --- what each method looks at -------------------------------------
+        ax = axes[0][col]
+        ax.plot(co2.index, co2.values, lw=0.8, color="#4f93e8" if room == "desk" else "#b07ae0",
+                label="every sample (integral, spectrum)")
+        used = 0
+        for r in db.decays(room, min_r2=0.90):
+            if r["inferred"] != "sealed":
+                continue
+            a = pd.Timestamp(r["start_ts"], unit="s", tz="UTC")
+            b = pd.Timestamp(r["end_ts"], unit="s", tz="UTC")
+            seg = co2.loc[a:b]
+            used += len(seg)
+            ax.plot(seg.index, seg.values, lw=2.4, color="#e2574c",
+                    label="empty-room decays (decay fit)" if used == len(seg) else None)
+        ax.axhline(c_out, ls=":", lw=1, color="#8b9bab")
+        ax.set_title(f"{room} - decay fitting sees {100*used/max(len(co2),1):.0f}% of the record",
+                     loc="left")
+        ax.set_ylabel("CO$_2$ ppm")
+        timeaxis(ax, days=True)
+        ax.legend(loc="upper right", fontsize=8)
+
+        # --- the spectrum the frequency estimate comes from -----------------
+        ax = axes[1][col]
+        sp = res["spectrum"].get("spectrum")
+        if sp:
+            f_, p_, fit = np.array(sp["freqs"]), np.array(sp["psd"]), np.array(sp["fit"])
+            ax.loglog(f_, p_, lw=0.7, color="#8b9bab", label="measured spectrum")
+            ax.loglog(f_, fit, lw=2.0, color="#3fb97f", label="first-order fit")
+            fc = res["spectrum"]["corner_hz_per_h"]
+            ax.axvline(fc, color="#3fb97f", ls="--", lw=1.2,
+                       label=f"corner {res['spectrum']['corner_period_h']:.0f} h"
+                             rf"  ->  $\lambda$={res['spectrum']['lambda_h']:.2f}/h")
+            if res["decay"].get("lambda_h"):
+                ax.axvline(res["decay"]["lambda_h"] / (2 * np.pi), color="#e2574c", ls="--",
+                           lw=1.2, label=f"where decay fitting says it is")
+            ax.axvline(1 / 24, color="#e2a23b", ls=":", lw=1, label="daily rhythm")
+        ax.set_xlabel("cycles per hour"); ax.set_ylabel("power")
+        ax.set_title("the room as a filter: fast rhythms are smoothed away", loc="left")
+        ax.legend(fontsize=8)
+
+        # --- the three answers ---------------------------------------------
+        ax = axes[2][col]
+        names, vals, errs, cols, ns = [], [], [], [], []
+        for key, colour in (("decay", "#e2574c"), ("integral", "#e2a23b"),
+                            ("spectrum", "#3fb97f")):
+            r = res[key]
+            if r.get("lambda_h") is None:
+                continue
+            names.append(key); vals.append(r["lambda_h"])
+            errs.append(r.get("stderr") or 0.0); cols.append(colour)
+            ns.append(f"n={r['n']}, {r.get('samples_used', 0)} samples")
+        y = np.arange(len(names))
+        ax.barh(y, vals, xerr=errs, color=cols, height=0.55, capsize=5, alpha=.85)
+        ax.set_yticks(y); ax.set_yticklabels(names)
+        for i, (v, note) in enumerate(zip(vals, ns)):
+            ax.text(v + (errs[i] or 0) + 0.02, i, f"{v:.3f}/h   {note}",
+                    va="center", fontsize=8, color="#c7d3de")
+        ax.set_xlim(0, max(vals + [0.1]) * 1.9)
+        ax.set_xlabel("air changes per hour")
+        ax.set_title("three independent routes to the same number", loc="left")
+
+    fig.suptitle("Measuring the same physical quantity three different ways", y=.995)
+    fig.tight_layout()
+    path = Path(out) / "08_estimators.png"
+    fig.savefig(path, dpi=140); plt.close(fig)
+    print(f"  {path.name}  {path.stat().st_size//1024} kB")
+    return path

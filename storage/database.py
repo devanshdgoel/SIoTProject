@@ -30,6 +30,18 @@ class Database:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.conn() as c:
             c.executescript(SCHEMA.read_text(encoding="utf-8"))
+            self._migrate(c)
+
+    @staticmethod
+    def _migrate(c):
+        """Add columns that CREATE TABLE IF NOT EXISTS cannot add to an existing table.
+
+        Additive only: a column that is missing is appended, nothing is dropped or
+        rewritten, so running against an older database never loses anything."""
+        for table, column, decl in (("labels", "people", "INTEGER"),):
+            have = {r[1] for r in c.execute(f"PRAGMA table_info({table})")}
+            if column not in have:
+                c.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
 
     @contextmanager
     def conn(self):
@@ -148,12 +160,18 @@ class Database:
         return obs, runs
 
     # ---- analysis layer --------------------------------------------------
-    def add_label(self, location, kind, value, start_ts, end_ts, note=None):
-        """Record user ground truth ('bedroom window open 14:00-15:00'). Idempotent."""
+    def add_label(self, location, kind, value, start_ts, end_ts, note=None, people=None):
+        """Record user ground truth ('bedroom window open 14:00-15:00'). Idempotent.
+
+        `people` matters for occupancy: two people fill a room twice as fast, so a
+        source term fitted without knowing the headcount is wrong for both cases and
+        the room volume it implies comes out at half its true size."""
         with self.conn() as c:
-            c.execute("INSERT OR REPLACE INTO labels (location,kind,value,start_ts,end_ts,note,created_at) "
-                      "VALUES (?,?,?,?,?,?,?)",
-                      (location, kind, value, int(start_ts), int(end_ts), note, int(time.time())))
+            c.execute("INSERT OR REPLACE INTO labels "
+                      "(location,kind,value,people,start_ts,end_ts,note,created_at) "
+                      "VALUES (?,?,?,?,?,?,?,?)",
+                      (location, kind, value, None if people is None else int(people),
+                       int(start_ts), int(end_ts), note, int(time.time())))
 
     def labels(self, location=None, kind=None, start=None, end=None):
         q, args = "SELECT * FROM labels WHERE 1=1", []

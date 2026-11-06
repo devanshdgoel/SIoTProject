@@ -219,7 +219,15 @@ class HttpBackend:
                 self._reply(200, {"accepted": accepted, "pressure_hpa": backend.pressure,
                                   "display": backend.display})
 
-        self.server = ThreadingHTTPServer(("0.0.0.0", settings.INGEST_PORT if port is None else port), Handler)
+        class Ingest(ThreadingHTTPServer):
+            # Windows treats SO_REUSEADDR as permission to share a listening port, so
+            # a second collector binds 8765 alongside the first instead of failing.
+            # Nothing errors; the nodes' readings are then split between two processes
+            # and land in whichever database each one writes to. Refusing the second
+            # bind turns a silent data loss into an immediate, obvious failure.
+            allow_reuse_address = False
+
+        self.server = Ingest(("0.0.0.0", settings.INGEST_PORT if port is None else port), Handler)
         self.port = self.server.server_address[1]
         threading.Thread(target=self.server.serve_forever, daemon=True, name="ingest").start()
 

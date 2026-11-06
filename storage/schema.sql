@@ -144,6 +144,7 @@ CREATE TABLE IF NOT EXISTS labels (
     location   TEXT    NOT NULL,
     kind       TEXT    NOT NULL,          -- window | door | occupancy | cooking
     value      TEXT    NOT NULL,          -- open | closed | present | absent | yes
+    people     INTEGER,                     -- how many, when the label is an occupancy
     start_ts   INTEGER NOT NULL,
     end_ts     INTEGER NOT NULL,
     note       TEXT,

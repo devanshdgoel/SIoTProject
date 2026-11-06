@@ -26,6 +26,7 @@ why every number it produces has a unit and a confidence interval.
 
 import json
 import time
+from datetime import datetime
 
 import numpy as np
 import pandas as pd
@@ -235,18 +236,28 @@ def learn(db, location, days=14, now=None):
                       pd.Timestamp(b, unit="s", tz="UTC")].dropna()
         fit = features.fit_rise(seg, c_out)
         if fit is not None and fit["r2"] >= 0.90:
+            # Divide by the headcount before averaging. Two people fill a room twice
+            # as fast, so a source fitted across a mixture of one- and two-person
+            # spells is wrong for both, and the volume it implies comes out halved.
+            fit["people"] = features.people_at(labels, (a + b) // 2, default=1)
+            fit["per_person"] = fit["source_ppm_h"] / fit["people"]
             rises.append(fit)
     if rises:
-        med, err, n = _robust([r["source_ppm_h"] for r in rises])
-        db.set_param(location, "source_ppm_h", med, err, n, "ppm/h",
-                     {"from": f"{n} occupied rise(s)",
+        med, err, n = _robust([r["per_person"] for r in rises])
+        counts = [r["people"] for r in rises]
+        typical = int(round(float(np.median(counts))))
+        db.set_param(location, "source_ppm_h", med, err, n, "ppm/h per person",
+                     {"from": f"{n} occupied rise(s)", "people_seen": counts,
                       "ceilings": [round(r["ceiling"]) for r in rises],
                       "lambda_from_rise": [round(r["lambda_h"], 3) for r in rises]})
+        db.set_param(location, "typical_people", typical, None, n, "people",
+                     {"from": "median headcount across the labelled occupied rises"})
         volume = CO2_PER_PERSON_LH * 1000.0 / med
         db.set_param(location, "volume_m3", volume, None, n, "m3",
                      {"assumes": "one seated adult at 18.7 L/h; compare with a tape measure"})
         summary["rises"] = n
         summary["source_ppm_h"] = (round(med, 1), n)
+        summary["typical_people"] = typical
         summary["volume_m3"] = round(volume, 1)
 
     lam_sealed = db.params(location).get("lambda_sealed")
@@ -316,6 +327,9 @@ class RoomModel:
                 self.n[name] = 0 if row is None else int(row["n"])
                 self.basis[name] = "default"
         self.volume_m3 = stored["volume_m3"]["value"] if "volume_m3" in stored else None
+        # How many people usually occupy it, when it is occupied at all.
+        row = stored.get("typical_people")
+        self.occupants = max(1, int(row["value"])) if row and row["value"] else 1
 
     @property
     def learned(self):
@@ -323,21 +337,58 @@ class RoomModel:
         return all(self.basis[k] == "learned" for k in ("c_out", "lambda_sealed", "source_ppm_h"))
 
     def steady_state(self, occupied, ventilated=False):
+        """Where the room is heading. The source is stored per person, so presence
+        alone is not enough - a living room shared by two fills twice as fast."""
         lam = self.value["lambda_open" if ventilated else "lambda_sealed"]
-        return self.value["c_out"] + (self.value["source_ppm_h"] / lam if occupied else 0.0)
+        source = self.value["source_ppm_h"] * self.occupants
+        return self.value["c_out"] + (source / lam if occupied else 0.0)
 
-    def forward(self, c0, minutes, occupied, ventilated=False, step_min=5):
+    def forward(self, c0, minutes, occupied, ventilated=False, step_min=5,
+                prior=None, now=None, persistence_min=60.0):
         """CO2 trajectory as [(minutes_from_now, ppm), ...].
 
-        Solved in closed form per step rather than numerically: over a step where
-        lambda and the source are constant the equation is exactly exponential."""
+        Closed form per step: over a step where lambda and the source are constant
+        the equation is exactly exponential, so no solver is needed.
+
+        With a `prior` - 24 hourly occupancy probabilities from
+        features.occupancy_prior - the assumption that whoever is here now stays here
+        is dropped. Belief in the present decays towards the long-run pattern with a
+        time constant of `persistence_min`, so a short horizon trusts what the room
+        is doing and a long one trusts what usually happens at that hour.
+
+        Taking the expected source rather than sampling is exact, not an
+        approximation: the equation is linear in the source, so the response to the
+        average source is the average of the responses."""
+        import time as _time
+
         lam = self.value["lambda_open" if ventilated else "lambda_sealed"]
-        ss = self.steady_state(occupied, ventilated)
+        source = self.value["source_ppm_h"] * self.occupants
+        c_out = self.value["c_out"]
         decay = np.exp(-lam * step_min / 60.0)
+        belief = 1.0 if occupied else 0.0
+        now = int(_time.time()) if now is None else int(now)
+
+        hour_of = None
+        if prior:
+            from zoneinfo import ZoneInfo
+
+            from config import settings
+            zone = ZoneInfo(settings.USER_TZ)
+
+            def hour_of(ts):
+                return datetime.fromtimestamp(ts, zone).hour
+
         out, c = [], float(c0)
         for step in range(1, int(minutes / step_min) + 1):
+            ahead = step * step_min
+            if hour_of is None:
+                occupancy = belief
+            else:
+                weight = float(np.exp(-ahead / persistence_min))
+                occupancy = weight * belief + (1 - weight) * prior[hour_of(now + ahead * 60)]
+            ss = c_out + source * occupancy / lam
             c = ss + (c - ss) * decay
-            out.append((step * step_min, round(c, 1)))
+            out.append((ahead, round(c, 1)))
         return out
 
     def time_to(self, threshold, c0, occupied, ventilated=False):
