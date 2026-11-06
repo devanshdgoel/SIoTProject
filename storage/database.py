@@ -256,3 +256,63 @@ class Database:
         args.append(int(time.time()) - days * 86400)
         with self.conn() as c:
             return c.execute(" ".join(q), args).fetchall()
+
+    # ---- episodes awaiting a verdict --------------------------------------
+    def add_episodes(self, rows):
+        """Store detections. Idempotent on (location, kind, start_ts), and a row that
+        has already been judged is never overwritten by a fresh detection."""
+        kept = 0
+        with self.conn() as c:
+            for r in rows:
+                judged = c.execute("SELECT verdict FROM episodes WHERE location=? AND kind=? "
+                                   "AND start_ts=?", (r["location"], r["kind"],
+                                                      r["start_ts"])).fetchone()
+                if judged and judged["verdict"]:
+                    continue
+                _insert(c, "episodes", r, "INSERT OR REPLACE")
+                kept += 1
+        return kept
+
+    def episodes(self, verdict="__open__", limit=50, since=None):
+        """Detections, newest first. By default only those nobody has judged yet."""
+        q, args = "SELECT * FROM episodes WHERE 1=1", []
+        if verdict == "__open__":
+            q += " AND verdict IS NULL"
+        elif verdict is not None:
+            q, args = q + " AND verdict=?", args + [verdict]
+        if since is not None:
+            q, args = q + " AND start_ts>=?", args + [int(since)]
+        with self.conn() as c:
+            return c.execute(q + " ORDER BY start_ts DESC LIMIT ?", args + [int(limit)]).fetchall()
+
+    def judge_episode(self, episode_id, verdict, people=None):
+        """Record the user's answer, and turn a confirmation into a real label.
+
+        A denial is not discarded: it is stored as the opposite label, because
+        "this was not a window opening" is just as useful to the threshold that
+        separates ventilated decays from sealed ones."""
+        opposite = {"open": "closed", "present": "absent", "yes": "no"}
+        with self.conn() as c:
+            row = c.execute("SELECT * FROM episodes WHERE id=?", (episode_id,)).fetchone()
+            if row is None:
+                return None
+            c.execute("UPDATE episodes SET verdict=?, verdict_at=?, people=? WHERE id=?",
+                      (verdict, int(time.time()), people, episode_id))
+        if verdict == "confirmed":
+            self.add_label(row["location"], row["kind"], row["value"], row["start_ts"],
+                           row["end_ts"], "confirmed from a detection", people)
+        elif verdict == "denied":
+            flip = opposite.get(row["value"])
+            if flip:
+                self.add_label(row["location"], row["kind"], flip, row["start_ts"],
+                               row["end_ts"], "detection denied")
+        return dict(row)
+
+    def episode_accuracy(self, days=60):
+        """How often the detector was right, by kind - the learning curve's numerator."""
+        with self.conn() as c:
+            return c.execute(
+                "SELECT kind, COUNT(*) n, SUM(verdict='confirmed') right_, "
+                "SUM(verdict='denied') wrong, SUM(verdict='unsure') unsure "
+                "FROM episodes WHERE verdict IS NOT NULL AND verdict_at>=? GROUP BY kind",
+                (int(time.time()) - days * 86400,)).fetchall()

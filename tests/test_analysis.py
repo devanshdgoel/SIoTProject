@@ -543,3 +543,81 @@ def test_an_unlabelled_room_still_assumes_one_person(db):
     labels[0]["people"] = 3
     assert features.people_at(labels, 50) == 3
     assert features.people_at(labels, 500) == 1          # outside the label
+
+
+# ---------------------------------------------------------------- episodes
+def test_a_confirmation_becomes_a_label_and_a_denial_becomes_its_opposite(db):
+    """The whole learning loop in one assertion: answering a detection writes the
+    same label the user would have typed, and saying no is evidence too - it moves
+    that decay into the sealed group rather than being thrown away."""
+    now = int(time.time())
+    db.add_episodes([{"location": "bedroom", "kind": "window", "value": "open",
+                      "start_ts": now - 3600, "end_ts": now - 1800, "confidence": 0.8,
+                      "evidence": "{}", "detected_at": now},
+                     {"location": "bedroom", "kind": "window", "value": "open",
+                      "start_ts": now - 7200, "end_ts": now - 5400, "confidence": 0.6,
+                      "evidence": "{}", "detected_at": now}])
+    open_now = db.episodes()
+    assert len(open_now) == 2
+
+    db.judge_episode(open_now[0]["id"], "confirmed")
+    db.judge_episode(open_now[1]["id"], "denied")
+    values = {(lb["kind"], lb["value"]) for lb in db.labels(location="bedroom")}
+    assert ("window", "open") in values          # the yes
+    assert ("window", "closed") in values        # the no, kept as its opposite
+    assert db.episodes() == []                   # nothing left waiting
+
+
+def test_not_sure_records_the_answer_but_creates_no_label(db):
+    now = int(time.time())
+    db.add_episodes([{"location": "desk", "kind": "cooking", "value": "yes",
+                      "start_ts": now - 3600, "end_ts": now - 3000, "confidence": 0.5,
+                      "evidence": "{}", "detected_at": now}])
+    db.judge_episode(db.episodes()[0]["id"], "unsure")
+    assert db.labels(location="desk") == []      # ambiguity is not evidence
+    assert db.episodes(verdict="unsure")         # but it is remembered
+
+
+def test_a_confirmed_headcount_reaches_the_label(db):
+    now = int(time.time())
+    db.add_episodes([{"location": "desk", "kind": "occupancy", "value": "present",
+                      "start_ts": now - 3600, "end_ts": now - 1800, "confidence": 0.7,
+                      "evidence": "{}", "detected_at": now}])
+    db.judge_episode(db.episodes()[0]["id"], "confirmed", people=2)
+    assert db.labels(location="desk")[0]["people"] == 2
+
+
+def test_an_answered_episode_is_not_re_asked(db):
+    """Re-running the detector must not undo a verdict already given."""
+    now = int(time.time())
+    row = {"location": "bedroom", "kind": "window", "value": "open",
+           "start_ts": now - 3600, "end_ts": now - 1800, "confidence": 0.8,
+           "evidence": "{}", "detected_at": now}
+    db.add_episodes([row])
+    db.judge_episode(db.episodes()[0]["id"], "confirmed")
+    assert db.add_episodes([row]) == 0            # detected again, but not re-opened
+    assert db.episodes() == []
+
+
+def test_the_detector_finds_a_night_in_the_bedroom(db):
+    """A sealed room cannot rise on its own, so a sustained climb is somebody in it."""
+    from analysis import episodes
+    from analysis.room_model import RoomModel
+
+    now = int(time.time()) // 300 * 300
+    db.set_param("bedroom", "c_out", 400.0, None, 99, "ppm")
+    db.set_param("bedroom", "lambda_sealed", 0.25, 0.02, 9, "1/h")
+    db.set_param("bedroom", "source_ppm_h", 900.0, 50.0, 5, "ppm/h per person")
+    rows, value = [], 450.0
+    for i in range(120):                          # ten hours, rising for the first six
+        ts = now - (120 - i) * 300
+        value += 45.0 if i < 72 else -25.0
+        rows.append(Observation("scd40", "co2_ppm", "bedroom", ts, value, "measured", "ppm"))
+    r = CollectResult("scd40"); r.observations = rows
+    db.save_result(r)
+
+    co2 = features.series(db, "co2_ppm", "bedroom", now - 86400, now)
+    found = episodes.detect_occupancy(db, "bedroom", RoomModel(db, "bedroom"),
+                                      co2, now - 86400, now)
+    assert found, "a six-hour climb should be reported as somebody being there"
+    assert found[0]["end_ts"] - found[0]["start_ts"] > 3 * 3600

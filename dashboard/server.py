@@ -184,6 +184,10 @@ def full_state(db, collectors):
         }
 
 
+def _rows_of(rows):
+    return [dict(r) for r in rows]
+
+
 def body_state(c, now):
     """The wearable in one object: today's scalars against the user's own baseline,
     the last few nights, and how long ago the ring last reached the cloud.
@@ -331,6 +335,11 @@ def make_handler(db, collectors):
                     return self._send(200, CHART_JS.read_bytes(), "application/javascript")
                 if u.path == "/api/state":
                     return self._send(200, full_state(db, collectors))
+                if u.path == "/api/episodes":
+                    return self._send(200, {
+                        "open": _rows_of(db.episodes(limit=40)),
+                        "accuracy": _rows_of(db.episode_accuracy()),
+                        "judged": _rows_of(db.episodes(verdict=None, limit=200))})
                 if u.path == "/api/rooms":
                     return self._send(200, rooms_state(db))
                 if u.path == "/api/nights":
@@ -373,6 +382,29 @@ def make_handler(db, collectors):
                     return self._send(200, {"decision": out.get("decision"),
                                             "fits": out.get("fits"),
                                             "strictness": out.get("strictness")})
+                if u.path == "/api/episodes/detect":
+                    from analysis import episodes
+                    kept, found = episodes.detect(db, days=int(body.get("days", 3)))
+                    return self._send(200, {"stored": kept, "detected": found})
+                if u.path == "/api/episodes/verdict":
+                    try:
+                        episode_id = int(body["id"])
+                    except (KeyError, TypeError, ValueError):
+                        return self._send(400, {"error": "id required"})
+                    verdict = str(body.get("verdict", ""))
+                    if verdict not in ("confirmed", "denied", "unsure"):
+                        return self._send(400, {"error": "verdict must be confirmed/denied/unsure"})
+                    people = body.get("people")
+                    row = db.judge_episode(episode_id, verdict,
+                                           int(people) if people else None)
+                    if row is None:
+                        return self._send(404, {"error": "no such episode"})
+                    # A verdict is new evidence, so the parameters are re-derived at
+                    # once rather than waiting for the next scheduled pass.
+                    if verdict in ("confirmed", "denied"):
+                        from analysis import episodes as _ep
+                        _ep.learn_from(db, row["location"])
+                    return self._send(200, {"ok": True, "verdict": verdict})
                 if u.path == "/api/display":
                     expr, msg = str(body.get("expression", "")), str(body.get("message", ""))[:120]
                     if expr not in EXPRESSIONS or not msg:

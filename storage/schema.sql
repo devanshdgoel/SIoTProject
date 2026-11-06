@@ -205,3 +205,25 @@ CREATE TABLE IF NOT EXISTS predictions (
     UNIQUE (location, metric, issued_at, target_ts)
 );
 CREATE INDEX IF NOT EXISTS idx_pred_open ON predictions (scored_at, target_ts);
+
+-- Things the system believes happened, before anybody has confirmed them. The user
+-- answers each one yes, no or not sure; a yes becomes an ordinary label, a no becomes
+-- evidence the other way, and a not-sure is recorded and then ignored. The verdicts
+-- are also what the detector's accuracy is scored against, so the system can report
+-- how often it was right rather than asserting that it improves.
+CREATE TABLE IF NOT EXISTS episodes (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    location    TEXT    NOT NULL,
+    kind        TEXT    NOT NULL,          -- window | occupancy | cooking | door
+    value       TEXT    NOT NULL,          -- open | present | yes
+    start_ts    INTEGER NOT NULL,
+    end_ts      INTEGER NOT NULL,
+    confidence  REAL,
+    evidence    TEXT,                      -- JSON: what led it to think so
+    detected_at INTEGER NOT NULL,
+    verdict     TEXT,                      -- confirmed | denied | unsure
+    verdict_at  INTEGER,
+    people      INTEGER,                   -- supplied with a confirmation, when relevant
+    UNIQUE (location, kind, start_ts)
+);
+CREATE INDEX IF NOT EXISTS idx_episodes_open ON episodes (verdict, start_ts);

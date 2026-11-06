@@ -83,6 +83,20 @@ tr:hover td{background:#192029}
 .empty{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
   color:var(--dim);font:12px var(--mono)}
 .empty[hidden]{display:none}
+.ep{display:grid;grid-template-columns:1fr auto;gap:12px;align-items:center;
+  padding:9px 11px;border:1px solid var(--line);border-radius:8px;margin-bottom:7px;
+  background:var(--panel2)}
+.ep.gone{opacity:.35}
+.ep b{font-weight:600}
+.ep .ev{color:var(--mute);font:11px var(--mono);margin-top:3px}
+.conf{display:inline-block;width:46px;height:5px;border-radius:3px;background:#2a3744;
+  vertical-align:middle;margin-left:7px;overflow:hidden}
+.conf i{display:block;height:100%;background:var(--accent)}
+.vote{display:flex;gap:5px}
+.vote button{width:34px;height:30px;font-size:14px;line-height:1}
+.vote button.yes:hover{border-color:var(--good);color:var(--good)}
+.vote button.no:hover{border-color:var(--bad);color:var(--bad)}
+.vote button.maybe:hover{border-color:var(--warn);color:var(--warn)}
 .row{display:flex;gap:7px;flex-wrap:wrap;align-items:center}
 .hint{color:var(--dim);font-size:11px;margin-top:7px;line-height:1.5}
 .err{color:#ff9a90;font:12px var(--mono)}
@@ -104,6 +118,17 @@ tr:hover td{background:#192029}
 </header>
 
 <div class="grid">
+
+  <section class="card c12" id="reviewCard"><h2>Did this happen?
+      <span class="dim" style="text-transform:none;letter-spacing:0">
+        &mdash; confirming these is how it learns</span></h2>
+    <div id="review"></div>
+    <div class="row" style="margin-top:9px">
+      <button class="go" id="detectNow">look for more</button>
+      <span class="dim" id="reviewMsg"></span>
+      <span class="spacer"></span>
+      <span class="dim" id="reviewScore"></span>
+    </div></section>
 
   <section class="card c4"><h2>The pet right now</h2>
     <div class="pet">
@@ -214,6 +239,82 @@ const roomColour = r => r==='bedroom' ? getComputedStyle(document.body).getPrope
                                       : getComputedStyle(document.body).getPropertyValue('--desk');
 
 let S = null, R = null, N = null;
+
+// The sensor locations are named after where the node sits; these are the rooms
+// they are actually in, so the questions read like questions.
+const ROOM = {desk: 'living room', bedroom: 'bedroom'};
+const room = e => esc(ROOM[e.location] || e.location);
+const EP_WORDS = {
+  window:   e => `the <b>${room(e)}</b> window was <b>open</b>`,
+  occupancy:e => `somebody was <b>in the ${room(e)}</b>`,
+  cooking:  e => `somebody was <b>cooking</b> in the ${room(e)}`,
+  door:     e => `the <b>${room(e)}</b> door was open`,
+};
+let EP = null;
+
+function renderReview(){
+  if(!EP){ return; }
+  const open = EP.open || [];
+  $('#reviewCard').style.display = '';
+  if(!open.length){
+    $('#review').innerHTML = '<span class="dim">Nothing waiting. Everything it has '
+      + 'spotted so far has been answered.</span>';
+  } else {
+    $('#review').innerHTML = open.map(e=>{
+      let ev = {}; try{ ev = JSON.parse(e.evidence||'{}'); }catch(_){}
+      const mins = Math.round((e.end_ts - e.start_ts)/60);
+      const dur = mins >= 120 ? (mins/60).toFixed(1)+' h' : mins+' min';
+      const people = ev.people_guess && ev.people_guess > 1
+        ? ` <span class="dim">(looks like ${ev.people_guess} people)</span>` : '';
+      return `<div class="ep" data-id="${e.id}">
+        <div>
+          <div>${(EP_WORDS[e.kind]||(x=>esc(x.kind)))(e)}
+            <span class="dim">&nbsp;${t(e.start_ts)} &rarr; ${hm(e.end_ts)} &middot; ${dur}</span>
+            ${people}
+            <span class="conf" title="confidence ${e.confidence}"><i style="width:${
+              Math.round((e.confidence||0)*100)}%"></i></span></div>
+          <div class="ev">${esc(ev.why||'')}</div>
+        </div>
+        <div class="vote">
+          <button class="yes"   title="yes, that happened">&#10003;</button>
+          <button class="no"    title="no, it did not">&#10007;</button>
+          <button class="maybe" title="not sure">?</button>
+        </div></div>`;
+    }).join('');
+    $('#review').querySelectorAll('.ep').forEach(row=>{
+      const id = +row.dataset.id;
+      const send = async (verdict) => {
+        row.classList.add('gone');
+        let people = null;
+        const guess = (open.find(x=>x.id===id)||{});
+        if(verdict === 'confirmed' && guess.kind === 'occupancy'){
+          const asked = prompt('How many people? (blank = 1)', '');
+          if(asked !== null && asked.trim()) people = parseInt(asked, 10) || null;
+        }
+        const r = await post('/api/episodes/verdict', {id, verdict, people});
+        $('#reviewMsg').textContent = r && r.ok
+          ? `recorded "${verdict}" - parameters re-derived` : 'could not save that';
+        refreshEpisodes();
+      };
+      row.querySelector('.yes').onclick   = () => send('confirmed');
+      row.querySelector('.no').onclick    = () => send('denied');
+      row.querySelector('.maybe').onclick = () => send('unsure');
+    });
+  }
+  const acc = EP.accuracy || [];
+  $('#reviewScore').textContent = acc.length
+    ? 'how it has done so far: ' + acc.map(a=>{
+        const judged = a.right_ + a.wrong;
+        const pct = judged ? Math.round(100*a.right_/judged) : 0;
+        return `${a.kind} ${pct}% of ${judged}`;
+      }).join('  ·  ')
+    : 'no verdicts yet - answer a few and its accuracy appears here';
+}
+
+async function refreshEpisodes(){
+  try{ EP = await fetch('/api/episodes').then(r=>r.json()); renderReview(); }
+  catch(e){ console.error(e); }
+}
 
 /* ---------------- the face ---------------- */
 function drawFace(expr, co2){
@@ -592,7 +693,7 @@ async function refreshNights(){
 }
 async function refreshAll(){ await refreshState(); await refreshRooms();
   await drawCo2().catch(console.error); await drawBody().catch(console.error);
-  await refreshNights(); }
+  await refreshNights(); await refreshEpisodes(); }
 
 $('#addLabel').onclick = async () => {
   const end = Math.floor(Date.now()/1000), mins = Math.max(5, +$('#lbMins').value||60);
@@ -609,6 +710,13 @@ $('#setDisplay').onclick = async () => {
   await post('/api/display', {expression:$('#expr').value, message:$('#msg').value||'test'});
   refreshState();
 };
+$('#detectNow').onclick = async () => {
+  $('#reviewMsg').textContent = 'looking...';
+  const r = await post('/api/episodes/detect', {days: 3});
+  $('#reviewMsg').textContent = r && r.detected != null
+    ? `found ${r.detected}, ${r.stored} need an answer` : 'detection failed';
+  refreshEpisodes();
+};
 $('#refresh').onclick = refreshAll;
 $('#range').onchange = () => { drawCo2().catch(console.error); drawBody().catch(console.error); };
 
@@ -619,4 +727,5 @@ setInterval(refreshState, 10000);
 setInterval(refreshRooms, 15000);
 setInterval(() => { drawCo2().catch(console.error); drawBody().catch(console.error); }, 60000);
 setInterval(refreshNights, 300000);
+setInterval(refreshEpisodes, 60000);
 </script></body></html>
