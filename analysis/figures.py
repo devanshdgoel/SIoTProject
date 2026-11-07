@@ -239,40 +239,54 @@ def fig_occupancy(db, out):
 
 
 def fig_forecast(db, out):
-    """Forecast error by horizon: the evidence the model is or is not improving."""
-    fig, axes = plt.subplots(1, 2, figsize=(13, 4.4))
-    any_data = False
-    for ax, room in zip(axes, ROOM):
-        rows = [dict(r) for r in db.prediction_error(room, days=60)]
-        ax.set_title(f"{room}")
-        ax.set_ylabel("mean absolute error (ppm)")
-        if not rows:
-            ax.text(.5, .5, "no scored forecasts yet", transform=ax.transAxes,
-                    ha="center", color=MUTE)
-            ax.set_axis_off()
-            continue
-        any_data = True
-        horizons = sorted({r["horizon_s"] for r in rows})
-        days = sorted({r["day"] for r in rows})
-        width = .8 / max(1, len(horizons))
-        for i, h in enumerate(horizons):
-            vals = [next((r["mae"] for r in rows
-                          if r["day"] == d and r["horizon_s"] == h), np.nan) for d in days]
-            ax.bar(np.arange(len(days)) + i * width, vals, width,
-                   color=[ROOM[room], WARN][i % 2], alpha=.85,
-                   label=f"{h // 60} min ahead")
-            for x, v in zip(np.arange(len(days)) + i * width, vals):
-                if not np.isnan(v):
-                    ax.text(x, v, f"{v:.0f}", ha="center", va="bottom",
-                            fontsize=8, color=INK)
-        ax.set_xticks(np.arange(len(days)) + width * (len(horizons) - 1) / 2)
-        ax.set_xticklabels(days, fontsize=8)
-        ax.legend(fontsize=8)
-    if not any_data:
-        plt.close(fig)
+    """Forecast error against the forecast that assumes nothing changes.
+
+    The old version of this plotted model MAE by day issued, which cannot answer
+    the only question a reader should ask: compared with WHAT? Every forecast is
+    now scored against persistence - "the room stays where it is" - recorded at the
+    same instant from the same information, and split by whether the model was
+    running on this room's learned parameters or on published defaults.
+
+    On this record the model loses at every room, horizon and basis. That is drawn
+    rather than hidden, because it is the most informative result the project has.
+    The diagnosis is in the bias column: with default parameters the bedroom is
+    under-predicted by 200-615 ppm, which is a wrong room rather than a wrong
+    method, while with learned parameters the bias nearly vanishes at 30 minutes
+    (-15 ppm) and the error is almost all variance. So learning fixed the bias and
+    did not buy accuracy - over half an hour a room with a 3.4-hour time constant
+    barely moves, and "no change" is very hard to beat.
+
+    What this does NOT say is that the model is useless. Persistence cannot answer
+    the question the system is actually for - what happens if I open the window -
+    because it has no counterfactual. The honest claim is narrower than the one the
+    project started with: the model is for comparing options, not for extrapolating.
+    """
+    rows = db.forecast_skill()
+    if not rows:
         return None
-    fig.suptitle("Forecast error — every prediction was written down before its "
-                 "outcome was known", y=.99)
+    rooms = sorted({r["location"] for r in rows})
+    fig, axes = plt.subplots(1, max(1, len(rooms)), figsize=(6.6 * len(rooms), 4.8),
+                             squeeze=False)
+    for ax, room in zip(axes[0], rooms):
+        mine = [r for r in rows if r["location"] == room]
+        mine.sort(key=lambda r: (r["horizon_s"], r["basis"]))
+        labels = [f"{r['horizon_s'] // 60} min\n{r['basis']}\nn={r['n']}" for r in mine]
+        x = np.arange(len(mine))
+        ax.bar(x - 0.2, [r["mae"] for r in mine], 0.4, label="physical model",
+               color=ROOM.get(room, "#4f93e8"), alpha=.9)
+        ax.bar(x + 0.2, [r["naive_mae"] for r in mine], 0.4,
+               label="persistence (assume no change)", color=MUTE, alpha=.75)
+        for xi, r in zip(x, mine):
+            ax.text(xi, max(r["mae"], r["naive_mae"]),
+                    f"skill {r['skill']:+.0%}", ha="center", va="bottom",
+                    fontsize=8, color=WARN if r["skill"] < 0 else INK)
+        ax.set_xticks(x)
+        ax.set_xticklabels(labels, fontsize=8)
+        ax.set_ylabel("mean absolute error (ppm)")
+        ax.set_title(room)
+        ax.legend(fontsize=8)
+    fig.suptitle("Every forecast against the one that assumes nothing changes "
+                 "— negative skill means the model lost", y=.99)
     fig.tight_layout()
     fig.savefig(out / "05_forecast_error.png")
     plt.close(fig)

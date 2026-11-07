@@ -177,7 +177,12 @@ def forecast_rows(model, state, now, prior=None):
         out.append({"issued_at": now, "location": state["room"], "metric": "co2_ppm",
                     "target_ts": now + horizon, "horizon_s": horizon, "predicted": value,
                     "lo": round(value - spread, 1), "hi": round(value + spread, 1),
-                    "basis": "learned" if model.learned else "default"})
+                    "basis": "learned" if model.learned else "default",
+                    # The rival forecast, recorded at the same instant from the same
+                    # information: assume the room stays where it is. It is written
+                    # here rather than reconstructed at scoring time so that it is a
+                    # genuine out-of-sample prediction and not a retrospective one.
+                    "naive": round(float(state["co2"]), 1)})
     return out
 
 

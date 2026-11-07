@@ -41,10 +41,26 @@ class Database:
         for table, column, decl in (("labels", "people", "INTEGER"),
                                     ("decay_events", "method", "TEXT"),
                                     ("decay_events", "c_inf", "REAL"),
-                                    ("decay_events", "asym_note", "TEXT")):
+                                    ("decay_events", "asym_note", "TEXT"),
+                                    ("predictions", "naive", "REAL")):
             have = {r[1] for r in c.execute(f"PRAGMA table_info({table})")}
             if column not in have:
                 c.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+
+        # collector_runs gained an 'empty' status. SQLite cannot alter a CHECK
+        # constraint in place, so an older database has to be rebuilt - additively,
+        # keeping every row, because the run history is the record of how the
+        # system behaved and is the only place an outage is visible after the fact.
+        sql = c.execute("SELECT sql FROM sqlite_master WHERE type='table' "
+                        "AND name='collector_runs'").fetchone()
+        if sql and "'empty'" not in (sql[0] or ""):
+            c.execute("ALTER TABLE collector_runs RENAME TO collector_runs_old")
+            c.executescript(SCHEMA.read_text(encoding="utf-8"))
+            cols = [r[1] for r in c.execute("PRAGMA table_info(collector_runs_old)")]
+            names = ",".join(cols)
+            c.execute(f"INSERT INTO collector_runs ({names}) "
+                      f"SELECT {names} FROM collector_runs_old")
+            c.execute("DROP TABLE collector_runs_old")
 
     @contextmanager
     def conn(self):
@@ -206,12 +222,23 @@ class Database:
                 _insert(c, "decay_events", r, "INSERT OR REPLACE")
         return len(rows)
 
-    def decays(self, location=None, min_r2=None):
+    def decays(self, location=None, min_r2=None, start=None, end=None):
+        """Fitted decays, optionally restricted to a window.
+
+        The window matters: `learn()` only deletes rows inside the period it
+        re-fitted, so older rows survive carrying the lambda they were fitted with
+        against an OLDER c_out. This room's c_out moved 107 ppm in one refinement,
+        which is about 20% on every lambda, so pooling across that boundary mixes
+        two different measurements of two different things."""
         q, args = "SELECT * FROM decay_events WHERE 1=1", []
         if location:
             q, args = q + " AND location=?", args + [location]
         if min_r2 is not None:
             q, args = q + " AND r2>=?", args + [min_r2]
+        if start is not None:
+            q, args = q + " AND start_ts>=?", args + [int(start)]
+        if end is not None:
+            q, args = q + " AND start_ts<=?", args + [int(end)]
         with self.conn() as c:
             return c.execute(q + " ORDER BY start_ts", args).fetchall()
 
@@ -247,9 +274,15 @@ class Database:
         return scored
 
     def prediction_error(self, location=None, metric="co2_ppm", days=7):
-        """Mean absolute error of scored forecasts per day: the learning curve."""
+        """Mean absolute error of scored forecasts per day: the learning curve.
+
+        `naive_mae` is the same error for "assume no change", which is the forecast
+        a reader should compare against before believing any of this. A model that
+        cannot beat persistence has not been shown to know anything about the room."""
         q = ["SELECT DATE(issued_at,'unixepoch') day, horizon_s, COUNT(*) n,"
-             " ROUND(AVG(ABS(actual-predicted)),1) mae, ROUND(AVG(actual-predicted),1) bias",
+             " ROUND(AVG(ABS(actual-predicted)),1) mae, ROUND(AVG(actual-predicted),1) bias,"
+             " ROUND(AVG(ABS(actual-naive)),1) naive_mae,"
+             " SUM(naive IS NOT NULL) n_naive",
              "FROM predictions WHERE actual IS NOT NULL AND metric=?"]
         args = [metric]
         if location:
@@ -259,6 +292,33 @@ class Database:
         args.append(int(time.time()) - days * 86400)
         with self.conn() as c:
             return c.execute(" ".join(q), args).fetchall()
+
+    def forecast_skill(self, location=None, metric="co2_ppm", days=3650):
+        """Model error against persistence, split by horizon and by basis.
+
+        Split by basis because that is the comparison the learning claim rests on:
+        if the error with learned parameters is no better than with the published
+        defaults, the room taught the model nothing. Grouping only by day - which is
+        what the figure used to do - cannot show that."""
+        q = ["SELECT location, horizon_s, basis, COUNT(*) n,"
+             " ROUND(AVG(ABS(actual-predicted)),1) mae,"
+             " ROUND(AVG(ABS(actual-naive)),1) naive_mae,"
+             " ROUND(AVG(actual-predicted),1) bias",
+             "FROM predictions WHERE actual IS NOT NULL AND naive IS NOT NULL",
+             "AND metric=?"]
+        args = [metric]
+        if location:
+            q.append("AND location=?")
+            args.append(location)
+        q.append("AND issued_at>=? GROUP BY location, horizon_s, basis"
+                 " ORDER BY location, horizon_s, basis")
+        args.append(int(time.time()) - days * 86400)
+        with self.conn() as c:
+            rows = [dict(r) for r in c.execute(" ".join(q), args).fetchall()]
+        for r in rows:
+            r["skill"] = (None if not r["naive_mae"] else
+                          round(1 - r["mae"] / r["naive_mae"], 3))
+        return rows
 
     # ---- episodes awaiting a verdict --------------------------------------
     def add_episodes(self, rows):

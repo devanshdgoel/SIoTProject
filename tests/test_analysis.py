@@ -1292,3 +1292,149 @@ def test_the_inferred_volume_carries_the_sources_error(db):
     chk = volume_check(db, "r", 1000.0, 6, source_stderr=100.0)
     assert chk["inferred_lo"] == pytest.approx(18.7 * 0.9, abs=0.1)
     assert chk["inferred_hi"] == pytest.approx(18.7 * 1.1, abs=0.1)
+
+
+# --- a cut that any sample would produce is not a measurement -----------------
+
+def test_a_split_must_beat_one_cluster():
+    """split_point used to find a split in essentially any sample.
+
+    Minimising within-group variance over every cut ALWAYS returns something, and
+    the ratio-of-medians guard does not catch it because a heavy right tail clears
+    a factor of two on its own. Drawn from a SINGLE log-normal with this room's
+    observed spread, the old version called the sample bimodal 95% of the time at
+    n=6 and 99% at n=11 - it was detecting dispersion, not windows. And it decided
+    lambda_sealed."""
+    rng = np.random.default_rng(1)
+    false = sum(split_point(np.exp(rng.normal(-1.0, 1.03, 11))) is not None
+                for _ in range(60))
+    assert false / 60 < 0.15, f"one cluster declared bimodal {false}/60 times"
+
+
+def test_a_real_split_is_still_found():
+    """The guard has to be two-sided or it just disables the feature."""
+    sealed = [0.28, 0.30, 0.31, 0.33, 0.29, 0.27]
+    opened = [2.9, 3.1, 3.0, 3.2]
+    cut = split_point(sealed + opened)
+    assert cut is not None
+    assert max(sealed) < cut < min(opened)
+
+
+def test_this_rooms_lambdas_are_one_cluster(db):
+    """The bedroom's own fitted values, which the old cut split at 0.615/h."""
+    real = [0.147, 0.198, 0.211, 0.348, 0.381, 0.390, 0.471, 0.804, 1.197,
+            2.575, 4.547]
+    assert split_point(real) is None, "a heavy tail was mistaken for a second mode"
+
+
+def test_robust_never_claims_infinite_precision():
+    """A zero MAD is reachable with four values and wrote stderr=0.0 to the database."""
+    from analysis.room_model import _robust
+
+    med, err, n = _robust([0.5, 0.5, 0.5, 2.0])
+    assert med == 0.5 and n == 4
+    assert err is not None and err > 0.0
+    med, err, _n = _robust([0.3, 0.3, 0.31])
+    assert err > 0.0
+
+
+# --- sealed must mean sealed --------------------------------------------------
+
+def test_a_decay_that_settled_on_house_air_is_not_sealed(db):
+    """lambda_sealed is the envelope leaking to OUTDOOR air; that is what every
+    ceiling is built from and what fit_weather regresses on weather. A decay whose
+    own fit says it was heading for 1029 ppm against an outdoor 358 measured a door.
+    Nine of eighteen desk decays were such rows and one was the bedroom's median."""
+    from analysis import features
+
+    now = simulate(db, days=4)
+    learn(db, "bedroom", days=5, now=now)
+    rows = [dict(r) for r in db.decays("bedroom")]
+    assert rows
+    for r in rows:
+        if r["inferred"] == "sealed":
+            assert (r["c_inf"] is None
+                    or r["c_inf"] - r["c_out"] < features.ASYM_MIN_ABOVE), r
+
+
+def test_c_out_counts_baseline_observations_not_co2_samples(db):
+    """n said 1169 for a c_out measured in a single labelled airing, which is the
+    opposite of what the n column is for."""
+    now = simulate(db, days=4)
+    learn(db, "bedroom", days=5, now=now)
+    row = db.params("bedroom")["c_out"]
+    samples = len(features.series(db, "co2_ppm", "bedroom").dropna())
+    assert row["n"] < samples, "n is still the CO2 sample count"
+    assert row["n"] <= 20
+
+
+# --- fits that cannot be believed are not stored ------------------------------
+
+def test_fit_weather_refuses_an_impossible_intercept(db):
+    """a is still-air infiltration SQUARED, so a < 0 is impossible rather than weak.
+    The desk stored a = -0.709 with every coefficient inside its own stderr."""
+    from analysis.room_model import fit_weather
+
+    rng = np.random.default_rng(0)
+    rows = []
+    for i in range(8):
+        rows.append({"location": "r", "start_ts": 10_000 * i,
+                     "end_ts": 10_000 * i + 3600,
+                     "lambda_h": float(0.4 + 0.02 * rng.normal()), "r2": 0.99,
+                     "method": "departure", "inferred": "sealed",
+                     "wind_ms": 3.0 + 0.1 * i,       # almost no span
+                     "delta_t_c": 9.5 + 0.2 * (i % 2),   # 0.2 C of span
+                     "labelled": None})
+    db.save_decays(rows)
+    out = fit_weather(db, "r")
+    assert out.get("refuted"), out
+    assert "dT" in out["refuted"] or "t = " in out["refuted"]
+    assert db.params("r")["lambda_wind_c"]["n"] == 0
+    assert db.params("r")["lambda_wind_c"]["value"] is None
+
+
+def test_decays_can_be_restricted_to_a_window(db):
+    """learn() only deletes rows inside the period it re-fitted, so older rows keep
+    the lambda they were fitted against an older c_out - 107 ppm away, here."""
+    db.save_decays([{"location": "r", "start_ts": 1000, "end_ts": 2000,
+                     "lambda_h": 0.3, "r2": 0.99, "method": "window",
+                     "inferred": "sealed", "labelled": None},
+                    {"location": "r", "start_ts": 900_000, "end_ts": 901_000,
+                     "lambda_h": 0.4, "r2": 0.99, "method": "window",
+                     "inferred": "sealed", "labelled": None}])
+    assert len(db.decays("r")) == 2
+    assert len(db.decays("r", start=500_000)) == 1
+    assert len(db.decays("r", end=500_000)) == 1
+
+
+# --- compared with what? ------------------------------------------------------
+
+def test_every_forecast_records_the_rival_that_assumes_no_change(db):
+    """Persistence is written at issue time, not reconstructed at scoring time, so
+    it is a genuine out-of-sample forecast rather than a retrospective one."""
+    now = simulate(db, days=3)
+    analysis_human.run(db, now=now)
+    with db.conn() as c:
+        rows = c.execute("SELECT predicted, naive FROM predictions "
+                         "WHERE naive IS NOT NULL").fetchall()
+    assert rows, "no forecast carried a persistence baseline"
+    assert all(r["naive"] > 0 for r in rows)
+
+
+def test_skill_is_reported_against_persistence(db):
+    """The comparison the project's headline claim needs and did not have."""
+    base = {"location": "r", "metric": "co2_ppm", "horizon_s": 1800,
+            "basis": "learned"}
+    t0 = int(time.time()) - 3600
+    rows = []
+    for i in range(6):
+        rows.append(dict(base, issued_at=t0 + i * 100, target_ts=t0 + 1800 + i * 100,
+                         predicted=900.0, naive=800.0, actual=810.0,
+                         scored_at=t0 + 3600))
+    db.add_predictions(rows)
+    got = db.forecast_skill()
+    assert len(got) == 1
+    r = got[0]
+    assert r["mae"] == pytest.approx(90.0)        # model is 90 out
+    assert r["naive_mae"] == pytest.approx(10.0)  # persistence is 10 out
+    assert r["skill"] < 0, "a model this much worse must score negative skill"

@@ -87,8 +87,16 @@ def run_collector(name, fn, db):
     try:
         result = fn(db)
         db.save_result(result)
-        db.log_run(name, t0, ms(), "ok", result.n_rows())
-        return "ok", result.n_rows(), None
+        # "ok" with nothing stored is how a ten-hour outage stayed invisible. The
+        # scd40 backend drains an in-memory queue, so a node that has fallen off the
+        # network produces a perfectly successful run every minute, for ever, and
+        # collector_runs - the only per-run health record kept - had no value that
+        # could distinguish that from a quiet minute. It still is not an error (a
+        # single empty minute is normal), but it has to be countable.
+        n = result.n_rows()
+        status = "ok" if n else "empty"
+        db.log_run(name, t0, ms(), status, n)
+        return status, n, None
     except NotConfigured as e:
         db.log_run(name, t0, ms(), "skipped", 0, str(e))
         return "skipped", 0, str(e)

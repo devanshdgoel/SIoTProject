@@ -43,7 +43,9 @@ DEFAULTS = {
     "tau_t_h": (6.0, "h"),
 }
 # Observations required before a learned value displaces its default.
-MIN_N = {"c_out": 12, "lambda_sealed": 2, "lambda_open": 2, "source_ppm_h": 2, "tau_t_h": 2}
+# One measured baseline is evidence; the old threshold of 12 was never tested
+# against the number of baseline observations, only against the CO2 sample count.
+MIN_N = {"c_out": 1, "lambda_sealed": 2, "lambda_open": 2, "source_ppm_h": 2, "tau_t_h": 2}
 
 CO2_PER_PERSON_LH = 18.7        # seated adult at rest, litres of CO2 per hour
 
@@ -168,20 +170,26 @@ def _robust(values):
     if a.size < 2:
         return med, None, 1
     sd = 1.4826 * float(np.median(np.abs(a - med)))
+    # The MAD can be exactly zero - two of four fits agreeing to three decimals is
+    # enough - and 1.253*0/sqrt(n) is a claim of INFINITE precision written straight
+    # into room_params.stderr. _robust([0.5, 0.5, 0.5, 2.0]) did precisely that.
+    # The floor is the widest of three scales that cannot all collapse together, so
+    # a degenerate MAD falls back on the spread that is actually there.
+    if a.size >= 4:
+        q1, q3 = np.percentile(a, [25, 75])
+        sd = max(sd, float(q3 - q1) / 1.349)
+    sd = max(sd, 0.05 * abs(med))
+    # At n = 4-6 the MAD's own relative error is near 40%, so this remains a noisy
+    # estimate of a noisy quantity. It is a floor on the honesty, not a tight bound.
     return med, float(1.253 * sd / np.sqrt(a.size)), int(a.size)
 
 
-def split_point(values, default=1.5):
-    """Where the sealed and ventilated clusters of lambda divide.
+SPLIT_ALPHA = 0.05              # how surprising a split has to be before it is real
+SPLIT_DRAWS = 400               # parametric bootstrap draws under the one-cluster null
 
-    Opening a window multiplies the air-change rate several-fold, so the histogram
-    of fitted values is bimodal. On sorted one-dimensional data the optimal
-    two-cluster split is simply the gap that minimises within-group variance, so no
-    clustering library is needed. Returns None when the data is not convincingly
-    bimodal, which is the honest answer for a room that was never opened."""
-    v = np.sort(np.log(np.asarray(list(values), dtype=float)))
-    if v.size < 6:
-        return default
+
+def _best_split(v):
+    """Lowest within-group sum of squares over every cut of sorted log-lambda."""
     best, cut, groups = None, None, None
     for i in range(2, v.size - 1):
         a, b = v[:i], v[i:]
@@ -189,8 +197,53 @@ def split_point(values, default=1.5):
         if best is None or wss < best:
             best, cut = wss, float(np.exp((a[-1] + b[0]) / 2.0))
             groups = (float(np.exp(np.median(a))), float(np.exp(np.median(b))))
+    return best, cut, groups
+
+
+def split_point(values, default=None, alpha=SPLIT_ALPHA, draws=SPLIT_DRAWS, seed=0):
+    """Where the sealed and ventilated clusters of lambda divide, IF they do.
+
+    Opening a window multiplies the air-change rate several-fold, so one might
+    expect the histogram of fitted values to be bimodal, and the optimal two-cluster
+    split of sorted one-dimensional data is just the cut minimising within-group
+    variance. The trap is that this search ALWAYS finds a cut: minimising over n-3
+    candidates on any sample at all produces a split that looks convincing, and the
+    ratio-of-medians guard does not catch it because a heavy right tail clears a
+    factor of two on its own. Simulated from a SINGLE log-normal with this room's
+    observed spread, the old version called the sample bimodal 95% of the time at
+    n=6 and 99% at n=11. It was not detecting windows; it was detecting dispersion.
+
+    So the split now has to beat its own null. Fit one log-normal to the values,
+    draw samples of the same size from it, run the identical search on each, and
+    keep the cut only if the real within-group SS sits below the alpha quantile of
+    those - i.e. only if no single cluster plausibly produces a split this clean.
+
+    Returns None when it does not, and None is not a failure: `classify` then falls
+    back on the user's own window labels, which are evidence rather than inference.
+    `default` is None for the same reason - the old 1.5 1/h was a bare literal doing
+    load-bearing classification for every room with fewer than six decays.
+    """
+    a = np.asarray(list(values), dtype=float)
+    a = a[a > 0]
+    if a.size < 6:
+        return default
+    v = np.sort(np.log(a))
+    best, cut, groups = _best_split(v)
     if groups is None or groups[1] < groups[0] * VENT_RATIO:
         return None                      # one cluster: the window stayed shut all record
+
+    rng = np.random.default_rng(seed)
+    mu, sigma = float(v.mean()), float(v.std(ddof=1))
+    if sigma <= 0:
+        return None
+    null = np.empty(draws)
+    for k in range(draws):
+        draw = np.sort(rng.normal(mu, sigma, v.size))
+        null[k] = _best_split(draw)[0]
+    # A SMALLER within-group SS means a cleaner split, so the real one has to sit in
+    # the lower tail of what one cluster manages by chance.
+    if best > float(np.quantile(null, alpha)):
+        return None
     return cut
 
 
@@ -288,9 +341,22 @@ def learn(db, location, days=14, now=None):
     # One usable asymptote is not a refinement: the branch above needs two before it
     # replaces the percentile, so a single tail must not make the clamp look trusted.
     clamped = not 250.0 <= float(co2.dropna().quantile(0.05)) <= 700.0
-    trusted = 0 if (clamped and not refined) else int(co2.dropna().size)
-    db.set_param(location, "c_out", c_out, None, trusted, "ppm",
-                 {"method": method, "clamped": clamped})
+    # n is how many BASELINE observations there were, not how many CO2 samples the
+    # room produced. Storing the sample count made a c_out resting on one measured
+    # airing display as n=1169 beside a lambda resting on six decays, which is the
+    # opposite of what the n column exists to tell a reader - and it cleared
+    # MIN_N["c_out"] trivially whatever the evidence.
+    basis_set = direct if direct else (tails if refined else [])
+    trusted = 0 if (clamped and not refined) else len(basis_set)
+    # c_out is subtracted from every excess in the model, so it is the last
+    # parameter that should have no uncertainty attached. 30 ppm of it moves every
+    # fitted lambda by 5-7%, in the same direction for every decay.
+    c_err = (float(np.std(basis_set, ddof=1)) / np.sqrt(len(basis_set))
+             if len(basis_set) >= 2 else None)
+    db.set_param(location, "c_out", c_out, c_err, trusted, "ppm",
+                 {"method": method, "clamped": clamped,
+                  "from_n": len(basis_set),
+                  "seed_percentile": round(float(features.outdoor_baseline(co2) or 0), 1)})
     summary["c_out"] = round(c_out, 1)
     summary["c_out_trusted"] = bool(trusted)
 
@@ -322,6 +388,24 @@ def learn(db, location, days=14, now=None):
                                                 int(b.timestamp()), "window")}
 
     rows, lams, marks = [], [], []
+
+    def coupled(row):
+        """Did this decay empty into the rest of the home rather than outdoors?
+
+        dcae24d let a decay choose its own asymptote, which fixed rates that had
+        been biased low - and quietly created a second problem it did not address.
+        "Sealed" is supposed to mean the envelope leaking to OUTDOOR air, and that
+        is what `fit_weather` regresses on weather and what every ceiling is built
+        from. But a decay whose own fit says it was heading for 1029 ppm against an
+        outdoor 358 was measuring a door, not a wall. Nine of the desk's eighteen
+        sealed decays were such rows, and in the bedroom one of them WAS the median
+        - so the headline lambda_sealed was, in both rooms, a mixture of envelope
+        leakage and inter-room coupling reported as if it were the first.
+
+        The information needed was already being computed and stored; nothing read
+        it. `fit_open_wind` applies exactly this test to openings."""
+        ci = row.get("c_inf")
+        return ci is not None and ci - c_out >= features.ASYM_MIN_ABOVE
 
     # Standardised measurements first. Every one of these starts the same delay after
     # somebody left and runs for the same span, so they are comparable with each other
@@ -357,10 +441,19 @@ def learn(db, location, days=14, now=None):
     if rows:
         cut = split_point(lams)
         for row, state in zip(rows, classify(lams, marks, cut)):
+            # A confirmed opening stays what the user said it was; anything else
+            # that settled on house air is reclassified, not discarded. It is still
+            # a real air-change rate of the room - it just answers a different
+            # question, and lumping it in with the envelope answers neither.
+            if state != "ventilated" and coupled(row):
+                state = "coupled"
             row["inferred"] = state
         db.save_decays(rows)
         summary["decays"] = len(rows)
         summary["split_at"] = cut
+        n_coupled = sum(1 for r in rows if r["inferred"] == "coupled")
+        if n_coupled:
+            summary["coupled"] = n_coupled
         for state, param in (("sealed", "lambda_sealed"), ("ventilated", "lambda_open")):
             vals = [r["lambda_h"] for r in rows if r["inferred"] == state]
             med, err, n = _robust(vals)
@@ -436,6 +529,8 @@ def learn(db, location, days=14, now=None):
     rise_lams = [r["lambda_h"] for r in rises if r["lambda_usable"]]
     if rise_lams:
         decay_lams = [r["lambda_h"] for r in rows if r.get("inferred") == "sealed"]
+        # "sealed" now excludes decays that settled on house air (see `coupled`), so
+        # this is an envelope rate compared against an envelope rate.
         med, err, n = _robust(decay_lams + rise_lams)
         if med is not None:
             d_med, _e, _n = _robust(decay_lams)
@@ -507,15 +602,15 @@ def learn(db, location, days=14, now=None):
     # just written. They have to run after save_decays and after room_params is
     # cleared, so that neither reads a rate measured against an older baseline nor
     # survives as a stale row once the evidence for it is gone.
-    summary["weather"] = fit_weather(db, location)
-    summary["open_wind"] = fit_open_wind(db, location)
+    summary["weather"] = fit_weather(db, location, start=start)
+    summary["open_wind"] = fit_open_wind(db, location, start=start)
     return summary
 
 
 MIN_WEATHER_FITS = 6          # below this the three coefficients are not identifiable
 
 
-def fit_weather(db, location, min_r2=0.90):
+def fit_weather(db, location, min_r2=0.90, start=None):
     """How this room's air-change rate moves with the weather.
 
     Infiltration is driven by two pressures - the stack effect from the indoor to
@@ -534,8 +629,25 @@ def fit_weather(db, location, min_r2=0.90):
 
     Returns None - and stores nothing - until there are enough of them. With three
     coefficients and a handful of points the fit would be meaningless however good its
-    r-squared looked."""
-    usable = [r for r in db.decays(location, min_r2=min_r2)
+    r-squared looked.
+
+    A count is not enough, though, and for a long time this function only had one.
+    `fit_open_wind` refuses to store a law its own data refutes and says why; this
+    one fitted three coefficients to six points and stored whatever came out. What
+    came out for the desk was a = -0.709 +/- 5.118, b = 0.057 +/- 0.462,
+    c = 0.049 +/- 0.027: every coefficient inside its own standard error, an
+    intercept that is negative (a is still-air infiltration SQUARED, so a < 0 is not
+    a weak result but an impossible one), and a dT range of 2.1 C across which the
+    stack term cannot be identified at all. `predicted_lambda` duly returned None
+    for a fifth of ordinary conditions, and nothing noticed because nothing in the
+    application reads it.
+
+    So the same guards apply here, in the order a reader would ask about them:
+    enough span to identify each term, physically possible signs, and a coefficient
+    distinguishable from zero. A fit that fails any of them is reported in full and
+    stored with n=0, because the refutation is the result - the same way the wind
+    law's refutation is."""
+    usable = [r for r in db.decays(location, min_r2=min_r2, start=start)
               if (r["method"] == "departure" and r["inferred"] == "sealed"
                   and r["wind_ms"] is not None and r["delta_t_c"] is not None)]
     if len(usable) < MIN_WEATHER_FITS:
@@ -558,6 +670,36 @@ def fit_weather(db, location, min_r2=0.90):
            "r2": 1 - float(np.sum(resid ** 2)) / total if total > 0 else 0.0,
            "wind_range": [round(float(wind.min()), 1), round(float(wind.max()), 1)],
            "dT_range": [round(float(dT.min()), 1), round(float(dT.max()), 1)]}
+    # Adjusted, because r2 on 6 points and 3 parameters flatters itself badly.
+    n_obs = len(lam)
+    out["r2_adj"] = (1 - (1 - out["r2"]) * (n_obs - 1) / max(1, n_obs - 3)
+                     if n_obs > 3 else None)
+
+    fails = []
+    if float(dT.max() - dT.min()) < MIN_DT_SPAN_C:
+        fails.append(f"|dT| spans only {float(dT.max() - dT.min()):.1f} C, so the "
+                     f"stack term b cannot be separated from the intercept "
+                     f"(needs {MIN_DT_SPAN_C:.0f} C)")
+    if out["a"] < 0:
+        fails.append(f"a = {out['a']:.3f} is negative, and a is still-air "
+                     f"infiltration squared - not a weak fit but an impossible one")
+    if out["b"] < 0:
+        fails.append(f"b = {out['b']:.3f} is negative, which says a colder night "
+                     f"drives LESS infiltration; stack pressure cannot do that")
+    t_c = abs(out["c"] / out["stderr"][2]) if out["stderr"][2] > 0 else 0.0
+    out["t_c"] = round(float(t_c), 2)
+    if t_c < MIN_WEATHER_T:
+        fails.append(f"the wind coefficient is t = {t_c:.1f}, indistinguishable "
+                     f"from zero at this sample size")
+
+    if fails:
+        out["refuted"] = "; ".join(fails)
+        out["usable"] = False
+        db.set_param(location, "lambda_wind_c", None, None, 0,
+                     "(1/h)^2 per (m/s)^2", out)
+        return out
+
+    out["usable"] = True
     db.set_param(location, "lambda_wind_c", out["c"], out["stderr"][2], len(lam),
                  "(1/h)^2 per (m/s)^2", out)
     return out
@@ -572,6 +714,8 @@ def predicted_lambda(fit, wind, delta_t):
 
 
 MIN_OPEN_FITS = 2               # one point cannot give a slope
+MIN_DT_SPAN_C = 5.0             # below this, the stack term is the intercept in disguise
+MIN_WEATHER_T = 2.0             # a coefficient inside its own stderr is not a measurement
 
 # A rise has to have bent before its rate can be read off it. Below this fraction of
 # the climb to its own fitted ceiling the curve is still near-linear, and lambda and
@@ -581,7 +725,7 @@ MIN_RISE_R2 = 0.95
 RISE_DECAY_GAP = 0.5            # how far the two routes may differ before it is news
 
 
-def fit_open_wind(db, location, min_r2=MIN_R2):
+def fit_open_wind(db, location, min_r2=MIN_R2, start=None):
     """How fast an OPEN window exchanges air, as a function of wind speed.
 
     The quadrature in `fit_weather` still applies - stack pressure and wind pressure
@@ -604,7 +748,7 @@ def fit_open_wind(db, location, min_r2=MIN_R2):
     pooling all three yields a median that describes none of them.
 
     Returns a note - and stores nothing - below MIN_OPEN_FITS confirmed openings."""
-    usable = [r for r in db.decays(location, min_r2=min_r2)
+    usable = [r for r in db.decays(location, min_r2=min_r2, start=start)
               if r["labelled"] == "open" and r["wind_ms"] is not None]
     if len(usable) < MIN_OPEN_FITS:
         return {"n": len(usable), "need": MIN_OPEN_FITS,

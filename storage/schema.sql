@@ -28,7 +28,7 @@ CREATE TABLE IF NOT EXISTS collector_runs (
     collector   TEXT    NOT NULL,
     started_at  INTEGER NOT NULL,
     duration_ms INTEGER NOT NULL,
-    status      TEXT    NOT NULL CHECK (status IN ('ok','error','skipped')),
+    status      TEXT    NOT NULL CHECK (status IN ('ok','empty','error','skipped')),
     n_rows      INTEGER NOT NULL DEFAULT 0,
     error       TEXT
 );
@@ -203,6 +203,7 @@ CREATE TABLE IF NOT EXISTS predictions (
     lo        REAL,
     hi        REAL,
     basis     TEXT,                        -- learned | default: which parameters were used
+    naive     REAL,                         -- persistence: the room's CO2 when this was issued
     actual    REAL,
     scored_at INTEGER,
     UNIQUE (location, metric, issued_at, target_ts)

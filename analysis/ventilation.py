@@ -104,7 +104,11 @@ def plan_night(db, location="bedroom", now=None, hours=8.0):
         return {"error": f"no recent CO2 for {location}"}
 
     c_out = model.value["c_out"]
-    source = model.value["source_ppm_h"]
+    # Per PERSON: that is the stored unit, and RoomModel.steady_state multiplies by
+    # the headcount while this did not. Latent only because this bedroom sleeps one
+    # - a two-person room got a ceiling exactly half the truth from the CLI while
+    # the pet, reading the same parameter, got it right.
+    source = model.value["source_ppm_h"] * model.occupants
     start = float(co2.iloc[-1])
     t_in = features.at(features.series(db, "indoor_temp_c", location, now - 6 * 3600, now), now)
     t_out = _forecast_mean(db, "outdoor_temp_c", now, hours)

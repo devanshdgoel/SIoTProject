@@ -217,6 +217,40 @@ def cmd_volume(args, db):
           "  no source term fitted yet, so nothing to check it against")
 
 
+def cmd_skill(args, db):
+    """Forecast error against the forecast that assumes nothing changes.
+
+    Compared with what? is the first question any error figure has to answer, and
+    for a long time this project could not. Persistence is the right rival: it uses
+    the same information at the same instant and costs nothing, so beating it is
+    the minimum evidence that the physics is doing work."""
+    rows = db.forecast_skill(days=args.days)
+    if not rows:
+        print("no scored forecasts with a persistence baseline yet")
+        return
+    print(f"{'room':9s}{'horizon':>8s}  {'basis':8s}{'n':>5s}{'model':>9s}"
+          f"{'persist':>9s}{'skill':>8s}{'bias':>9s}")
+    for r in rows:
+        print(f"{r['location']:9s}{r['horizon_s'] // 60:6d}m  {r['basis']:8s}"
+              f"{r['n']:5d}{r['mae']:9.1f}{r['naive_mae']:9.1f}"
+              f"{r['skill']:+8.0%}{r['bias']:+9.1f}")
+    worst = min(rows, key=lambda r: r["skill"])
+    best = max(rows, key=lambda r: r["skill"])
+    print()
+    if best["skill"] < 0:
+        print("The model loses to persistence everywhere. Read the bias column for "
+              "why: a large bias is a wrong room, a small one with a large error is "
+              "variance the model is adding rather than removing.")
+        print(f"Best it manages is {best['skill']:+.0%} ({best['location']} "
+              f"{best['horizon_s'] // 60} min, {best['basis']}); "
+              f"worst {worst['skill']:+.0%}.")
+        print("Persistence cannot answer 'what if I open the window', which is what "
+              "this model is actually for. Extrapolation is not its job and it "
+              "should not be sold as one.")
+    else:
+        print(f"Best {best['skill']:+.0%}, worst {worst['skill']:+.0%}.")
+
+
 def cmd_params(args, db):
     """What the system currently believes about each room, and how sure it is."""
     from analysis.room_model import RoomModel, rooms
@@ -241,8 +275,14 @@ def cmd_params(args, db):
                 print(f"  volume            cross-check: {chk['note']}")
         rows = db.decays(name, min_r2=0.9)
         if rows:
-            vent = sum(1 for r in rows if r["inferred"] == "ventilated")
-            print(f"  {len(rows)} usable decays: {len(rows) - vent} sealed, {vent} ventilated")
+            kinds = {}
+            for r in rows:
+                kinds[r["inferred"] or "unclassified"] = kinds.get(r["inferred"] or "unclassified", 0) + 1
+            shown = ", ".join(f"{v} {k}" for k, v in sorted(kinds.items()))
+            print(f"  {len(rows)} usable decays: {shown}")
+            if kinds.get("coupled"):
+                print(f"  {'':18s}'coupled' settled on house air, not outdoor air, so they "
+                      f"measure a door rather than the envelope and are kept out of lambda_sealed")
 
         # lambda_sealed is measured twice over, by a room emptying and by the same
         # room filling. They share no assumption but the mass balance, so how far
@@ -255,6 +295,20 @@ def cmd_params(args, db):
             print(f"  {'':18s}{detail['decays']} decays + {detail['rises']} rises"
                   + (f", {detail['skipped_rises']} rise(s) too straight to read a "
                      f"rate off" if detail.get("skipped_rises") else ""))
+
+        # The weather law gets the same treatment as the wind law: shown whether it
+        # passed or failed, because a refutation is a result and a silent parameter
+        # nobody reads is not.
+        wrow = db.params(name).get("lambda_wind_c")
+        wd = json.loads(wrow["detail"]) if wrow and wrow["detail"] else None
+        if wd and wd.get("refuted"):
+            print(f"  weather law       REFUTED: lambda^2 = a + b|dT| + c*v^2 over "
+                  f"n={wd['n']}, r2_adj={wd.get('r2_adj') and round(wd['r2_adj'], 2)}")
+            for reason in wd["refuted"].split("; "):
+                print(f"  {'':18s}- {reason}")
+        elif wd and wd.get("usable"):
+            print(f"  weather law       lambda^2 = {wd['a']:.3f} + {wd['b']:.4f}|dT| "
+                  f"+ {wd['c']:.4f}v^2   r2_adj={wd['r2_adj']:.2f} n={wd['n']}")
 
         # An open window is not one number - what it delivers scales with wind - so
         # the pooled lambda_open above is only the fallback. Show the law and what it
@@ -482,6 +536,8 @@ def main():
     p.add_argument("--people", type=int, help="how many, for an occupancy label")
     p.set_defaults(fn=cmd_label)
     p = sub.add_parser("params"); p.set_defaults(fn=cmd_params)
+    p = sub.add_parser("skill", help="forecast error vs 'assume no change'")
+    p.add_argument("--days", type=int, default=3650); p.set_defaults(fn=cmd_skill)
     p = sub.add_parser("volume", help="record a tape-measured room volume: volume bedroom 18")
     p.add_argument("room"); p.add_argument("m3", type=float)
     p.set_defaults(fn=cmd_volume)
