@@ -948,12 +948,14 @@ def test_the_openings_figure_refuses_without_a_labelled_opening(db, tmp_path):
         figures.fig_openings(db, tmp_path, location="bedroom")
 
 
-def test_the_openings_figure_anchors_on_the_peak_not_the_reported_time(db, tmp_path):
-    """The anchor is what makes two events on different days comparable.
+def test_the_openings_figure_falls_back_to_the_peak_without_a_fit(db, tmp_path):
+    """With no fitted decay to anchor on, the figure finds the turn itself.
 
     The room here peaks a quarter of an hour before the time the user reported, the
-    way a real one does. Anchoring on the label would start the curve part-way down
-    its own decay, so the figure has to find the turn itself.
+    way a real one does, so anchoring on the label would start the curve part-way
+    down its own decay. Where a fit DOES exist the fit's start wins instead - see
+    test_the_openings_figure_prefers_the_fit_start - because the peak can sit inside
+    a mixing transient that obeys no air-change rate.
     """
     from analysis import figures
 
@@ -995,3 +997,48 @@ def test_minutes_from_puts_two_days_on_one_axis(db):
     got = figures._minutes_from(pd.Series([1.0] * 4, index=idx),
                                 int(idx[0].timestamp()))
     assert list(got) == [0.0, 10.0, 20.0, 30.0]
+
+
+def test_the_openings_figure_prefers_the_fit_start(db, tmp_path):
+    """A peak can sit inside a plume, so the fit's start is the better anchor.
+
+    The 6 Nov bedroom opening falls steeply for 35 minutes as a breath plume
+    disperses past the sensor, then settles into the slow decay the fit describes.
+    Normalised at the peak, that opening very nearly overlays a night with five
+    times its air-change rate; normalised where the fit begins, it does not.
+    """
+    from analysis import figures
+
+    t0 = int(pd.Timestamp("2026-11-06 21:00", tz="UTC").timestamp())
+    peak_at = t0 + 30 * 60
+    fit_from = peak_at + 35 * 60
+    obs = []
+    for i in range(60):
+        ts_i = t0 + i * 300
+        if ts_i <= peak_at:
+            value = 600 + 20 * i
+        elif ts_i < fit_from:
+            value = 720 - 3.0 * (ts_i - peak_at) / 60.0        # the plume, steep
+        else:
+            value = 615 * math.exp(-0.87 * (ts_i - fit_from) / 3600) + 358
+        obs.append(Observation("scd40", "co2_ppm", "bedroom", ts_i,
+                               round(value, 1), "measured", "ppm"))
+        obs.append(Observation("scd40", "indoor_temp_c", "bedroom", ts_i,
+                               18.5, "measured", "C"))
+    result = CollectResult("scd40")
+    result.observations = obs
+    db.save_result(result)
+    db.add_label("bedroom", "window", "open", peak_at, t0 + 59 * 300)
+    db.save_decays([{"location": "bedroom", "start_ts": fit_from,
+                     "end_ts": t0 + 59 * 300, "lambda_h": 0.87, "r2": 0.99,
+                     "method": "window", "inferred": "ventilated",
+                     "wind_ms": 0.76, "delta_t_c": 9.3, "labelled": "open"}])
+
+    figures.style()
+    figures.fig_openings(db, tmp_path, location="bedroom")
+    assert (tmp_path / "09_openings.png").exists()
+
+    # The anchor the figure uses: the fit's start, 35 minutes after the peak.
+    fits = [r for r in db.decays("bedroom", min_r2=0.9) if r["labelled"] == "open"]
+    assert len(fits) == 1
+    assert int(fits[0]["start_ts"]) - peak_at == 35 * 60

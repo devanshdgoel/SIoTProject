@@ -12,6 +12,7 @@ Each function takes the database and an axis, so the same code can later produce
 the report plates and the dashboard thumbnails without diverging.
 """
 
+import math
 import sys
 import time
 from pathlib import Path
@@ -500,6 +501,7 @@ def fig_estimators(db, out):
 
 PRE_MIN, POST_MIN = 20, 25       # context either side of the opening
 SEARCH_MIN = 45                  # how far from a reported time to hunt the peak
+MIN_EXCESS_PPM = 40              # below this there is no excess worth scaling by
 
 
 def _minutes_from(series, origin_ts):
@@ -517,13 +519,36 @@ def fig_openings(db, out, location="bedroom"):
     alternative - the still night had the LARGER indoor-outdoor temperature
     difference, so buoyancy on its own predicts the opposite ordering.
 
-    Zero is the CO2 peak - the moment the room began to clear - and not the reported
-    time, which is rounded, nor the fitted start, which is trimmed. All three differ
-    here. The 4 Nov opening was reported as 20:00 and the air began moving at 19:30;
-    the 6 Nov fit starts at 22:35 because the offset search dropped a transient, but
-    the room peaked at 1162 ppm at 22:00 and anchoring on the fit would cut away a
-    third of its decay. The peak is the one anchor that is measured, untrimmed, and
-    means the same thing for both events.
+    CO2 is drawn as excess above the outdoor baseline, as a percentage of the excess
+    at the peak. That is not cosmetic. A first-order room obeys
+
+        C(t) = C_out + (C_0 - C_out) e^(-lambda t)
+
+    so subtracting the baseline and dividing by the starting excess leaves e^(-lambda
+    t) exactly - a curve that depends on the air-change rate and on nothing else. The
+    two openings started 475 ppm apart, which otherwise shows up as a vertical gap
+    that has no bearing on how fast either room cleared. Normalised, the only thing
+    left between the curves is the quantity being compared. The absolute levels are
+    kept in the legend so nothing is hidden by the transform.
+
+    Zero is the start of the fitted decay, and both curves are normalised to their
+    excess there. The peak is the wrong reference, which the normalisation itself is
+    what revealed: anchored at the peak the two curves very nearly overlap for the
+    first half hour and cross 1/e within six minutes of each other, which cannot be
+    reconciled with air-change rates five times apart.
+
+    The 6 Nov trace is not a single exponential. It falls steeply from 1141 ppm for
+    about 35 minutes and only then settles into the slow decay the fit describes.
+    That opening plunge is a breath plume dispersing past the sensor after the
+    occupant left - mixing within the room, not exchange with outside - and it obeys
+    no air-change rate at all. best_decay_fit trims it by searching start offsets,
+    which is exactly right; anchoring on the peak puts it back and makes a still
+    night look like a breezy one.
+
+    So the reference is the point from which the room genuinely behaves as first
+    order. What precedes it is drawn faintly rather than hidden, because the reason
+    for the trim is itself worth seeing, and the 4 Nov opening shows how little gets
+    trimmed when no plume is involved.
     """
     labels = db.labels(location=location)
     events = sorted((lb for lb in labels
@@ -545,17 +570,17 @@ def fig_openings(db, out, location="bedroom"):
         colour = palette[i % len(palette)]
         fit = next((r for r in fits
                     if ev["start_ts"] - 1800 <= r["start_ts"] <= ev["end_ts"]), None)
-        # Look either side of the reported time for where the room actually turned
-        # over. A label is accurate to about a quarter of an hour, so the search is
-        # wider than that and no wider.
         wide = features.series(db, "co2_ppm", location,
                                ev["start_ts"] - 3600, ev["end_ts"] + POST_MIN * 60).dropna()
         if wide.empty:
             continue
+        # The peak, kept for the legend: it says what the room actually reached, and
+        # how much of the record the fit had to discard before it behaved.
         near = wide.loc[ts(ev["start_ts"] - SEARCH_MIN * 60):
                         ts(ev["start_ts"] + SEARCH_MIN * 60)]
-        origin = int((near.idxmax() if not near.empty else wide.index[0]).timestamp())
-        a, b = origin - PRE_MIN * 60, ev["end_ts"] + POST_MIN * 60
+        peak_ts = int((near.idxmax() if not near.empty else wide.index[0]).timestamp())
+        origin = int(fit["start_ts"]) if fit is not None else peak_ts
+        a, b = min(origin, peak_ts) - PRE_MIN * 60, ev["end_ts"] + POST_MIN * 60
 
         co2 = wide.loc[ts(a):ts(b)]
         t_in = features.series(db, "indoor_temp_c", location, a, b).dropna()
@@ -563,26 +588,46 @@ def fig_openings(db, out, location="bedroom"):
         if co2.empty:
             continue
 
-        when = ts(origin).strftime("%d %b %H:%M")
+        when = ts(peak_ts).strftime("%d %b %H:%M")
         gust = (float(fit["wind_ms"]) if fit is not None and fit["wind_ms"] is not None
                 else float("nan"))
-        name = f"{when} — wind {gust:.1f} m/s"
+        peak = float(co2.loc[ts(peak_ts)]) if ts(peak_ts) in co2.index else float(co2.max())
+        trimmed = (origin - peak_ts) / 60.0
+        name = f"{when} — wind {gust:.1f} m/s,  peak {peak:.0f} ppm"
         if fit is not None:
             name += f",  λ = {fit['lambda_h']:.2f}/h"
+            if trimmed >= 10:
+                name += f"\n        (first {trimmed:.0f} min trimmed: not first order)"
 
-        ax_c.plot(_minutes_from(co2, origin), co2.values, color=colour,
-                  lw=1.9, marker="o", ms=2.6, label=name, zorder=3)
+        # Excess above the baseline, as a share of the excess where the fit begins.
+        # Guard the division: a room already sitting on outdoor air has no excess to
+        # scale by, and dividing by near-zero turns sensor noise into a signal.
+        base = c_out if c_out is not None else float(co2.min())
+        at_origin = (float(co2.loc[ts(origin)]) if ts(origin) in co2.index
+                     else float(co2.iloc[0]))
+        excess0 = at_origin - base
+        if excess0 < MIN_EXCESS_PPM:
+            continue
+        x_all = _minutes_from(co2, origin)
+        y_all = (co2.values - base) / excess0 * 100.0
+        # Split rather than overlay: a translucent line drawn on top of a solid one
+        # still reads as solid, and the point of the lead-in is that it is excluded.
+        keep, drop = x_all >= 0, x_all <= 0
+        ax_c.plot(x_all[keep], y_all[keep], color=colour, lw=1.9, marker="o",
+                  ms=2.6, label=name, zorder=3)
+        if drop.sum() > 1:
+            ax_c.plot(x_all[drop], y_all[drop], color=colour, lw=1.4, alpha=.3,
+                      ls=(0, (2, 2)), zorder=2.5)
 
-        # The fitted exponential over its own span, to show the model IS the curve
-        # rather than a line drawn near it.
-        if fit is not None and c_out is not None:
+        # The fitted exponential over its own span, normalised the same way, to show
+        # the model IS the curve rather than a line drawn near it.
+        if fit is not None:
             span = co2.loc[ts(fit["start_ts"]):ts(fit["end_ts"])]
             if span.size >= 3:
                 x = _minutes_from(span, origin)
-                excess = float(span.iloc[0]) - c_out
-                model = c_out + excess * np.exp(-fit["lambda_h"] * (x - x[0]) / 60.0)
-                ax_c.plot(x, model, color=colour, lw=1.0, ls=(0, (4, 3)),
-                          alpha=.9, zorder=4)
+                model = excess0 * np.exp(-fit["lambda_h"] * x / 60.0)
+                ax_c.plot(x, model / excess0 * 100.0, color=colour, lw=1.0,
+                          ls=(0, (4, 3)), alpha=.9, zorder=4)
 
         shut = (ev["end_ts"] - origin) / 60.0
         shut_marks.append((shut, colour))
@@ -601,17 +646,30 @@ def fig_openings(db, out, location="bedroom"):
                 # score a three-hour airing as a temperature GAIN.
                 lost = float(held.iloc[0] - held.min())
                 dT = float(held.mean()) - outside
-                ax_t.plot(_minutes_from(t_in, origin), t_in.values, color=colour,
-                          lw=1.9, marker="o", ms=2.6, zorder=3,
+                xt = _minutes_from(t_in, origin)
+                k, d = xt >= 0, xt <= 0
+                ax_t.plot(xt[k], t_in.values[k], color=colour, lw=1.9, marker="o",
+                          ms=2.6, zorder=3,
                           label=f"{when} — outdoors {outside:.1f} °C, "
                                 f"ΔT {dT:.1f} °C,  fell {lost:.1f} °C")
+                if d.sum() > 1:
+                    ax_t.plot(xt[d], t_in.values[d], color=colour, lw=1.4,
+                              alpha=.3, ls=(0, (2, 2)), zorder=2.5)
 
-    if c_out is not None:
-        ax_c.axhline(c_out, color=MUTE, lw=1.1, ls="--", alpha=.75, zorder=1)
-        ax_c.annotate(f"measured outdoor baseline, {c_out:.0f} ppm",
-                      (0.015, c_out), xycoords=("axes fraction", "data"),
-                      xytext=(0, 5), textcoords="offset points",
-                      color=MUTE, fontsize=7.5)
+    ax_c.axhline(0, color=MUTE, lw=1.1, ls="--", alpha=.75, zorder=1)
+    ax_c.annotate(f"outdoor baseline, {c_out:.0f} ppm" if c_out is not None
+                  else "outdoor baseline",
+                  (0.015, 0), xycoords=("axes fraction", "data"),
+                  xytext=(0, 5), textcoords="offset points",
+                  color=MUTE, fontsize=7.5)
+    # Where a curve crosses 1/e it has run for exactly one time constant, 1/lambda.
+    # The horizontal distance between the two crossings IS the ratio of the rates,
+    # which is the whole comparison, readable off the axis without arithmetic.
+    ax_c.axhline(100 / math.e, color=MUTE, lw=1.0, ls=":", alpha=.65, zorder=1)
+    ax_c.annotate("1/e — one time constant, 1/λ",
+                  (0.015, 100 / math.e), xycoords=("axes fraction", "data"),
+                  xytext=(0, 5), textcoords="offset points",
+                  color=MUTE, fontsize=7.5)
 
     # Each opening ran for a different length, so the close is marked per event, at
     # the foot of the axis where it cannot collide with the traces or the legend.
@@ -624,12 +682,14 @@ def fig_openings(db, out, location="bedroom"):
         ax_c.annotate(f"shut, {shut:.0f} min", (shut, lo), xytext=(4, 6),
                       textcoords="offset points", color=colour, fontsize=7.5)
 
-    ax_c.set_title(f"the same {location} window, opened twice")
-    ax_c.set_ylabel("CO₂ (ppm)")
+    ax_c.set_ylim(-6, 128)      # the trimmed plume leaves the top of the panel
+    ax_c.set_title(f"the same {location} window, opened twice "
+                   f"(CO₂ normalised where each fit begins)")
+    ax_c.set_ylabel("CO₂ excess above baseline\n(% of excess at t = 0)")
     ax_c.legend(loc="upper right", fontsize=8)
     ax_t.set_title("indoor temperature over the same openings")
     ax_t.set_ylabel("temperature (°C)")
-    ax_t.set_xlabel("minutes since the CO₂ peak (0 = measured, not reported)")
+    ax_t.set_xlabel("minutes since the fitted decay begins (0 = measured, not reported)")
     ax_t.legend(loc="lower left", fontsize=8)
 
     fig.tight_layout()
