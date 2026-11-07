@@ -8,8 +8,10 @@ Three jobs.
   1. Put four sources sampled at 1 min, 7 min, 30 min and 60 min onto one 5-minute
      grid. 5 minutes is well inside Nyquist for room CO2 dynamics, whose time
      constant (1/lambda) runs from about 20 minutes to several hours.
-  2. Remove spikes without smearing them (Hampel), and refuse to invent data across
-     gaps where the sensor was simply absent.
+  2. Remove single-sample spikes without smearing them - NOT with a Hampel filter,
+     which deletes the very decays this file exists to measure; see `despike` for
+     the reasoning and for what the filter does to a genuine turning point. And
+     refuse to invent data across gaps where the sensor was simply absent.
   3. Find the stretches of record that carry physical information: decays, from which
      the air-change rate follows, and plateaus, from which the CO2 source term does.
 """
@@ -25,11 +27,20 @@ GRID_S = 300
 # How each metric reaches the common grid.
 #   "agg"  collapses the samples inside one bin
 #   "fill" bridges bins the source never sampled at all (the hourly feeds)
-# mean is not cosmetic: averaging the 1-minute sensors is the anti-alias filter.
-# Taking one sample in five would fold sensor noise down into the band of interest.
+# Averaging the 1-minute sensors is a weak anti-alias filter and the honest figure
+# is worth stating: a 5-sample boxcar is only -3.8 dB at the new Nyquist (10 min)
+# with a -14 dB sidelobe floor across the fold band, so it is not the reason this
+# is safe. It is safe because the SCD40 averages internally and has a ~60 s
+# response, which leaves 0.04% of the desk record's power above the 5-minute
+# Nyquist; the boxcar then puts what aliases 42 dB down, against 34 dB for naive
+# decimation. A future sensor with real high-frequency content would need more.
 # max exists because peak exposure must not be averaged away.
-# interp suits a continuous physical field, which is near-linear across an hour;
-# an interval total such as rainfall cannot be interpolated and is held instead.
+# interp suits a continuous physical field, which is near-linear across an hour.
+# An interval total such as rainfall cannot be interpolated, so "ffill" here means
+# fill with ZERO rather than hold: forward-filling a rain total would manufacture
+# rain that did not fall. It is the one place absence is written as a measurement,
+# and it is deliberate - but precip_mm is collected and not yet consumed, so
+# nothing depends on the choice today.
 RESAMPLE = {
     "co2_ppm": ("mean", None),
     "co2_max_ppm": ("max", None),
@@ -107,9 +118,15 @@ def despike(s, k=4.0):
 def outdoor_baseline(co2, q=0.05, lo=250.0, hi=700.0):
     """Outdoor CO2 as this particular sensor sees it: the low tail of its own record.
 
-    An empty or open room tends towards outdoor air, so the 5th percentile is that
-    value. Using the sensor's own tail rather than a textbook 420 ppm also absorbs
-    its calibration offset, which is what makes two sensors comparable."""
+    An empty or open room tends towards outdoor air, so the 5th percentile is a
+    first guess at that value - and only a guess. It is an UPPER bound, biased high
+    by however rarely the room is left empty long enough to get there: for this
+    bedroom it gave 465 ppm against the 358 later measured during a labelled
+    airing, so the seed was 107 ppm out, which is about 20% on every lambda fitted
+    against it. `learn` treats it as a seed and replaces it wherever a settled
+    baseline or a deep decay's asymptote can be had. Using the sensor's own tail
+    rather than a textbook 420 ppm does still absorb its calibration offset, which
+    is what makes two sensors comparable."""
     v = co2.dropna()
     if v.empty:
         return None
@@ -171,8 +188,16 @@ def plateau_windows(co2, c_out, min_minutes=30, max_slope_ppm_h=40.0,
                     min_excess=150.0, step=GRID_S):
     """Stretches where an occupied room has levelled off.
 
-    At steady state production balances losses, so source = lambda * excess. That is
-    a far more robust way to get the source term than fitting the rising transient."""
+    At steady state production balances losses, so source = lambda * excess.
+
+    This is the FALLBACK, not the preferred route - `learn` only reaches it when no
+    occupied rise could be fitted. An earlier version of this docstring called it
+    'far more robust than fitting the rising transient', which contradicts
+    `fit_rise` two functions below and is wrong for this flat: a plateau needs the
+    room to have reached steady state, and a bedroom with a 3-4 hour time constant
+    and a sleeper in it for eight never does. It is also worse arithmetic, because
+    source = lambda * excess inherits lambda's error in full and then passes it to
+    the volume as 1/lambda."""
     if co2.dropna().size < 4:
         return []
     smooth = co2.rolling(3, center=True, min_periods=1).median()
@@ -455,7 +480,10 @@ def occupancy_prior(db, location, start, end, step_s=GRID_S):
             "spell_min": round(spell_min), "runs": len(runs)}
 
 
-SETTLE_PPM = 25.0             # residual excess a sensor cannot tell from its own noise
+# A physics tolerance, not a noise floor: measured sensor noise on the 5-minute
+# grid is about 2-3 ppm, so this is roughly 9 sigma. It is the excess below which
+# a room is called equilibrated for the purpose of reading a baseline off it.
+SETTLE_PPM = 25.0
 
 
 def settled_baseline(seg, c_out_guess):

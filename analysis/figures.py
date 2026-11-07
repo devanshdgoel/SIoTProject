@@ -468,11 +468,24 @@ def fig_estimators(db, out):
         if sp:
             f_, p_, fit = np.array(sp["freqs"]), np.array(sp["psd"]), np.array(sp["fit"])
             ax.loglog(f_, p_, lw=0.7, color="#8b9bab", label="measured spectrum")
-            ax.loglog(f_, fit, lw=2.0, color="#3fb97f", label="first-order fit")
-            fc = res["spectrum"]["corner_hz_per_h"]
-            ax.axvline(fc, color="#3fb97f", ls="--", lw=1.2,
-                       label=f"corner {res['spectrum']['corner_period_h']:.0f} h"
-                             rf"  ->  $\lambda$={res['spectrum']['lambda_h']:.2f}/h")
+            spec = res["spectrum"]
+            slope = spec.get("slope_dec_per_dec")
+            ax.loglog(f_, fit, lw=2.0, color="#3fb97f",
+                      label=f"fitted roll-off {slope} dec/dec"
+                            if slope is not None else "fit")
+            fc = spec["corner_hz_per_h"]
+            # The corner is only a rate if the roll-off says the room is first
+            # order. Here it does not, so the line is drawn as a corner and
+            # explicitly NOT labelled with a lambda - putting one there is what
+            # made this figure claim three independent measurements of one
+            # quantity when it had two.
+            if spec.get("lambda_h"):
+                tag = (f"corner {spec['corner_period_h']:.0f} h"
+                       rf"  ->  $\lambda$={spec['lambda_h']:.2f}/h")
+            else:
+                tag = (f"corner {spec['corner_period_h']:.0f} h — not a rate: "
+                       f"roll-off {slope} ≠ −2.0, so not first order")
+            ax.axvline(fc, color="#3fb97f", ls="--", lw=1.2, label=tag)
             if res["decay"].get("lambda_h"):
                 ax.axvline(res["decay"]["lambda_h"] / (2 * np.pi), color="#e2574c", ls="--",
                            lw=1.2, label=f"where decay fitting says it is")
@@ -500,9 +513,15 @@ def fig_estimators(db, out):
                     va="center", fontsize=8, color="#c7d3de")
         ax.set_xlim(0, max(vals + [0.1]) * 1.9)
         ax.set_xlabel("air changes per hour")
-        ax.set_title("three independent routes to the same number", loc="left")
+        # Not "three routes to the same number": the spectral route declines to
+        # give one at all (its roll-off rejects first order), and the two that do
+        # disagree by more than their error bars. Titling a disagreement as
+        # agreement is the failure mode this whole figure exists to prevent.
+        ax.set_title("what each route can measure, and how far apart they land",
+                     loc="left")
 
-    fig.suptitle("Measuring the same physical quantity three different ways", y=.995)
+    fig.suptitle("Three routes to the air-change rate — one of them refuses, "
+                 "and the other two disagree", y=.995)
     fig.tight_layout()
     path = Path(out) / "08_estimators.png"
     fig.savefig(path, dpi=140); plt.close(fig)
@@ -528,7 +547,7 @@ def fig_openings(db, out, location="bedroom"):
     hour in 3.7 m/s against 2.58 in 0.75 m/s. A factor of 1.8 for a factor of five in
     wind, which is the measurement that refuted proportionality through the origin -
     and the lower panel says why. The still night had the LARGER indoor-outdoor
-    difference, 9.3 C against 6.1, so buoyancy was working harder on the night the
+    difference, 9.5 C against 6.5, so buoyancy was working harder on the night the
     wind was doing nothing. An open window here is a stack-driven opening that wind
     adds to, not a wind-driven one.
 
@@ -551,9 +570,9 @@ def fig_openings(db, out, location="bedroom"):
     reconciled with air-change rates five times apart.
 
     The 6 Nov curve does not reach zero, and that is the second finding rather than
-    a defect in the measurement. It flattens around 35% of its starting excess, which
-    in ppm is about 480 - close to the living room's own resting level and nowhere
-    near the 358 ppm outside. With the window open on a still night the air replacing
+    a defect in the measurement. It flattens at 29% of its starting excess, which in
+    ppm is 479 - far above the 358 ppm outside, and close to where the desk room
+    sits when nobody has aired it. With the window open on a still night the air replacing
     the bedroom's was mostly coming through the door from the rest of the flat, not
     in through the window. Each curve is therefore drawn against the asymptote its
     own fit found, marked where it differs from outdoor air.
