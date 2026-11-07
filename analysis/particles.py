@@ -1,0 +1,316 @@
+"""
+particles.py
+
+What the particle counter is for, which is not "a second air-quality number".
+
+CO2 and particles are carried by the same air exchange and lost in different ways,
+and that difference is the only genuinely independent measurement of the air-change
+rate this project can make.
+
+    CO2:        dC/dt = -lambda (C - C_out)
+    particles:  dP/dt = lambda * p * P_out - (lambda + k) P + S/V
+
+CO2 is a gas. It leaves only with the air, so a decay measures lambda and nothing
+else. A particle also settles out on the floor, the walls and the duvet, at a
+deposition rate k, so a particle decay measures lambda + k. Subtract one from the
+other over the same event and you have k: a second physical property of the room,
+from a sensor that shares no baseline, no calibration and no arithmetic with the
+CO2 path.
+
+That matters here specifically. `estimators.compare` offered three routes to lambda
+and two of them subtract the same c_out, so an error there moves them together and
+their agreement is partly tautological; the third turned out to measure the shape
+of the occupancy cycle rather than the room. Particles have none of those couplings.
+
+THE FALSIFICATION. Deposition is not a free parameter to be fitted and admired: it
+is strongly size-dependent, and the direction is not in doubt. Bigger particles
+settle faster, so
+
+    k(PM1) < k(PM2.5) < k(PM10)
+
+always, in every room, by gravity. The sensor reports all three from the same air
+at the same instant, so this ordering is a prediction the hardware cannot help but
+test. If the fitted k rise with size, the method is measuring deposition. If they
+come out in some other order, it is fitting noise and says so - which is the whole
+reason to compute all three rather than just PM2.5.
+
+PENETRATION. With the window shut, particles arriving from outside are filtered by
+the gaps they come through, so only a fraction p survives. At steady state with no
+indoor source,
+
+    P_in / P_out = lambda * p / (lambda + k)
+
+so once lambda and k are known the floor a decay settles to gives p. That turns
+"open the window to clear the CO2" into "open it, and here is the PM it will let
+in", which is the trade-off `ventilation.plan_purge` currently weighs with a
+hand-picked divisor and no measurement behind it.
+
+WHAT THIS NEEDS FROM YOU. CO2 events happen because you breathe. Particle events do
+not: there has to be an indoor source and then an end to it. One deliberate cooking
+event with the door shut gives every number on this page.
+"""
+
+import numpy as np
+
+from analysis import features
+
+# The three masses the PMS5003 reports, with the size each stands for. The order is
+# load-bearing: it is what the deposition ordering is checked against.
+PM_SIZES = (("pm1_0", 1.0), ("pm2_5", 2.5), ("pm10", 10.0))
+
+MIN_PM_DROP = 0.5          # a decay must lose half its excess to be worth fitting
+MIN_PM_MINUTES = 40        # and run long enough for the curvature to be real
+MIN_PM_PEAK = 15.0         # ug/m3 above the floor; below this it is sensor noise
+MIN_PM_R2 = 0.85           # particle data is noisier than CO2; do not demand 0.99
+
+
+def pm_decays(series, min_minutes=MIN_PM_MINUTES, min_drop=MIN_PM_DROP,
+              min_peak=MIN_PM_PEAK):
+    """Stretches where particles fall steadily: a source stopped and the room cleared.
+
+    Deliberately simpler than `features.decay_windows`. A particle event has a
+    sharp peak and a long tail rather than CO2's slow build, and the floor it
+    settles to is set by outdoor air leaking in rather than by a known baseline, so
+    the test is "falling from a real peak for long enough" and the floor is left to
+    the fit.
+    """
+    s = series.dropna()
+    if s.size < 8:
+        return []
+    smooth = s.rolling(3, center=True, min_periods=1).median()
+    out, start = [], None
+    for i in range(1, len(smooth)):
+        falling = smooth.iloc[i] < smooth.iloc[i - 1]
+        if falling and start is None:
+            start = i - 1
+        elif not falling and start is not None:
+            out.append((start, i - 1))
+            start = None
+    if start is not None:
+        out.append((start, len(smooth) - 1))
+
+    keep = []
+    for a, b in out:
+        seg = s.iloc[a:b + 1]
+        if seg.size < 6:
+            continue
+        minutes = (seg.index[-1] - seg.index[0]).total_seconds() / 60.0
+        peak, floor = float(seg.iloc[0]), float(seg.min())
+        if minutes < min_minutes or peak - floor < min_peak:
+            continue
+        if (peak - float(seg.iloc[-1])) < min_drop * (peak - floor):
+            continue
+        keep.append((seg.index[0], seg.index[-1]))
+    return keep
+
+
+def fit_pm_decay(seg):
+    """Total loss rate (lambda + k) from one particle decay, with its own floor free.
+
+    The asymptote has to be free. A particle decay does not head for zero - it heads
+    for whatever outdoor air is leaking in and surviving the journey - and forcing
+    it to zero would do here exactly what forcing CO2 to c_out did there: buy the
+    misfit off with a rate that is too low.
+    """
+    seg = seg.dropna()
+    if seg.size < 6:
+        return None
+    fit = features.fit_decay_free(seg, 0.0)
+    if fit is None or fit["r2"] < MIN_PM_R2:
+        return None
+    return {"total_loss_h": fit["lambda_h"], "floor": fit["c_inf"],
+            "r2": fit["r2"], "stderr": fit.get("stderr"),
+            "n": int(seg.size), "n_eff": fit.get("n_eff"),
+            "start": seg.index[0], "end": seg.index[-1],
+            "peak": float(seg.iloc[0])}
+
+
+def _lambda_during(db, location, start_ts, end_ts, model=None):
+    """The air-change rate that applied during a window, and where it came from.
+
+    A measured CO2 decay overlapping the same minutes is worth far more than the
+    room's pooled average, because deposition is the DIFFERENCE between two rates
+    and a difference of two averages taken at different times is mostly noise. The
+    pooled value is accepted as a fallback but labelled as one.
+    """
+    best, overlap = None, 0.0
+    for r in db.decays(location):
+        lo, hi = int(r["start_ts"]), int(r["end_ts"])
+        seen = min(end_ts, hi) - max(start_ts, lo)
+        if seen > overlap and seen > 0:
+            best, overlap = r, seen
+    span = max(float(end_ts - start_ts), 1.0)
+    if best is not None and overlap / span >= 0.5:
+        return float(best["lambda_h"]), "measured CO2 decay over the same minutes"
+    if model is not None:
+        return float(model.value["lambda_sealed"]), "the room's pooled lambda_sealed"
+    return None, "no CO2 rate available"
+
+
+def deposition(db, location, days=14, now=None, model=None):
+    """Deposition rate per particle size, and whether it behaves like deposition.
+
+    For each size: find particle decays, fit the total loss rate, subtract the CO2
+    air-change rate measured over the same minutes, and keep what is left.
+
+    Returns a dict per size plus an `ordered` verdict on the size dependence, which
+    is the test that makes this physics rather than curve fitting.
+    """
+    import time as _time
+
+    now = int(_time.time()) if now is None else int(now)
+    start = now - days * 86400
+    out = {"location": location, "sizes": {}, "events": 0}
+
+    for metric, micron in PM_SIZES:
+        s = features.series(db, metric, location, start, now)
+        if s.dropna().size < 12:
+            continue
+        ks, rows = [], []
+        for a, b in pm_decays(s):
+            fit = fit_pm_decay(s.loc[a:b])
+            if fit is None:
+                continue
+            lam, basis = _lambda_during(db, location, int(a.timestamp()),
+                                        int(b.timestamp()), model)
+            if lam is None:
+                continue
+            k = fit["total_loss_h"] - lam
+            rows.append({"total_loss_h": round(fit["total_loss_h"], 3),
+                         "lambda_h": round(lam, 3), "k_h": round(k, 3),
+                         "floor": round(fit["floor"], 1), "r2": round(fit["r2"], 4),
+                         "peak": round(fit["peak"], 1), "basis": basis,
+                         "start_ts": int(a.timestamp())})
+            # A negative k means particles left SLOWER than the air did, which is
+            # impossible: deposition can only add to the loss. Kept in the record
+            # because a run of them says the CO2 rate is wrong, not the particles.
+            if k > 0:
+                ks.append(k)
+        if rows:
+            med, err, n = _robust_k(ks)
+            out["sizes"][metric] = {"micron": micron, "events": len(rows),
+                                    "k_h": med, "stderr": err, "n_usable": n,
+                                    "negative": len(rows) - n, "fits": rows}
+            out["events"] += len(rows)
+
+    out.update(_check_ordering(out["sizes"]))
+    return out
+
+
+def _robust_k(values):
+    if not values:
+        return None, None, 0
+    a = np.asarray(values, dtype=float)
+    med = float(np.median(a))
+    if a.size < 2:
+        return round(med, 3), None, 1
+    sd = 1.4826 * float(np.median(np.abs(a - med)))
+    sd = max(sd, 0.05 * abs(med))
+    return round(med, 3), round(float(1.253 * sd / np.sqrt(a.size)), 3), int(a.size)
+
+
+def _check_ordering(sizes):
+    """Does fitted deposition rise with particle size, as gravity requires?
+
+    This is the falsification and it costs nothing: the sensor reports all three
+    masses from the same air at the same instant, so no extra experiment is needed
+    and no tuning can rescue a wrong answer. Two sizes can only be compared, not
+    confirmed - a pair agrees by chance half the time - so the verdict stays
+    provisional until all three are in.
+    """
+    have = [(m, d["k_h"]) for m, d in sizes.items()
+            if d.get("k_h") is not None]
+    order = [m for m, _mic in PM_SIZES if m in dict(have)]
+    ks = [dict(have)[m] for m in order]
+    if len(ks) < 2:
+        return {"ordered": None,
+                "ordering_note": "needs at least two sizes with a fitted rate"}
+    rising = all(b > a for a, b in zip(ks, ks[1:]))
+    note = " < ".join(f"k({m})={v:.2f}" for m, v in zip(order, ks))
+    if rising and len(ks) >= 3:
+        return {"ordered": True,
+                "ordering_note": (f"deposition rises with size as gravity requires: "
+                                  f"{note}. Three sizes from one sensor in one air "
+                                  f"sample, so this is a real test and it passed.")}
+    if rising:
+        return {"ordered": True,
+                "ordering_note": (f"{note}, which is the right direction - but two "
+                                  f"sizes agree by chance half the time. Provisional "
+                                  f"until the third is fitted.")}
+    return {"ordered": False,
+            "ordering_note": (f"deposition does NOT rise with particle size: {note}. "
+                              f"Gravity does not permit that, so these are fits to "
+                              f"noise rather than measurements of deposition, and "
+                              f"no k should be believed from them.")}
+
+
+def penetration(db, location, k_h, lambda_h, days=14, now=None, metric="pm2_5"):
+    """Fraction of outdoor particles that survive the journey indoors.
+
+    At steady state with no indoor source, P_in/P_out = lambda*p/(lambda + k), so
+
+        p = (P_in / P_out) * (lambda + k) / lambda
+
+    Measured on the quietest indoor stretches available, because the derivation
+    assumes the indoor source is zero and anything else biases p upwards.
+    """
+    import time as _time
+
+    now = int(_time.time()) if now is None else int(now)
+    start = now - days * 86400
+    inside = features.series(db, metric, location, start, now).dropna()
+    outside = features.series(db, metric, "home", start, now).dropna()
+    if inside.size < 24 or outside.size < 24 or not lambda_h:
+        return None
+
+    pair = inside.to_frame("in").join(outside.to_frame("out"), how="inner").dropna()
+    pair = pair[pair["out"] > 2.0]                 # a ratio to nothing is not a ratio
+    if pair.shape[0] < 24:
+        return None
+    # The quietest quarter: lowest indoor level for the outdoor level at the time.
+    pair["ratio"] = pair["in"] / pair["out"]
+    quiet = pair[pair["ratio"] <= pair["ratio"].quantile(0.25)]
+    if quiet.empty:
+        return None
+    ratio = float(quiet["ratio"].median())
+    p = ratio * (lambda_h + k_h) / lambda_h
+    return {"metric": metric, "ratio_in_out": round(ratio, 3),
+            "penetration": round(min(p, 1.5), 3), "n": int(quiet.shape[0]),
+            "capped": bool(p > 1.5),
+            "note": (f"indoors sits at {ratio:.2f} of outdoor {metric} when nothing "
+                     f"is happening inside; with lambda={lambda_h:.2f}/h and "
+                     f"k={k_h:.2f}/h that implies {min(p, 1.5):.2f} of outdoor "
+                     f"particles survive the way in"
+                     + (". Capped at 1.5: a penetration above 1 means the model is "
+                        "wrong, most likely an indoor source during the 'quiet' "
+                        "hours." if p > 1.5 else "."))}
+
+
+def learn_particles(db, location, days=14, now=None):
+    """Fit everything the particle counter can say, and store what survives its test.
+
+    Nothing is stored unless the size ordering passes, because a deposition rate
+    that does not rise with size is not a deposition rate.
+    """
+    from analysis.room_model import RoomModel
+
+    model = RoomModel(db, location)
+    out = deposition(db, location, days=days, now=now, model=model)
+    if not out["sizes"]:
+        out["note"] = "no usable particle decays yet - needs an indoor source event"
+        return out
+
+    fine = out["sizes"].get("pm2_5")
+    if out.get("ordered") and fine and fine["k_h"]:
+        db.set_param(location, "deposition_k_pm2_5", fine["k_h"], fine["stderr"],
+                     fine["n_usable"], "1/h",
+                     {"from": f"{fine['events']} particle decay(s) minus the CO2 "
+                              f"rate over the same minutes",
+                      "ordering": out["ordering_note"]})
+        pen = penetration(db, location, fine["k_h"],
+                          model.value["lambda_sealed"], days=days, now=now)
+        if pen:
+            db.set_param(location, "penetration_pm2_5", pen["penetration"], None,
+                         pen["n"], "fraction", pen)
+            out["penetration"] = pen
+    return out

@@ -735,6 +735,19 @@ def _learn(db, location, days=14, now=None):
     # survives as a stale row once the evidence for it is gone.
     summary["weather"] = fit_weather(db, location, start=start)
     summary["open_wind"] = fit_open_wind(db, location, start=start)
+
+    # Particles, where there are any. Imported here rather than at module scope
+    # because analysis.particles needs RoomModel, and a cycle at import time would
+    # break every caller for the sake of a feature most rooms do not have.
+    try:
+        from analysis.particles import learn_particles
+        pm = learn_particles(db, location, days=days, now=now)
+        if pm.get("events"):
+            summary["particles"] = pm
+    except Exception as e:                          # noqa: BLE001
+        # A node without a particle counter is the normal case, not an error, and
+        # the CO2 model must not depend on the optional sensor in any way.
+        summary["particles_error"] = f"{type(e).__name__}: {e}"
     return summary
 
 

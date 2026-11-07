@@ -452,6 +452,29 @@ def cmd_params(args, db):
                   + (f", {detail['skipped_rises']} rise(s) too straight to read a "
                      f"rate off" if detail.get("skipped_rises") else ""))
 
+        # Particles, where the counter has produced anything. This is the only
+        # route to lambda that shares no arithmetic with the CO2 path, so it is
+        # shown next to it rather than tucked away.
+        dep = db.params(name).get("deposition_k_pm2_5")
+        if dep and dep["value"]:
+            d = json.loads(dep["detail"]) if dep["detail"] else {}
+            err = f" +/-{dep['stderr']:.3f}" if dep["stderr"] else ""
+            print(f"  deposition_k      {dep['value']:9.3f}{err} 1/h (PM2.5), "
+                  f"n={dep['n']}")
+            if d.get("ordering"):
+                print(f"  {'':18s}{d['ordering']}")
+            lam = model.value["lambda_sealed"]
+            print(f"  {'':18s}particles leave at {lam + dep['value']:.2f}/h against "
+                  f"the air's {lam:.2f}/h - the difference is settling, measured "
+                  f"by a sensor that shares no baseline with the CO2")
+        pen = db.params(name).get("penetration_pm2_5")
+        if pen and pen["value"]:
+            pd_ = json.loads(pen["detail"]) if pen["detail"] else {}
+            print(f"  penetration       {pen['value']:9.3f}            of outdoor "
+                  f"PM2.5 survives the way in")
+            if pd_.get("note"):
+                print(f"  {'':18s}{pd_['note']}")
+
         # The weather law gets the same treatment as the wind law: shown whether it
         # passed or failed, because a refutation is a result and a silent parameter
         # nobody reads is not.

@@ -1629,3 +1629,146 @@ def test_the_lock_is_released_even_when_the_body_raises(db):
             assert got
             raise ValueError("boom")
     assert db.lock_holder("analysis") is None
+
+
+# --- particles: the independent route -----------------------------------------
+
+def _pm_event(lam, k, peak, floor=4.0, hours=4.0, step=5, noise=0.6,
+              start="2026-11-08 18:00", seed=0):
+    """A cooking puff clearing: P(t) = floor + (peak-floor) exp(-(lambda+k) t)."""
+    rng = np.random.default_rng(seed)
+    n = int(hours * 60 / step) + 1
+    idx = pd.date_range(start, periods=n, freq=f"{step}min", tz="UTC")
+    t = np.arange(n) * step / 60.0
+    y = floor + (peak - floor) * np.exp(-(lam + k) * t)
+    return pd.Series(np.clip(y + rng.normal(0, noise, n), 0.1, None), index=idx)
+
+
+def test_a_particle_decay_measures_lambda_plus_k():
+    """The whole premise: particles leave with the air AND settle, so their decay
+    is faster than the CO2 decay of the same room by exactly the deposition rate."""
+    from analysis import particles
+
+    fit = particles.fit_pm_decay(_pm_event(lam=0.3, k=0.45, peak=120.0))
+    assert fit is not None
+    assert fit["total_loss_h"] == pytest.approx(0.75, rel=0.1)
+    assert fit["floor"] == pytest.approx(4.0, abs=2.0)
+
+
+def test_a_pm_decay_is_not_forced_to_zero():
+    """A particle decay heads for the level outdoor air leaks in at, not for zero.
+    Forcing zero would understate the rate exactly as forcing c_out did for CO2."""
+    from analysis import particles
+
+    seg = _pm_event(lam=0.3, k=0.45, peak=120.0, floor=18.0)
+    fit = particles.fit_pm_decay(seg)
+    assert fit["floor"] == pytest.approx(18.0, abs=3.0)
+    assert fit["total_loss_h"] == pytest.approx(0.75, rel=0.15)
+
+
+def test_deposition_recovers_the_rate_it_was_built_from(db):
+    """End to end: a room with a known lambda and known size-dependent deposition."""
+    from analysis import particles
+
+    lam = 0.30
+    truth = {"pm1_0": 0.10, "pm2_5": 0.40, "pm10": 1.20}
+    now = int(dt.datetime(2026, 11, 8, 23, 0, tzinfo=dt.UTC).timestamp())
+    obs = []
+    for i, (metric, k) in enumerate(truth.items()):
+        s = _pm_event(lam, k, peak=140.0, hours=5.0, seed=i,
+                      start="2026-11-08 17:00")
+        for ts, v in s.items():
+            obs.append(Observation("scd40", metric, "bedroom", int(ts.timestamp()),
+                                   round(float(v), 2), "measured", "ug/m3"))
+    res = CollectResult("scd40")
+    res.observations = obs
+    db.save_result(res)
+
+    # the CO2 air-change rate measured over the same minutes
+    db.save_decays([{"location": "bedroom", "start_ts": int(s.index[0].timestamp()),
+                     "end_ts": int(s.index[-1].timestamp()), "lambda_h": lam,
+                     "r2": 0.99, "method": "window", "inferred": "sealed",
+                     "labelled": None}])
+
+    out = particles.deposition(db, "bedroom", days=5, now=now)
+    assert out["events"] >= 3, out
+    for metric, k in truth.items():
+        got = out["sizes"][metric]["k_h"]
+        assert got == pytest.approx(k, abs=0.15), f"{metric}: {got} vs {k}"
+
+
+def test_deposition_must_rise_with_particle_size(db):
+    """The falsification, and it costs nothing: all three masses come from the same
+    air at the same instant, so gravity's ordering is a free test the hardware
+    cannot avoid taking."""
+    from analysis.particles import _check_ordering
+
+    good = _check_ordering({"pm1_0": {"k_h": 0.1}, "pm2_5": {"k_h": 0.4},
+                            "pm10": {"k_h": 1.2}})
+    assert good["ordered"] is True
+    assert "gravity" in good["ordering_note"]
+
+    bad = _check_ordering({"pm1_0": {"k_h": 0.9}, "pm2_5": {"k_h": 0.4},
+                           "pm10": {"k_h": 0.2}})
+    assert bad["ordered"] is False
+    assert "noise" in bad["ordering_note"]
+
+    # two sizes in the right order is not yet evidence
+    pair = _check_ordering({"pm1_0": {"k_h": 0.1}, "pm2_5": {"k_h": 0.4}})
+    assert pair["ordered"] is True and "Provisional" in pair["ordering_note"]
+
+
+def test_nothing_is_stored_when_the_ordering_fails(db):
+    """A deposition rate that does not rise with size is not a deposition rate, so
+    it must not reach room_params where something downstream would use it."""
+    from analysis import particles
+
+    lam = 0.30
+    now = int(dt.datetime(2026, 11, 8, 23, 0, tzinfo=dt.UTC).timestamp())
+    obs = []
+    # deliberately inverted: the coarse fraction clears SLOWEST, which cannot happen
+    for i, (metric, k) in enumerate((("pm1_0", 1.2), ("pm2_5", 0.4),
+                                     ("pm10", 0.1))):
+        s = _pm_event(lam, k, peak=140.0, hours=5.0, seed=i,
+                      start="2026-11-08 17:00")
+        for ts, v in s.items():
+            obs.append(Observation("scd40", metric, "bedroom", int(ts.timestamp()),
+                                   round(float(v), 2), "measured", "ug/m3"))
+    res = CollectResult("scd40")
+    res.observations = obs
+    db.save_result(res)
+    db.save_decays([{"location": "bedroom", "start_ts": int(s.index[0].timestamp()),
+                     "end_ts": int(s.index[-1].timestamp()), "lambda_h": lam,
+                     "r2": 0.99, "method": "window", "inferred": "sealed",
+                     "labelled": None}])
+
+    out = particles.learn_particles(db, "bedroom", days=5, now=now)
+    assert out["ordered"] is False
+    assert "deposition_k_pm2_5" not in db.params("bedroom")
+
+
+def test_penetration_is_recovered_from_a_quiet_stretch(db):
+    """p = (P_in/P_out)(lambda+k)/lambda, so a room sitting at a known ratio with
+    known rates gives back the penetration it was built with."""
+    from analysis import particles
+
+    lam, k, p = 0.30, 0.40, 0.60
+    ratio = lam * p / (lam + k)                    # what the room must settle at
+    now = int(dt.datetime(2026, 11, 9, 0, 0, tzinfo=dt.UTC).timestamp())
+    idx = pd.date_range("2026-11-08 12:00", periods=200, freq="5min", tz="UTC")
+    rng = np.random.default_rng(2)
+    obs = []
+    for ts in idx:
+        out_v = 20.0 + 5.0 * rng.normal()
+        out_v = max(out_v, 5.0)
+        obs.append(Observation("open_meteo", "pm2_5", "home", int(ts.timestamp()),
+                               round(out_v, 2), "measured", "ug/m3"))
+        obs.append(Observation("scd40", "pm2_5", "bedroom", int(ts.timestamp()),
+                               round(out_v * ratio, 2), "measured", "ug/m3"))
+    res = CollectResult("mix")
+    res.observations = obs
+    db.save_result(res)
+
+    got = particles.penetration(db, "bedroom", k_h=k, lambda_h=lam, days=5, now=now)
+    assert got is not None
+    assert got["penetration"] == pytest.approx(p, abs=0.12), got
