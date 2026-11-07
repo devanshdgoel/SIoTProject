@@ -49,9 +49,6 @@ LOG = ROOT / "data" / "watchdog.log"
 # The third is the one nothing else could ever notice: parameters would simply
 # stop being re-fitted and keep serving their last values for ever.
 CHECKS = (
-    ("readings", 900,
-     "SELECT CAST(MAX(ts) AS INTEGER) FROM observations WHERE source='scd40'",
-     "no sensor reading has arrived"),
     ("collector", 600,
      "SELECT CAST(MAX(started_at) AS INTEGER) FROM collector_runs",
      "the collect process has not run"),
@@ -64,6 +61,28 @@ CHECKS = (
 # exits non-zero; it just cannot reach you while the laptop is closed.
 NTFY_TOPIC = os.environ.get("SIOT_NTFY_TOPIC", "").strip()
 NTFY_URL = os.environ.get("SIOT_NTFY_URL", "https://ntfy.sh").rstrip("/")
+
+
+SENSOR_STALE_S = 900        # a node posting every minute is late after fifteen
+
+
+def _per_sensor(conn):
+    """(location, seconds since its newest reading) for every indoor sensor.
+
+    Locations are discovered from the data rather than configured, so a node added
+    later is watched automatically and one removed stops being watched once its
+    last row ages out of the window below.
+    """
+    import time as _t
+    now = int(_t.time())
+    try:
+        rows = conn.execute(
+            "SELECT location, CAST(MAX(ts) AS INTEGER) FROM observations "
+            "WHERE source='scd40' AND ts > ? GROUP BY location",
+            (now - 7 * 86400,)).fetchall()
+    except sqlite3.Error:
+        return []
+    return [(r[0], now - int(r[1])) for r in rows if r[1] is not None]
 
 
 def age_of(conn, sql):
@@ -102,6 +121,21 @@ def main():
         # mode=ro: this process can never write, lock or vacuum the live database.
         conn = sqlite3.connect(f"file:{DB}?mode=ro", uri=True, timeout=5)
         try:
+            # Each sensor separately. The first version of this took a global
+            # MAX(ts) over every scd40 row, which one healthy node keeps fresh for
+            # ever - so the bedroom node went quiet for half an hour and the
+            # watchdog reported everything fine, which is precisely the failure it
+            # exists to catch. A node is only as watched as its own newest row.
+            for loc, age in _per_sensor(conn):
+                if age is None:
+                    continue
+                if age > SENSOR_STALE_S:
+                    lines.append(f"sensor {loc}: STALE - nothing for "
+                                 f"{age // 60} min (limit {SENSOR_STALE_S // 60})")
+                    alarms[f"sensor:{loc}"] = f"{age // 60}min"
+                else:
+                    lines.append(f"sensor {loc}: ok ({age // 60} min)")
+
             for name, limit, sql, phrase in CHECKS:
                 age = age_of(conn, sql)
                 if age is None:

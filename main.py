@@ -233,6 +233,101 @@ def cmd_volume(args, db):
           "  no source term fitted yet, so nothing to check it against")
 
 
+def cmd_particles(args, db):
+    """Is the particle counter working, and are its numbers physically possible?
+
+    "Is there data" is the easy half. The PMS5003 can also sit on 3V3 and report
+    plausible-looking numbers from an airflow too weak to be a sample, which no
+    freshness check can catch - so this tests the internal consistency the sensor
+    cannot fake: the three masses must be ordered, the six counts must fall with
+    size because they are cumulative, and a fan that is actually running produces
+    variance rather than a flat line.
+    """
+    import time as _t
+
+    from analysis import features
+    from analysis.particles import PM_SIZES
+
+    now = int(_t.time())
+    from analysis.room_model import rooms
+    locs = rooms(db)
+
+    found = False
+    for loc in locs:
+        series = {m: features.series(db, m, loc).dropna() for m, _u in PM_SIZES}
+        if not any(s_.size for s_ in series.values()):
+            continue
+        found = True
+        print(f"\n{loc}")
+        newest = max((s_.index[-1] for s_ in series.values() if s_.size), default=None)
+        age = (now - int(newest.timestamp())) // 60 if newest is not None else None
+        print(f"  newest sample {age} min ago")
+
+        # 1. masses must be ordered: PM10 counts everything PM2.5 counts, and more
+        bad_order = 0
+        pm1, pm25, pm10 = (series["pm1_0"], series["pm2_5"], series["pm10"])
+        joined = pm1.to_frame("a").join(pm25.to_frame("b"), how="inner") \
+                    .join(pm10.to_frame("c"), how="inner").dropna()
+        if joined.shape[0]:
+            bad_order = int(((joined["a"] > joined["b"] + 0.01)
+                             | (joined["b"] > joined["c"] + 0.01)).sum())
+            print(f"  mass ordering PM1<=PM2.5<=PM10: "
+                  f"{joined.shape[0] - bad_order}/{joined.shape[0]} ok"
+                  + ("" if not bad_order else f"  <-- {bad_order} IMPOSSIBLE"))
+
+        # 2. the counter must actually vary; a flat line is a fan that is not moving
+        for name, s_ in (("PM2.5", pm25),):
+            if s_.size >= 12:
+                spread = float(s_.max() - s_.min())
+                print(f"  {name} range over the record: {spread:.1f} ug/m3"
+                      + ("" if spread > 1.0 else
+                         "  <-- FLAT: check VCC is on 5V, not 3V3"))
+
+        # 3. cumulative counts must fall with size
+        bins = ["pc0_3", "pc0_5", "pc1_0", "pc2_5", "pc5_0", "pc10_0"]
+        cnt = {b: features.series(db, b, loc).dropna() for b in bins}
+        have = [b for b in bins if cnt[b].size]
+        if len(have) >= 2:
+            df = None
+            for b in have:
+                f_ = cnt[b].to_frame(b)
+                df = f_ if df is None else df.join(f_, how="inner")
+            df = df.dropna()
+            bad = 0
+            for a, b in zip(have, have[1:]):
+                bad += int((df[a] < df[b]).sum())
+            print(f"  count bins fall with size: {len(df) * (len(have) - 1) - bad}"
+                  f"/{len(df) * (len(have) - 1)} ok"
+                  + ("" if not bad else f"  <-- {bad} IMPOSSIBLE"))
+
+        # 4. duty cycle: particles arrive on one minute in five
+        if pm25.size and newest is not None:
+            co2 = features.series(db, "co2_ppm", loc).dropna()
+            if co2.size:
+                share = pm25.size / co2.size
+                print(f"  particle samples per CO2 sample: {share:.2f} "
+                      f"(expect about 1.0 on the 5-minute grid)")
+
+        dep = db.params(loc).get("deposition_k_pm2_5")
+        if dep and dep["value"]:
+            print(f"  deposition k = {dep['value']:.3f}/h from {dep['n']} event(s)")
+        else:
+            print("  no deposition rate yet: needs an indoor source that then stops "
+                  "(cook something with the door shut)")
+
+    if not found:
+        print("No particle data from any room.")
+        print()
+        print("If the bedroom node is flashed and wired, check in this order:")
+        print("  1. Is it reporting at all?   python main.py status")
+        print("  2. Serial at 115200 should show, within a minute of boot:")
+        print("       [pms] PMS5003 on UART2, RX=GPIO25 TX=GPIO26, 9600 baud")
+        print("     If that line is missing, HAS_PMS is 0 - check NODE is 2.")
+        print("  3. After the first 30 s warm-up it should show a reading. If it")
+        print("     says 'only 0 good frame(s)', TXD is not on GPIO25 or VCC is")
+        print("     not on 5V. Those are the two failures that look identical.")
+
+
 def cmd_limits(args, db):
     """What this system does not know, measured from its own record.
 
@@ -718,6 +813,8 @@ def main():
     p.add_argument("--people", type=int, help="how many, for an occupancy label")
     p.set_defaults(fn=cmd_label)
     p = sub.add_parser("params"); p.set_defaults(fn=cmd_params)
+    p = sub.add_parser("particles", help="is the particle counter working")
+    p.set_defaults(fn=cmd_particles)
     p = sub.add_parser("limits", help="what this system does not know")
     p.set_defaults(fn=cmd_limits)
     p = sub.add_parser("backup", help="consistent copy of the database")
