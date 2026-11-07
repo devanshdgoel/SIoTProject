@@ -838,8 +838,21 @@ void setup() {
   Serial.println();
   Serial.println("==================================================");
   Serial.println("[boot] ESP32 SCD40 node starting (serial 115200 baud)");
-  Serial.printf("[boot] device \"%s\" in room \"%s\" (display %s)\n",
-                DEVICE_NAME, ROOM_NAME, HAS_OLED ? "expected" : "none");
+  /* Say which build this is, in one line, before anything can go wrong.
+   *
+   * "The bedroom node is sending but I see nothing about the PMS" is not a wiring
+   * question, it is a which-build-am-I-running question - and the board knew the
+   * answer all along and was not saying. A peripheral compiled out is
+   * indistinguishable from one that is broken unless the banner names it. */
+  Serial.printf("[boot] device \"%s\" in room \"%s\" (NODE %d)\n",
+                DEVICE_NAME, ROOM_NAME, (int)NODE);
+  Serial.printf("[boot] built with: display %s | particle counter %s | touch pad %s\n",
+                HAS_OLED ? "YES" : "no", HAS_PMS ? "YES" : "no",
+                HAS_TOUCH ? "YES" : "no");
+  if (!HAS_PMS)
+    Serial.println("[boot] no PMS in this build - if you expected one, NODE is "
+                   "wrong in secrets.h (bedroom is NODE 2) and this board needs "
+                   "reflashing");
   Serial.printf("[boot] will join WiFi \"%s\" and upload to %s\n", WIFI_SSID, INGEST_URL);
   Serial.printf("[boot] token is %s (%d chars)\n", strlen(INGEST_TOKEN) ? "set" : "EMPTY!", (int)strlen(INGEST_TOKEN));
 
