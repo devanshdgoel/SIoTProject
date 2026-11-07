@@ -297,3 +297,81 @@ def test_a_second_ingest_server_cannot_quietly_share_the_port(db):
             scd40.HttpBackend(db, port=first.port, token="secret")
     finally:
         first.server.shutdown()
+
+
+# --- PMS5003 particles ---------------------------------------------------------
+
+PM_OK = {"pm1": 6, "pm25": 9, "pm10": 11,
+         "n03": 1480, "n05": 430, "n10": 96, "n25": 8, "n50": 2, "n100": 1}
+
+
+def test_particles_become_their_own_observations(db):
+    import time, requests
+    b = scd40.HttpBackend(db, port=0, token="secret")
+    url, hdr = f"http://127.0.0.1:{b.port}/ingest", {"X-Auth-Token": "secret"}
+    now = int(time.time()) // 60 * 60
+    base = {"ts": now, "co2": 700, "co2_max": 720, "t": 20.0, "rh": 50, "n": 12}
+    assert requests.post(url, headers=hdr,
+                         json={"room": "bedroom",
+                               "readings": [{**base, **PM_OK}]}).json()["accepted"] == 1
+    obs = [o for row in b.drain() for o in scd40.reading_to_obs(*row)]
+    by = {o.metric: o for o in obs}
+    assert by["pm2_5"].value == 9 and by["pm2_5"].unit == "ug/m3"
+    assert by["pm2_5"].location == "bedroom"
+    assert by["pc0_3"].value == 1480 and by["pc0_3"].unit == "per 0.1 L"
+    assert by["co2_ppm"].value == 700          # the CO2 reading is untouched
+    assert len(obs) == 4 + 3 + 6
+    b.server.shutdown()
+
+
+def test_a_minute_without_the_fan_carries_no_particle_fields(db):
+    """Absent and zero are different claims: zero is clean air, absent is no reading.
+
+    The counter samples every fifth minute, so four minutes in five legitimately
+    have nothing to say about particles and must not be recorded as saying zero.
+    """
+    import time, requests
+    b = scd40.HttpBackend(db, port=0, token="secret")
+    url, hdr = f"http://127.0.0.1:{b.port}/ingest", {"X-Auth-Token": "secret"}
+    now = int(time.time()) // 60 * 60
+    r = {"ts": now, "co2": 700, "co2_max": 720, "t": 20.0, "rh": 50, "n": 12}
+    assert requests.post(url, headers=hdr, json={"readings": [r]}).json()["accepted"] == 1
+    obs = [o for row in b.drain() for o in scd40.reading_to_obs(*row)]
+    assert {o.metric for o in obs} == {"co2_ppm", "co2_max_ppm",
+                                       "indoor_temp_c", "indoor_rh_pct"}
+    b.server.shutdown()
+
+
+def test_an_impossible_particle_set_is_dropped_whole(db):
+    """Counts are cumulative, so they cannot rise with size.
+
+    A set that does means the frame was misaligned, and three quarters of a
+    misaligned frame is not worth keeping. The CO2 reading it arrived with still is.
+    """
+    import time, requests
+    b = scd40.HttpBackend(db, port=0, token="secret")
+    url, hdr = f"http://127.0.0.1:{b.port}/ingest", {"X-Auth-Token": "secret"}
+    now = int(time.time()) // 60 * 60
+    base = {"ts": now, "co2": 700, "co2_max": 720, "t": 20.0, "rh": 50, "n": 12}
+    bad = {**PM_OK, "n25": 9000}               # more coarse than fine: impossible
+    assert requests.post(url, headers=hdr,
+                         json={"readings": [{**base, **bad}]}).json()["accepted"] == 1
+    obs = [o for row in b.drain() for o in scd40.reading_to_obs(*row)]
+    assert not [o for o in obs if o.metric.startswith(("pm", "pc"))]
+    assert [o for o in obs if o.metric == "co2_ppm"]
+    b.server.shutdown()
+
+
+def test_a_saturated_mass_drops_the_set_but_not_the_reading(db):
+    import time, requests
+    b = scd40.HttpBackend(db, port=0, token="secret")
+    url, hdr = f"http://127.0.0.1:{b.port}/ingest", {"X-Auth-Token": "secret"}
+    now = int(time.time()) // 60 * 60
+    base = {"ts": now, "co2": 700, "co2_max": 720, "t": 20.0, "rh": 50, "n": 12}
+    assert requests.post(url, headers=hdr,
+                         json={"readings": [{**base, **PM_OK, "pm10": 5000}]}
+                         ).json()["accepted"] == 1
+    obs = [o for row in b.drain() for o in scd40.reading_to_obs(*row)]
+    assert not [o for o in obs if o.metric.startswith(("pm", "pc"))]
+    assert len(obs) == 4
+    b.server.shutdown()

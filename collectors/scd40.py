@@ -250,7 +250,7 @@ class HttpBackend:
         # reading is 0 or negative, which 250 still rejects.
         if not (250 <= co2 <= 10000 and -10 <= t <= 60 and 0 <= rh <= 100):
             return 0
-        self.queue.put((ts, co2, co2_max, t, rh, n, room))
+        self.queue.put((ts, co2, co2_max, t, rh, n, room, _particles(r)))
         return 1
 
     def drain(self):
@@ -268,6 +268,45 @@ class HttpBackend:
                 rows.append(self.queue.get_nowait())
             except queue.Empty:
                 return rows
+
+
+# PMS5003 fields, present only on the minutes the fan actually ran. A node without
+# the sensor sends none of them, and a node with it sends them every fifth minute,
+# so their absence is normal and must never cost the CO2 reading that carries them.
+PM_MASS = (("pm1", "pm1_0"), ("pm25", "pm2_5"), ("pm10", "pm10"))
+PM_COUNT = (("n03", "pc0_3"), ("n05", "pc0_5"), ("n10", "pc1_0"),
+            ("n25", "pc2_5"), ("n50", "pc5_0"), ("n100", "pc10_0"))
+
+
+def _particles(r):
+    """Pull the particle fields out of one posted reading, or None if it has none.
+
+    Everything is validated and the whole set is dropped together if any part of it
+    fails. A frame that survived the sensor's own checksum but arrives with one
+    impossible field is not a frame to take three quarters of.
+    """
+    if not isinstance(r, dict) or "pm25" not in r:
+        return None
+    out = {}
+    try:
+        for key, metric in PM_MASS:
+            v = float(r[key])
+            if not 0 <= v <= 1000:          # ug/m3; above this the sensor is saturated
+                return None
+            out[metric] = v
+        for key, metric in PM_COUNT:
+            v = float(r[key])
+            if not 0 <= v <= 65535:         # per 0.1 L, the wire format's own ceiling
+                return None
+            out[metric] = v
+    except (KeyError, TypeError, ValueError):
+        return None
+    # Counts are cumulative - every particle above 0.5 um is also above 0.3 - so a
+    # set that rises with size is impossible and means the frame was misaligned.
+    counts = [out[m] for _k, m in PM_COUNT]
+    if any(b > a for a, b in zip(counts, counts[1:])):
+        return None
+    return out
 
 
 _backend = None
@@ -288,12 +327,25 @@ def _get_backend(db=None):
     return _backend
 
 
-def reading_to_obs(ts, co2, co2_max, t, rh, n, location=settings.SCD40_LOCATION):
+def reading_to_obs(ts, co2, co2_max, t, rh, n, location=settings.SCD40_LOCATION, pm=None):
     """One node-averaged reading -> Observations ('partial' if under half the samples arrived)."""
     q = "ok" if n >= 6 else "partial"
     mk = lambda m, v, u: Observation(SOURCE, m, location, ts, round(v, 2), "measured", u, quality=q)  # noqa: E731
-    return [mk("co2_ppm", co2, "ppm"), mk("co2_max_ppm", co2_max, "ppm"),
-            mk("indoor_temp_c", t, "C"), mk("indoor_rh_pct", rh, "%")]
+    obs = [mk("co2_ppm", co2, "ppm"), mk("co2_max_ppm", co2_max, "ppm"),
+           mk("indoor_temp_c", t, "C"), mk("indoor_rh_pct", rh, "%")]
+    if pm:
+        # Masses use the same metric names as the outdoor feeds, distinguished by
+        # location alone, so an indoor/outdoor ratio is a join rather than a mapping.
+        # The quality flag comes from the CO2 window and does not describe the fan,
+        # so particles carry their own "ok": the node only sends a set it was able
+        # to take a median over.
+        for _k, metric in PM_MASS:
+            obs.append(Observation(SOURCE, metric, location, ts, round(pm[metric], 1),
+                                   "measured", "ug/m3", quality="ok"))
+        for _k, metric in PM_COUNT:
+            obs.append(Observation(SOURCE, metric, location, ts, pm[metric],
+                                   "measured", "per 0.1 L", quality="ok"))
+    return obs
 
 
 def summarise(samples, ts, window_s=settings.SCD40_WINDOW_S, location=settings.SCD40_LOCATION):

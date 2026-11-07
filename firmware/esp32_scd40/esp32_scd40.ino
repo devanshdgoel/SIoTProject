@@ -42,6 +42,9 @@
 #ifndef ROOM_NAME
 #define ROOM_NAME "desk"
 #endif
+#ifndef HAS_PMS
+#define HAS_PMS 0         // 1 on the node with a PMS5003 particle counter wired
+#endif
 #ifndef HAS_OLED
 #define HAS_OLED 0        // 1 only on the node that has a display wired
 #endif
@@ -60,13 +63,34 @@
 
 static const uint8_t  SCD_ADDR       = 0x62;
 static const float    TEMP_OFFSET_C  = 4.0;      // self-heating compensation
+#if HAS_PMS
+// Each stored minute carries three mass figures and six count bins on top of the
+// CO2 fields, so it is roughly twice the size. Halving the depth keeps the static
+// allocation where it was: a day of backlog still outlasts any outage seen so far,
+// and running the board out of DRAM would cost every reading, not just the old ones.
+static const int      BUF_SIZE       = 1440;     // minutes of backlog (~24 h)
+#else
 static const int      BUF_SIZE       = 2880;     // minutes of backlog (~48 h)
+#endif
 static const int      BATCH_MAX      = 30;       // readings per POST
 static const int      MAX_BATCHES_PER_CALL = 8;  // keep sampling while a backlog drains
 static const uint32_t UPLOAD_EVERY_MS = 60000;
 static const uint32_t CATCHUP_MS      = 5000;    // retry sooner while still behind
 
-struct Reading { uint32_t ts; float co2, co2_max, t, rh; uint8_t n; };
+// Particle data rides along on the minutes when the counter actually ran. Masses
+// are the "atmospheric" figures in ug/m3; counts are particles per 0.1 L above each
+// size, which is the part of this sensor most people throw away and the part that
+// says WHAT the particles are rather than just how many.
+struct Particles {
+  uint16_t pm1, pm25, pm10;                       // ug/m3
+  uint16_t n03, n05, n10, n25, n50, n100;         // per 0.1 L, cumulative
+};
+
+struct Reading {
+  uint32_t ts; float co2, co2_max, t, rh; uint8_t n;
+  uint8_t  hasPm;                                 // 0 on the minutes the fan was off
+  Particles pm;
+};
 static Reading buf[BUF_SIZE];
 static int bufHead = 0, bufCount = 0;            // ring buffer: oldest at bufHead
 
@@ -76,6 +100,145 @@ static bool  haveReading = false, timeOk = false, uploadOk = false, uploadTried 
 static uint32_t lastUpload = 0;                  // used by upload() to pace catching up
 static char  dispExpr[16] = "";                  // from the host; empty until it replies
 static char  dispMsg[64]  = "";
+
+// ---------------------------------------------------------------- PMS5003
+#if HAS_PMS
+/* Plantower PMS5003 on UART2.
+ *
+ * The fan is the part that wears out - about 8000 hours, which is under a year if
+ * it never stops - and it is also the only moving part in the project. So it is not
+ * left running. The sensor sleeps between samples and wakes for a warm-up before
+ * each one, which at one sample every five minutes puts the duty cycle near a tenth
+ * and the fan's life near a decade. Plantower specify 30 s to a stable reading from
+ * cold, and that number is why the warm-up is as long as it is.
+ *
+ * Frames are 32 bytes: 0x42 0x4D, a length, thirteen big-endian 16-bit fields and a
+ * checksum over everything before it. A burst is read rather than a single frame and
+ * the median taken, because the occasional frame arrives mangled and a median does
+ * not care, where a mean would carry the damage into the record.
+ */
+static const int      PMS_RX_PIN     = 25;   // ESP32 receives here <- sensor TXD
+static const int      PMS_TX_PIN     = 26;   // ESP32 sends here   -> sensor RXD
+static const uint32_t PM_EVERY_MS    = 300000;  // one sample every 5 minutes
+static const uint32_t PM_WARMUP_MS   = 30000;   // Plantower's figure for a stable fan
+static const uint32_t PM_BURST_MS    = 8000;    // listen this long, then sleep
+static const int      PM_MAX_FRAMES  = 16;
+
+static Particles pmLatest;
+static bool      pmHave = false, pmEverRead = false;
+static uint32_t  pmLastSample = 0, pmPhaseAt = 0;
+static uint32_t  pmFramesOk = 0, pmFramesBad = 0;
+enum PmPhase { PM_ASLEEP, PM_WARMING, PM_LISTENING };
+static PmPhase   pmPhase = PM_ASLEEP;
+static uint16_t  pmBurst[PM_MAX_FRAMES][9];
+static int       pmFrames = 0;
+
+static void pmsCommand(uint8_t cmd, uint8_t datah, uint8_t datal) {
+  uint8_t f[7] = {0x42, 0x4D, cmd, datah, datal, 0, 0};
+  uint16_t sum = 0;
+  for (int i = 0; i < 5; i++) sum += f[i];
+  f[5] = sum >> 8; f[6] = sum & 0xFF;
+  Serial2.write(f, 7);
+}
+static void pmsSleep() { pmsCommand(0xE4, 0x00, 0x00); }
+static void pmsWake()  { pmsCommand(0xE4, 0x00, 0x01); }
+
+/* Read one complete frame if the bytes are there. Returns false when they are not,
+   so the caller can keep looping without blocking. */
+static bool pmsFrame(uint16_t out[9]) {
+  while (Serial2.available() >= 32) {
+    if (Serial2.peek() != 0x42) { Serial2.read(); continue; }   // resynchronise
+    uint8_t b[32];
+    if (Serial2.readBytes(b, 32) != 32) return false;
+    if (b[1] != 0x4D) { pmFramesBad++; continue; }
+    uint16_t sum = 0;
+    for (int i = 0; i < 30; i++) sum += b[i];
+    uint16_t given = (uint16_t)b[30] << 8 | b[31];
+    if (sum != given) { pmFramesBad++; continue; }
+    // Fields 4..6 are the atmospheric masses, 7..12 the cumulative counts. The
+    // first three are the CF=1 "standard" masses, which agree with the atmospheric
+    // ones below 100 ug/m3 and are left on the floor.
+    for (int i = 0; i < 3; i++) out[i] = (uint16_t)b[10 + 2 * i] << 8 | b[11 + 2 * i];
+    for (int i = 0; i < 6; i++) out[3 + i] = (uint16_t)b[16 + 2 * i] << 8 | b[17 + 2 * i];
+    pmFramesOk++;
+    return true;
+  }
+  return false;
+}
+
+static uint16_t medianOf(int field) {
+  uint16_t v[PM_MAX_FRAMES];
+  for (int i = 0; i < pmFrames; i++) v[i] = pmBurst[i][field];
+  for (int i = 1; i < pmFrames; i++) {            // insertion sort, at most 16 items
+    uint16_t key = v[i]; int j = i - 1;
+    while (j >= 0 && v[j] > key) { v[j + 1] = v[j]; j--; }
+    v[j + 1] = key;
+  }
+  return pmFrames ? v[pmFrames / 2] : 0;
+}
+
+static void pmsBegin() {
+  Serial2.begin(9600, SERIAL_8N1, PMS_RX_PIN, PMS_TX_PIN);
+  delay(100);
+  pmsWake();                                      // in case it was left asleep
+  delay(50);
+  pmsSleep();
+  pmPhase = PM_ASLEEP;
+  pmPhaseAt = pmLastSample = millis();
+  Serial.printf("[pms] PMS5003 on UART2, RX=GPIO%d TX=GPIO%d, 9600 baud\n",
+                PMS_RX_PIN, PMS_TX_PIN);
+  Serial.printf("[pms] sampling every %lu s with a %lu s warm-up (fan duty ~%d%%)\n",
+                (unsigned long)(PM_EVERY_MS / 1000), (unsigned long)(PM_WARMUP_MS / 1000),
+                (int)(100 * (PM_WARMUP_MS + PM_BURST_MS) / PM_EVERY_MS));
+  Serial.println("[pms] no reading yet - the first one lands after the first warm-up");
+}
+
+/* Non-blocking: called every loop, moves the sensor through sleep -> warm -> listen. */
+static void pmsPoll() {
+  uint32_t now = millis();
+  switch (pmPhase) {
+    case PM_ASLEEP:
+      if (now - pmLastSample >= PM_EVERY_MS) {
+        pmsWake();
+        while (Serial2.available()) Serial2.read();     // drop anything stale
+        pmFrames = 0;
+        pmPhase = PM_WARMING; pmPhaseAt = now;
+      }
+      break;
+    case PM_WARMING:
+      while (Serial2.available()) Serial2.read();       // fan still spinning up
+      if (now - pmPhaseAt >= PM_WARMUP_MS) { pmPhase = PM_LISTENING; pmPhaseAt = now; }
+      break;
+    case PM_LISTENING: {
+      uint16_t f[9];
+      while (pmFrames < PM_MAX_FRAMES && pmsFrame(f)) {
+        memcpy(pmBurst[pmFrames], f, sizeof f);
+        pmFrames++;
+      }
+      bool done = pmFrames >= PM_MAX_FRAMES || now - pmPhaseAt >= PM_BURST_MS;
+      if (!done) break;
+      if (pmFrames >= 3) {
+        pmLatest.pm1  = medianOf(0); pmLatest.pm25 = medianOf(1); pmLatest.pm10 = medianOf(2);
+        pmLatest.n03  = medianOf(3); pmLatest.n05  = medianOf(4); pmLatest.n10  = medianOf(5);
+        pmLatest.n25  = medianOf(6); pmLatest.n50  = medianOf(7); pmLatest.n100 = medianOf(8);
+        pmHave = true; pmEverRead = true;
+        Serial.printf("[pms] PM1 %u  PM2.5 %u  PM10 %u ug/m3   (median of %d frames)\n",
+                      pmLatest.pm1, pmLatest.pm25, pmLatest.pm10, pmFrames);
+        Serial.printf("[pms]   per 0.1 L: >0.3um %u  >0.5 %u  >1.0 %u  >2.5 %u  >5 %u  >10 %u\n",
+                      pmLatest.n03, pmLatest.n05, pmLatest.n10,
+                      pmLatest.n25, pmLatest.n50, pmLatest.n100);
+      } else {
+        Serial.printf("[pms] only %d good frame(s) in %lu s - check TXD is on GPIO%d "
+                      "and that VCC is 5V, not 3V3 (the fan needs it)\n",
+                      pmFrames, (unsigned long)(PM_BURST_MS / 1000), PMS_RX_PIN);
+      }
+      pmsSleep();
+      pmPhase = PM_ASLEEP; pmLastSample = now;
+      break;
+    }
+  }
+}
+#endif  // HAS_PMS
 
 // ---------------------------------------------------------------- SCD4x I2C
 static uint8_t crc8(const uint8_t *d, int n) {
@@ -346,9 +509,21 @@ static int uploadBatch() {
   String body = "{\"device\":\"" DEVICE_NAME "\",\"room\":\"" ROOM_NAME "\",\"readings\":[";
   for (int i = 0; i < n; i++) {
     const Reading &r = buf[(bufHead + i) % BUF_SIZE];
-    char item[128];
-    snprintf(item, sizeof item, "%s{\"ts\":%lu,\"co2\":%.1f,\"co2_max\":%.0f,\"t\":%.2f,\"rh\":%.1f,\"n\":%u}",
-             i ? "," : "", (unsigned long)r.ts, r.co2, r.co2_max, r.t, r.rh, r.n);
+    char item[320];
+    int k = snprintf(item, sizeof item,
+                     "%s{\"ts\":%lu,\"co2\":%.1f,\"co2_max\":%.0f,\"t\":%.2f,\"rh\":%.1f,\"n\":%u",
+                     i ? "," : "", (unsigned long)r.ts, r.co2, r.co2_max, r.t, r.rh, r.n);
+    // Particle fields appear only on the minutes that carry them. An absent field
+    // and a zero are different claims - zero is clean air, absent is no measurement
+    // - and a sensor that samples every five minutes must not assert the first.
+    if (r.hasPm && k > 0 && k < (int)sizeof item)
+      snprintf(item + k, sizeof item - k,
+               ",\"pm1\":%u,\"pm25\":%u,\"pm10\":%u,"
+               "\"n03\":%u,\"n05\":%u,\"n10\":%u,\"n25\":%u,\"n50\":%u,\"n100\":%u}",
+               r.pm.pm1, r.pm.pm25, r.pm.pm10,
+               r.pm.n03, r.pm.n05, r.pm.n10, r.pm.n25, r.pm.n50, r.pm.n100);
+    else
+      snprintf(item + k, sizeof item - k, "}");
     body += item;
   }
   body += "]}";
@@ -444,6 +619,11 @@ void setup() {
   Serial.printf("[boot] token is %s (%d chars)\n", strlen(INGEST_TOKEN) ? "set" : "EMPTY!", (int)strlen(INGEST_TOKEN));
 
   Wire.begin(21, 22); Wire.setClock(100000);
+#if HAS_PMS
+  pmsBegin();
+#else
+  Serial.println("[pms] no particle counter on this node (set HAS_PMS in secrets.h)");
+#endif
   i2cScan();
   oledBegin();
   oledBoot("sensor...");
@@ -460,6 +640,9 @@ void setup() {
 }
 
 void loop() {
+#if HAS_PMS
+  pmsPoll();          // non-blocking: sleeps the fan between samples
+#endif
   reportWifi();
   if (WiFi.status() != WL_CONNECTED && millis() - lastWifi > 30000) { lastWifi = millis(); WiFi.reconnect(); }
 
@@ -497,10 +680,21 @@ void loop() {
     if (minute != curMinute) {                                   // minute rolled over: finalise window
       if (nSamples > 0) {
         Reading r = { (uint32_t)(curMinute * 60 + 60), (float)(sumCo2 / nSamples), (float)maxCo2,
-                      (float)(sumT / nSamples), (float)(sumRh / nSamples), (uint8_t)nSamples };
+                      (float)(sumT / nSamples), (float)(sumRh / nSamples), (uint8_t)nSamples,
+                      0, {0, 0, 0, 0, 0, 0, 0, 0, 0} };
+#if HAS_PMS
+        // A particle sample belongs to the minute it was taken in, and to no other.
+        // Consuming it here rather than repeating it means a minute either carries a
+        // real measurement or carries none, and the host is never handed the same
+        // reading five times over as though the air had been sampled five times.
+        if (pmHave) { r.hasPm = 1; r.pm = pmLatest; pmHave = false; }
+#endif
         pushReading(r);                                          // ts = window END, same as the host convention
         Serial.printf("[minute] stored 1-min average: CO2 %.0f ppm, %.1f C, %.0f %% RH (%d samples). Waiting to upload: %d\n",
                       r.co2, r.t, r.rh, nSamples, bufCount);
+        if (r.hasPm)
+          Serial.printf("[minute]   with particles: PM2.5 %u ug/m3, %u per 0.1 L above 0.3 um\n",
+                        r.pm.pm25, r.pm.n03);
       } else {
         Serial.println("[minute] window had no valid samples - nothing stored");
       }

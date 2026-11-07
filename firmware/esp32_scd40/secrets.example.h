@@ -4,7 +4,7 @@
 // ---- WHICH BOARD AM I FLASHING? ------------------------------------------
 // One sketch serves every node: change this ONE digit, upload, change it back.
 //   1 = desk node    (SCD40 + OLED)
-//   2 = bedroom node (SCD40 only)
+//   2 = bedroom node (SCD40 + PMS5003 particle counter)
 #define NODE 1
 // --------------------------------------------------------------------------
 
@@ -19,6 +19,7 @@
   #define DEVICE_NAME "esp32-1"
   #define ROOM_NAME   "desk"
   #define HAS_OLED    1
+  #define HAS_PMS     0
   // Uncomment to match the panel if the display stays blank or looks shifted:
   // #define OLED_SH1106 1    // controller is SH1106, not SSD1306
   // #define OLED_H      32   // panel is 128x32, not 128x64
@@ -26,6 +27,7 @@
   #define DEVICE_NAME "esp32-2"
   #define ROOM_NAME   "bedroom"
   #define HAS_OLED    0
+  #define HAS_PMS     1    // PMS5003 particle counter on UART2 (GPIO25 RX, GPIO26 TX)
 #else
   #error "Set NODE to 1 (desk) or 2 (bedroom)"
 #endif
