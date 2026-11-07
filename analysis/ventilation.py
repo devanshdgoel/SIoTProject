@@ -31,12 +31,17 @@ COMFORT_FLOOR_C = 16.0     # below this indoors the heat cost stops being accept
 # Air-change rates to compare, in air changes per hour. "shut" and "open" come from
 # the room's own fitted values; "ajar" has never been measured here, so it carries the
 # figure the model says is *needed* rather than one observed, and says so.
-def options(model):
+def options(model, wind=None):
+    """The three configurations to compare, at the wind the opening would happen in.
+
+    A wide-open window is not one number: what it delivers scales with wind speed, so
+    the same window is worth five times as much on a breezy night as on a still one.
+    Passing the forecast wind is what makes the comparison honest."""
     shut = model.value["lambda_sealed"]
-    wide = model.value["lambda_open"]
+    wide, basis = model.lambda_open_at(wind)
     return [("door and window shut", shut, model.basis["lambda_sealed"]),
             ("window ajar", None, "unmeasured"),
-            ("window wide open", wide, model.basis["lambda_open"])]
+            ("window wide open", wide, basis)]
 
 
 def trajectory(c0, minutes, lam, source, c_out, occupied):
@@ -104,16 +109,18 @@ def plan_night(db, location="bedroom", now=None, hours=8.0):
     t_in = features.at(features.series(db, "indoor_temp_c", location, now - 6 * 3600, now), now)
     t_out = _forecast_mean(db, "outdoor_temp_c", now, hours)
     pm25 = _forecast_mean(db, "pm2_5", now, hours)
+    wind = _forecast_mean(db, "wind_ms", now, hours)
 
     out = {"location": location, "now": now, "start_ppm": round(start),
            "hours": hours, "c_out": round(c_out), "source_ppm_h": round(source),
            "source_basis": model.basis["source_ppm_h"],
            "t_in": t_in, "t_out_forecast": t_out, "pm25_forecast": pm25,
+           "wind_forecast": None if wind is None else round(wind, 1),
            "volume_m3": model.volume_m3, "options": [],
            "needed": {int(t): round(lambda_needed(source, c_out, t), 2)
                       for t in CO2_TARGETS if lambda_needed(source, c_out, t)}}
 
-    for name, lam, basis in options(model):
+    for name, lam, basis in options(model, wind):
         if lam is None:
             out["options"].append({"name": name, "lambda_h": None, "basis": basis,
                                    "note": "never measured in this room - open it once "
@@ -136,17 +143,21 @@ def plan_purge(db, location, now=None, horizon_h=12.0, durations=(10, 20, 30, 45
     only a couple of thousand combinations and each is a closed-form integration, so
     the whole space is searched exactly rather than approximately.
 
-    The limit worth stating: this treats the open-window rate as constant. Making the
-    *timing* genuinely weather-driven needs the air-change rate fitted against wind
-    and indoor-outdoor temperature, which needs far more ventilated events than this
-    room has seen. Until then the timing is chosen on heat cost and outdoor air, and
-    the duration on how fast the room clears."""
+    The open-window rate is taken from the wind forecast at each candidate start, not
+    held constant, so the search trades three things off against each other: a breezy
+    hour clears the room faster, a cold one costs more heat, and a dirty one brings in
+    more particles. The same window really is worth several times as much at one hour
+    as at another, and that is now in the arithmetic rather than in a caveat.
+
+    Still approximate: the law is a single coefficient fitted through the origin over
+    the wind speeds this room has actually been aired in, and it is held inside that
+    range rather than extrapolated."""
     now = int(time.time()) if now is None else int(now)
     model = RoomModel(db, location)
     co2 = features.series(db, "co2_ppm", location, now - 6 * 3600, now).dropna()
     if co2.empty:
         return {"error": f"no recent CO2 for {location}"}
-    lam_open, c_out = model.value["lambda_open"], model.value["c_out"]
+    c_out = model.value["c_out"]
     t_in = features.at(features.series(db, "indoor_temp_c", location, now - 6 * 3600, now), now)
     start_ppm = float(co2.iloc[-1])
 
@@ -157,6 +168,7 @@ def plan_purge(db, location, now=None, horizon_h=12.0, durations=(10, 20, 30, 45
         pm25 = _forecast_at(db, "pm2_5", when)
         if t_out is None:
             continue
+        lam_open, lam_basis = model.lambda_open_at(_forecast_at(db, "wind_ms", when))
         for minutes in durations:
             scored += 1
             cleared = start_ppm - (c_out + (start_ppm - c_out)
@@ -172,9 +184,13 @@ def plan_purge(db, location, now=None, horizon_h=12.0, durations=(10, 20, 30, 45
                 best = {"at": when, "in_minutes": offset, "duration_min": minutes,
                         "clears_ppm": round(cleared), "heat_cost_c": round(heat, 1),
                         "t_out": round(t_out, 1), "pm25": None if pm25 is None else round(pm25, 1),
+                        "lambda_open": round(lam_open, 3), "basis": lam_basis,
                         "cost": round(cost, 3)}
+    pooled, pooled_basis = model.lambda_open_at(None)
     return {"location": location, "evaluated": scored, "start_ppm": round(start_ppm),
-            "lambda_open": round(lam_open, 3), "basis": model.basis["lambda_open"],
+            "lambda_open": None if best is None else best["lambda_open"],
+            "basis": pooled_basis if best is None else best["basis"],
+            "lambda_open_pooled": round(pooled, 3),
             "best": best}
 
 

@@ -332,6 +332,13 @@ def learn(db, location, days=14, now=None):
         db.set_param(location, "tau_t_h", med, err, n, "h",
                      {"from": "indoor temperature decay while ventilating"})
         summary["tau_t_h"] = (round(med, 2), n)
+
+    # Both weather relationships are re-fitted here, against the decays this run has
+    # just written. They have to run after save_decays and after room_params is
+    # cleared, so that neither reads a rate measured against an older baseline nor
+    # survives as a stale row once the evidence for it is gone.
+    summary["weather"] = fit_weather(db, location)
+    summary["open_wind"] = fit_open_wind(db, location)
     return summary
 
 
@@ -394,6 +401,84 @@ def predicted_lambda(fit, wind, delta_t):
     return float(np.sqrt(value)) if value > 0 else None
 
 
+MIN_OPEN_FITS = 2               # one point cannot give a slope
+
+
+def fit_open_wind(db, location, min_r2=MIN_R2):
+    """How fast an OPEN window exchanges air, as a function of wind speed.
+
+    The quadrature in `fit_weather` still applies - stack pressure and wind pressure
+    add as energies - but a wide opening is a different regime from an envelope leak.
+    The opening is large enough that wind pressure dominates the stack term, which
+    collapses the three-coefficient form to
+
+        lambda^2 = c*v^2    ->    lambda = k*v
+
+    one parameter, fitted through the origin. That choice matters with a handful of
+    events: the two-parameter form lambda = lambda0 + k*v would fit two measurements
+    exactly and leave nothing to check it against, while k alone leaves a residual
+    that can be reported. The form is derived and then tested, not chosen to fit.
+
+    Only openings the user confirmed with a label count. An inferred "ventilated"
+    decay may be a window, a door or a trickle vent, and this bedroom's own record
+    has a corridor-door flush sitting numerically between its two window tests - so
+    pooling all three yields a median that describes none of them.
+
+    Returns a note - and stores nothing - below MIN_OPEN_FITS confirmed openings."""
+    usable = [r for r in db.decays(location, min_r2=min_r2)
+              if r["labelled"] == "open" and r["wind_ms"] is not None]
+    if len(usable) < MIN_OPEN_FITS:
+        return {"n": len(usable), "need": MIN_OPEN_FITS,
+                "note": "not enough confirmed window openings yet"}
+
+    lam = np.array([r["lambda_h"] for r in usable], dtype=float)
+    wind = np.array([r["wind_ms"] for r in usable], dtype=float)
+    if float(np.sum(wind ** 2)) <= 0:
+        return {"n": len(usable), "note": "every opening was measured in dead-still air"}
+
+    k = float(np.sum(lam * wind) / np.sum(wind ** 2))        # least squares through 0
+    resid = lam - k * wind
+    dof = max(1, len(lam) - 1)
+    stderr = float(np.sqrt(float(np.sum(resid ** 2)) / dof / float(np.sum(wind ** 2))))
+    total = float(np.sum((lam - np.mean(lam)) ** 2))
+    out = {"n": len(lam), "k": k, "stderr": stderr,
+           "r2": 1 - float(np.sum(resid ** 2)) / total if total > 0 else 0.0,
+           "wind_range": [round(float(wind.min()), 2), round(float(wind.max()), 2)],
+           "lambda_range": [round(float(lam.min()), 3), round(float(lam.max()), 3)],
+           "spread": round(float(lam.max() / max(lam.min(), 1e-9)), 1)}
+    # With two openings and one coefficient there is a single residual degree of
+    # freedom, so a high r-squared is close to guaranteed: a line through the origin
+    # between two widely separated points will always look excellent, and the stated
+    # standard error is correspondingly optimistic. What would actually test the law
+    # is an opening at an intermediate wind speed, which no amount of arithmetic on
+    # the existing two can substitute for. Say so wherever the number is shown.
+    if len(lam) < 3:
+        out["provisional"] = (f"{len(lam)} openings, one coefficient: the fit cannot "
+                              f"fail yet. Needs an opening between "
+                              f"{out['wind_range'][0]} and {out['wind_range'][1]} m/s "
+                              f"to be tested.")
+    db.set_param(location, "lambda_open_k", k, stderr, len(lam), "(1/h) per (m/s)", out)
+    return out
+
+
+def predicted_lambda_open(fit, wind, floor=None):
+    """The open-window rate the fitted law expects at a wind speed.
+
+    Wind is held inside the range actually measured rather than extrapolated. A law
+    fitted over 0.8 to 3.7 m/s says nothing about a gale, and the failure is not
+    symmetric: over-promising air leads the system to recommend a window that will
+    not deliver, so the conservative edge is the right one to fall off.
+
+    `floor` is a floor, not a fit. However still the air, an open window cannot
+    exchange less than the same room with the window shut."""
+    if not fit or "k" not in fit or wind is None:
+        return None
+    lo, hi = fit["wind_range"]
+    held = min(max(float(wind), lo), hi)
+    lam = fit["k"] * held
+    return max(lam, floor) if floor is not None else lam
+
+
 class RoomModel:
     """The current parameters for one room, with published defaults where the record
     is still too thin. `basis` records which is which so advice can be honest."""
@@ -418,21 +503,55 @@ class RoomModel:
         # How many people usually occupy it, when it is occupied at all.
         row = stored.get("typical_people")
         self.occupants = max(1, int(row["value"])) if row and row["value"] else 1
+        # The open-window rate is a function of wind here, not a constant. See
+        # lambda_open_at; the stored pooled median remains the fallback.
+        row = stored.get("lambda_open_k")
+        self.open_wind = (json.loads(row["detail"])
+                          if row is not None and row["detail"]
+                          and row["n"] >= MIN_OPEN_FITS else None)
 
     @property
     def learned(self):
         """True once the parameters that drive a prediction are the room's own."""
         return all(self.basis[k] == "learned" for k in ("c_out", "lambda_sealed", "source_ppm_h"))
 
-    def steady_state(self, occupied, ventilated=False):
+    def lambda_open_at(self, wind=None):
+        """The open-window air-change rate at a wind speed, and how it was arrived at.
+
+        One pooled number cannot describe this room. The bedroom's two confirmed
+        openings differ five-fold - 4.55/h in 3.7 m/s against 0.87/h in 0.8 m/s -
+        and the temperature difference was LARGER on the still night, so buoyancy
+        alone predicts the opposite ordering. Averaging them would promise air on a
+        calm night that the window cannot deliver, which is the one error that
+        matters: it is the advice the user acts on.
+
+        Falls back to the pooled median when there is no law or no wind to feed it."""
+        fit = getattr(self, "open_wind", None)
+        if fit and wind is not None:
+            lam = predicted_lambda_open(fit, wind, floor=self.value["lambda_sealed"])
+            if lam is not None:
+                lo, hi = fit["wind_range"]
+                held = "" if lo <= float(wind) <= hi else f", wind held inside {lo}-{hi} m/s"
+                mark = " (provisional)" if fit.get("provisional") else ""
+                return lam, (f"wind law, k={fit['k']:.2f} per m/s "
+                             f"from {fit['n']} openings{held}{mark}")
+        return self.value["lambda_open"], self.basis["lambda_open"]
+
+    def lam(self, ventilated, wind=None):
+        """Whichever air-change rate applies, shut or open."""
+        if not ventilated:
+            return self.value["lambda_sealed"]
+        return self.lambda_open_at(wind)[0]
+
+    def steady_state(self, occupied, ventilated=False, wind=None):
         """Where the room is heading. The source is stored per person, so presence
         alone is not enough - a living room shared by two fills twice as fast."""
-        lam = self.value["lambda_open" if ventilated else "lambda_sealed"]
+        lam = self.lam(ventilated, wind)
         source = self.value["source_ppm_h"] * self.occupants
         return self.value["c_out"] + (source / lam if occupied else 0.0)
 
     def forward(self, c0, minutes, occupied, ventilated=False, step_min=5,
-                prior=None, now=None, persistence_min=60.0):
+                prior=None, now=None, persistence_min=60.0, wind=None):
         """CO2 trajectory as [(minutes_from_now, ppm), ...].
 
         Closed form per step: over a step where lambda and the source are constant
@@ -449,7 +568,7 @@ class RoomModel:
         average source is the average of the responses."""
         import time as _time
 
-        lam = self.value["lambda_open" if ventilated else "lambda_sealed"]
+        lam = self.lam(ventilated, wind)
         source = self.value["source_ppm_h"] * self.occupants
         c_out = self.value["c_out"]
         decay = np.exp(-lam * step_min / 60.0)
@@ -479,10 +598,10 @@ class RoomModel:
             out.append((ahead, round(c, 1)))
         return out
 
-    def time_to(self, threshold, c0, occupied, ventilated=False):
+    def time_to(self, threshold, c0, occupied, ventilated=False, wind=None):
         """Minutes until CO2 reaches a threshold, or None if it never gets there."""
-        lam = self.value["lambda_open" if ventilated else "lambda_sealed"]
-        ss = self.steady_state(occupied, ventilated)
+        lam = self.lam(ventilated, wind)
+        ss = self.steady_state(occupied, ventilated, wind)
         denom = float(c0) - ss
         if abs(denom) < 1e-9:
             return None

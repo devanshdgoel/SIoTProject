@@ -391,7 +391,8 @@ function renderRooms(){
 
 /* ---------------- learned parameters ---------------- */
 const PRETTY = {c_out:'outdoor baseline', lambda_sealed:'air changes, sealed',
-  lambda_open:'air changes, ventilated', source_ppm_h:'CO₂ source, one person',
+  lambda_open:'air changes, ventilated (pooled)', source_ppm_h:'CO₂ source, one person',
+  lambda_open_k:'open window, per m/s of wind', lambda_wind_c:'wind term, sealed',
   tau_t_h:'thermal time constant'};
 function renderLearned(){
   if(!R || !R.rooms.length){ $('#learned').innerHTML = '<span class="dim">nothing learned yet</span>'; return; }

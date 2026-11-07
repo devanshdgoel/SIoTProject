@@ -213,6 +213,25 @@ def cmd_params(args, db):
             vent = sum(1 for r in rows if r["inferred"] == "ventilated")
             print(f"  {len(rows)} usable decays: {len(rows) - vent} sealed, {vent} ventilated")
 
+        # An open window is not one number - what it delivers scales with wind - so
+        # the pooled lambda_open above is only the fallback. Show the law and what it
+        # predicts across the wind speeds this room was actually aired in.
+        law = model.open_wind
+        if law:
+            lo, hi = law["wind_range"]
+            print(f"  open-window law   lambda = {law['k']:.3f} +/-{law['stderr']:.3f} "
+                  f"x wind   r2={law['r2']:.4f}  n={law['n']}")
+            print(f"  {'':18s}measured {lo}-{hi} m/s, "
+                  f"lambda {law['lambda_range'][0]}-{law['lambda_range'][1]}/h "
+                  f"({law['spread']}x)")
+            for v in (lo, (lo + hi) / 2, hi):
+                print(f"  {'':18s}wind {v:4.1f} m/s -> {model.lambda_open_at(v)[0]:5.2f}/h")
+            if law.get("provisional"):
+                print(f"  {'':18s}provisional: {law['provisional']}")
+        else:
+            print("  open-window law   not yet: needs two labelled window openings "
+                  "at different wind speeds")
+
 
 def cmd_analyse(args, db):
     out = analysis_human.run(db)

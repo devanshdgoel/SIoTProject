@@ -827,3 +827,112 @@ def test_one_unfinished_opening_cannot_drag_a_measured_baseline(db):
     assert "1 further opening(s) ignored" in note, note
     assert abs(out["c_out"] - TRUE["c_out"]) < 15, out
     assert abs(out["lambda_sealed"][0] - TRUE["lam_sealed"]) < 0.15, out
+
+
+# --- an open window is not one number ----------------------------------------
+
+def _opening(i, lam, wind, labelled="open"):
+    return {"location": "r", "start_ts": 10_000 * i, "end_ts": 10_000 * i + 3600,
+            "lambda_h": lam, "r2": 0.99, "method": "window", "inferred": "ventilated",
+            "wind_ms": wind, "delta_t_c": 8.0, "labelled": labelled}
+
+
+def test_the_open_window_law_refuses_on_a_single_opening(db):
+    from analysis.room_model import fit_open_wind
+
+    db.save_decays([_opening(0, 4.5, 3.7)])
+    out = fit_open_wind(db, "r")
+    assert "k" not in out and out["n"] == 1 and out["need"] == 2
+
+
+def test_the_open_window_law_recovers_the_slope_it_was_given(db):
+    from analysis.room_model import fit_open_wind, predicted_lambda_open
+
+    k = 1.25
+    db.save_decays([_opening(i, k * v, v) for i, v in
+                    enumerate([0.8, 1.6, 2.4, 3.2, 4.0])])
+    out = fit_open_wind(db, "r")
+    assert out["n"] == 5
+    assert out["k"] == pytest.approx(k, rel=0.01)
+    assert out["r2"] > 0.99
+    assert "provisional" not in out                 # five points can actually fail
+    assert predicted_lambda_open(out, 2.0) == pytest.approx(k * 2.0, rel=0.01)
+
+
+def test_the_law_uses_only_openings_the_user_confirmed(db):
+    """The bedroom's corridor-door flush sits numerically between its two window
+    tests, so pooling every inferred 'ventilated' decay would bend the slope towards
+    an event that was not a window at all."""
+    from analysis.room_model import fit_open_wind
+
+    rows = [_opening(0, 0.869, 0.76), _opening(1, 4.547, 3.72),
+            _opening(2, 1.197, 4.20, labelled=None)]      # the door, high wind, low rate
+    db.save_decays(rows)
+    out = fit_open_wind(db, "r")
+    assert out["n"] == 2, "an unconfirmed opening entered the fit"
+    assert out["k"] == pytest.approx(1.221, rel=0.02)
+
+
+def test_two_openings_are_marked_as_untestable(db):
+    from analysis.room_model import fit_open_wind
+
+    db.save_decays([_opening(0, 0.869, 0.76), _opening(1, 4.547, 3.72)])
+    out = fit_open_wind(db, "r")
+    assert out["r2"] > 0.99                         # and yet
+    assert "provisional" in out, "a fit that cannot fail must say so"
+
+
+def test_the_law_is_held_inside_the_winds_it_was_measured_in(db):
+    from analysis.room_model import fit_open_wind, predicted_lambda_open
+
+    db.save_decays([_opening(i, 1.25 * v, v) for i, v in enumerate([1.0, 2.0, 3.0])])
+    out = fit_open_wind(db, "r")
+    # A law fitted to 1-3 m/s says nothing about a gale, and over-promising air is
+    # the error that reaches the user, so extrapolation is clamped rather than trusted.
+    assert predicted_lambda_open(out, 30.0) == pytest.approx(1.25 * 3.0, rel=0.01)
+    assert predicted_lambda_open(out, 0.0) == pytest.approx(1.25 * 1.0, rel=0.01)
+
+
+def test_an_open_window_is_never_worse_than_a_shut_one(db):
+    from analysis.room_model import fit_open_wind, predicted_lambda_open
+
+    db.save_decays([_opening(i, 0.02 * v, v) for i, v in enumerate([0.5, 1.0, 1.5])])
+    out = fit_open_wind(db, "r")
+    assert predicted_lambda_open(out, 0.5, floor=0.27) == pytest.approx(0.27)
+
+
+def test_lambda_open_follows_the_wind_and_falls_back_without_it(db):
+    from analysis.room_model import RoomModel, fit_open_wind
+
+    simulate(db, days=3)                            # gives the room its other params
+    db.save_decays([dict(_opening(0, 0.869, 0.76), location="bedroom"),
+                    dict(_opening(1, 4.547, 3.72), location="bedroom")])
+    fit_open_wind(db, "bedroom")
+    model = RoomModel(db, "bedroom")
+
+    still, basis_still = model.lambda_open_at(0.8)
+    windy, basis_windy = model.lambda_open_at(3.7)
+    assert windy > 4 * still, (still, windy)
+    assert "wind law" in basis_still and "wind law" in basis_windy
+    # With no wind to feed it there is nothing to condition on, so the pooled
+    # median is what remains - and it is honest about being that.
+    pooled, basis = model.lambda_open_at(None)
+    assert pooled == pytest.approx(model.value["lambda_open"])
+    assert "wind law" not in basis
+
+
+def test_the_night_plan_changes_with_the_forecast_wind(db):
+    """The end of it: the same window, two different nights, different advice."""
+    from analysis.room_model import fit_open_wind
+    from analysis.ventilation import options
+
+    simulate(db, days=3)
+    db.save_decays([dict(_opening(0, 0.869, 0.76), location="bedroom"),
+                    dict(_opening(1, 4.547, 3.72), location="bedroom")])
+    fit_open_wind(db, "bedroom")
+    model = RoomModel(db, "bedroom")
+
+    calm = {name: lam for name, lam, _b in options(model, wind=0.8)}
+    breezy = {name: lam for name, lam, _b in options(model, wind=3.7)}
+    assert breezy["window wide open"] > 4 * calm["window wide open"]
+    assert calm["door and window shut"] == breezy["door and window shut"]
