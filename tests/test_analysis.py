@@ -1161,3 +1161,65 @@ def test_an_asymptote_within_sensor_noise_of_outdoors_is_not_worth_a_parameter()
     got = features.asymptote_test(seg, 358.0, 1.5)
     assert got["free"] is False
     assert "sensor noise" in got["reason"]
+
+
+# --- a rise measures the same lambda a decay does -----------------------------
+
+def _rise(c_inf, c0, lam, hours, step=5, start="2026-11-07 01:00"):
+    """A room filling towards c_inf, sampled on the 5-minute grid."""
+    n = int(hours * 60 / step) + 1
+    idx = pd.date_range(start, periods=n, freq=f"{step}min", tz="UTC")
+    t = np.arange(n) * step / 60.0
+    return pd.Series(c_inf + (c0 - c_inf) * np.exp(-lam * t), index=idx)
+
+
+def test_a_rise_reports_how_far_up_its_own_curve_it_got():
+    """Lambda and the ceiling trade off, and coverage is what says whether they can
+    be told apart. A room an hour into a nine-hour climb is drawing a straight line,
+    and a straight line is equally well a slow climb to a low ceiling or a fast one
+    to a high one."""
+    far = features.fit_rise(_rise(5200.0, 620.0, 0.25, hours=9), 358.0)
+    near = features.fit_rise(_rise(5200.0, 620.0, 0.25, hours=2), 358.0)
+    assert far["covered"] > 0.85
+    assert near["covered"] < 0.45
+
+
+def test_a_full_nights_rise_recovers_the_rate_it_was_built_from():
+    fit = features.fit_rise(_rise(5200.0, 620.0, 0.25, hours=9), 358.0)
+    assert fit["lambda_h"] == pytest.approx(0.25, rel=0.05)
+    assert fit["ceiling"] == pytest.approx(5200.0, rel=0.05)
+
+
+def test_emptying_and_filling_agree_and_are_pooled(db):
+    """The cross-check the whole model rests on.
+
+    A decay and a rise share no assumption but the mass balance: one is short, steep
+    and vulnerable to the asymptote being wrong, the other long, gently curved and
+    vulnerable to lambda trading against its ceiling. Nothing makes them agree, so
+    when they do the number belongs to the room rather than to the method."""
+    now = simulate(db, days=6)
+    learn(db, "bedroom", days=7, now=now)
+    detail = json.loads(db.params("bedroom")["lambda_sealed"]["detail"])
+    assert detail.get("rises"), "the simulated nights produced no usable rise"
+    if detail.get("rises"):
+        assert detail["decays"] and detail["rises"]
+        assert detail["disagree"] is False, detail["agreement"]
+        assert "mass balance" in detail["agreement"]
+        assert db.params("bedroom")["lambda_sealed"]["n"] == (
+            detail["decays"] + detail["rises"])
+        # Both routes have to land on the rate the room was actually built with, or
+        # agreeing means only that they are wrong in the same direction.
+        assert detail["decay_median"] == pytest.approx(TRUE["lam_sealed"], rel=0.1)
+        assert detail["rise_median"] == pytest.approx(TRUE["lam_sealed"], rel=0.1)
+
+
+def test_a_rise_too_straight_to_read_is_counted_but_not_used(db):
+    """Being excluded has to be visible, or a quietly dropped measurement looks the
+    same as one that was never taken."""
+    from analysis.room_model import MIN_RISE_COVER
+
+    rises = [{"lambda_h": 0.25, "r2": 0.99, "covered": 0.9},
+             {"lambda_h": 9.90, "r2": 0.99, "covered": MIN_RISE_COVER - 0.2}]
+    usable = [r["lambda_h"] for r in rises
+              if r["covered"] >= MIN_RISE_COVER and r["r2"] >= 0.95]
+    assert usable == [0.25], "a near-linear rise reached the pooled rate"

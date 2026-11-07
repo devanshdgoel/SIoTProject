@@ -19,6 +19,7 @@ Week 1 commands (collection only):
 """
 
 import argparse
+import json
 import logging
 import os
 import threading
@@ -212,6 +213,18 @@ def cmd_params(args, db):
         if rows:
             vent = sum(1 for r in rows if r["inferred"] == "ventilated")
             print(f"  {len(rows)} usable decays: {len(rows) - vent} sealed, {vent} ventilated")
+
+        # lambda_sealed is measured twice over, by a room emptying and by the same
+        # room filling. They share no assumption but the mass balance, so how far
+        # apart they land is the best single check the system has on itself.
+        stored = db.params(name).get("lambda_sealed")
+        detail = json.loads(stored["detail"]) if stored and stored["detail"] else {}
+        if detail.get("agreement"):
+            flag = "DISAGREE - " if detail.get("disagree") else "cross-check: "
+            print(f"  lambda_sealed     {flag}{detail['agreement']}")
+            print(f"  {'':18s}{detail['decays']} decays + {detail['rises']} rises"
+                  + (f", {detail['skipped_rises']} rise(s) too straight to read a "
+                     f"rate off" if detail.get("skipped_rises") else ""))
 
         # An open window is not one number - what it delivers scales with wind - so
         # the pooled lambda_open above is only the fallback. Show the law and what it

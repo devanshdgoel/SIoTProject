@@ -350,8 +350,16 @@ def fit_rise(seg, c_out):
     source = rate * (c_inf - c_out)
     if source <= 0 or not np.isfinite(source):
         return None
+    # How far up its own curve the room actually got. A rise that has barely left the
+    # floor is nearly a straight line, and a straight line can be produced by a slow
+    # climb to a low ceiling or a fast one to a high ceiling equally well - lambda and
+    # the ceiling trade off against each other and neither is measured. The source
+    # survives that trade better than lambda does, because it is their product, so
+    # this is reported rather than enforced and the caller decides what it needs.
+    climb, reach = float(y[-1] - y[0]), float(c_inf - y[0])
     return {"lambda_h": float(rate), "stderr": float(np.sqrt(pcov[2][2])),
-            "ceiling": float(c_inf), "source_ppm_h": float(source), "r2": r2}
+            "ceiling": float(c_inf), "source_ppm_h": float(source), "r2": r2,
+            "covered": climb / reach if reach > 0 else 0.0}
 
 
 def occupied_windows(db, location, labels, start, end):

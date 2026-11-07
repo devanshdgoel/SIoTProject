@@ -280,6 +280,8 @@ def learn(db, location, days=14, now=None):
             # spells is wrong for both, and the volume it implies comes out halved.
             fit["people"] = features.people_at(labels, (a + b) // 2, default=1)
             fit["per_person"] = fit["source_ppm_h"] / fit["people"]
+            fit["lambda_usable"] = (fit["covered"] >= MIN_RISE_COVER
+                                    and fit["r2"] >= MIN_RISE_R2)
             rises.append(fit)
     if rises:
         med, err, n = _robust([r["per_person"] for r in rises])
@@ -298,6 +300,45 @@ def learn(db, location, days=14, now=None):
         summary["source_ppm_h"] = (round(med, 1), n)
         summary["typical_people"] = typical
         summary["volume_m3"] = round(volume, 1)
+
+    # A rise measures the same air-change rate a decay does. The loss term of the
+    # mass balance is lambda*(C - C_out) whether the room is filling or emptying, so
+    # an occupied night with the window shut is a measurement of lambda_sealed - and
+    # in this bedroom a far longer one than any decay: nine hours against thirty
+    # minutes. It is also the only route available in a room that is occupied nearly
+    # every night and so rarely produces a clean decay at all.
+    #
+    # They are pooled rather than one replacing the other, because they fail in
+    # opposite directions and agreeing is the evidence. A decay is fitted on a short,
+    # steep, well-conditioned stretch and is vulnerable to the asymptote being wrong;
+    # a rise is long and gently curved and is vulnerable to lambda trading against
+    # its ceiling. Nothing about the room makes them agree, so when they do, the
+    # number is the room's and not the method's.
+    rise_lams = [r["lambda_h"] for r in rises if r["lambda_usable"]]
+    if rise_lams:
+        decay_lams = [r["lambda_h"] for r in rows if r.get("inferred") == "sealed"]
+        med, err, n = _robust(decay_lams + rise_lams)
+        if med is not None:
+            d_med, _e, _n = _robust(decay_lams)
+            r_med, _e, _n = _robust(rise_lams)
+            detail = {"from": "CO2 decays and occupied rises pooled",
+                      "decays": len(decay_lams), "rises": len(rise_lams),
+                      "decay_median": None if d_med is None else round(d_med, 3),
+                      "rise_median": round(r_med, 3),
+                      "skipped_rises": sum(1 for r in rises if not r["lambda_usable"])}
+            # Two independent routes to one number, so say how far apart they landed.
+            # Agreement is the claim being made; a reader should not have to take it
+            # on trust, and a later disagreement should be loud rather than averaged.
+            if d_med is not None:
+                gap = abs(r_med - d_med) / max(d_med, 1e-9)
+                detail["agreement"] = (
+                    f"emptying gives {d_med:.3f}/h, filling gives {r_med:.3f}/h: "
+                    f"{gap * 100:.0f}% apart from two methods that share no "
+                    f"assumption but the mass balance itself")
+                detail["disagree"] = gap > RISE_DECAY_GAP
+            db.set_param(location, "lambda_sealed", med, err, n, "1/h", detail)
+            summary["lambda_sealed"] = (round(med, 3), n)
+            summary["lambda_sealed_agreement"] = detail.get("agreement")
 
     lam_sealed = db.params(location).get("lambda_sealed")
     lam_for_source = float(lam_sealed["value"]) if lam_sealed else DEFAULTS["lambda_sealed"][0]
@@ -412,6 +453,13 @@ def predicted_lambda(fit, wind, delta_t):
 
 
 MIN_OPEN_FITS = 2               # one point cannot give a slope
+
+# A rise has to have bent before its rate can be read off it. Below this fraction of
+# the climb to its own fitted ceiling the curve is still near-linear, and lambda and
+# the ceiling are trading against each other rather than being measured.
+MIN_RISE_COVER = 0.6
+MIN_RISE_R2 = 0.95
+RISE_DECAY_GAP = 0.5            # how far the two routes may differ before it is news
 
 
 def fit_open_wind(db, location, min_r2=MIN_R2):
