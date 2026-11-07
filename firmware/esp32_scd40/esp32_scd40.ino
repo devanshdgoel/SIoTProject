@@ -103,6 +103,7 @@ static int bufHead = 0, bufCount = 0;            // ring buffer: oldest at bufHe
 static float lastCo2 = 0, lastT = 0, lastRh = 0;
 static bool  haveReading = false, timeOk = false, uploadOk = false, uploadTried = false;
 static uint32_t lastUpload = 0;                  // used by upload() to pace catching up
+static uint8_t rejectStreak = 0;                 // consecutive batches the host refused
 static char  dispExpr[16] = "";                  // from the host; empty until it replies
 static char  dispMsg[64]  = "";
 // Lines for the info screen, filled by the host. The node renders whatever it is
@@ -699,8 +700,42 @@ static int uploadBatch() {
   uploadTried = true;
   if (code == 200) {
     uploadOk = true;
-    bufHead = (bufHead + n) % BUF_SIZE; bufCount -= n;          // acknowledged: drop from buffer
     String resp = http.getString();
+    /* 200 means the host answered, not that it kept anything.
+     *
+     * The reply carries "accepted": how many of the n readings passed validation
+     * and were queued. This used to be ignored and the buffer was dropped on the
+     * status code alone, so a batch the host threw away - every reading failing
+     * its range check, or an NTP slip putting every timestamp outside the accepted
+     * window - was deleted from the only other copy in existence. It is not
+     * hypothetical: this host has recorded 59 silently rejected readings from the
+     * bedroom node, which is 59 minutes of air nobody can get back.
+     *
+     * So the batch is only released once the host says it took all of it.
+     * Readings the host will never accept would otherwise block the queue for
+     * ever, so a batch rejected twice is dropped and said so loudly - the point is
+     * that it is reported, not that it is kept at any cost.
+     */
+    int acc = n;
+    int ai = resp.indexOf("\"accepted\":");
+    if (ai >= 0) acc = resp.substring(ai + 11).toInt();
+    if (acc >= n) {
+      bufHead = (bufHead + n) % BUF_SIZE; bufCount -= n;        // all of it stored
+      rejectStreak = 0;
+    } else {
+      rejectStreak++;
+      Serial.printf("[upload] host accepted only %d of %d - KEEPING the batch "
+                    "(attempt %d). Check the clock and the CO2 range.
+",
+                    acc, n, rejectStreak);
+      if (rejectStreak >= 2) {
+        bufHead = (bufHead + n) % BUF_SIZE; bufCount -= n;
+        rejectStreak = 0;
+        Serial.println("[upload] dropping it: the host will not take these readings. "
+                       "THIS IS DATA LOSS and it is deliberate - the queue cannot "
+                       "stall for ever on a batch nobody will store.");
+      }
+    }
     int k = resp.indexOf("\"pressure_hpa\":");
     if (k >= 0) {
       float p = resp.substring(k + 15).toFloat();               // 'null' parses to 0 -> ignored

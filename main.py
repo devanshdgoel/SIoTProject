@@ -217,6 +217,137 @@ def cmd_volume(args, db):
           "  no source term fitted yet, so nothing to check it against")
 
 
+def cmd_limits(args, db):
+    """What this system does not know, measured from its own record.
+
+    Written as a command rather than a document because a document goes stale the
+    day after it is written and this has already been wrong twice. Everything below
+    is read from the database at the moment it is printed, so it cannot drift from
+    what the code actually did. What a reader needs is the line between what was
+    measured in THIS flat and what is a property of the method.
+    """
+    import json as _json
+
+    from analysis import features
+    from analysis.room_model import (RoomModel, colocation_check,
+                                     measured_volume, rooms)
+
+    print("WHAT THIS SYSTEM DOES NOT KNOW")
+    print()
+
+    names = rooms(db)
+    print("Record length")
+    for name in names:
+        s_ = features.series(db, "co2_ppm", name).dropna()
+        if s_.empty:
+            continue
+        span = (s_.index[-1] - s_.index[0]).total_seconds() / 86400
+        gaps = int((s_.index.to_series().diff().dt.total_seconds() > 1800).sum())
+        print(f"  {name:9s} {span:.1f} days, {s_.size} samples on the 5-min grid, "
+              f"{gaps} gap(s) over 30 min")
+    print("  Every rate here rests on days, not seasons. Nothing in it has seen")
+    print("  a cold snap, a gale, or a summer, and the weather terms say so.")
+    print()
+
+    print("One flat, one occupant, two sensors")
+    print("  Rooms are hard-coded as 'bedroom' and 'desk' in analysis_human,")
+    print("  figures and night_associations, so a third room is collected and")
+    print("  then silently not analysed.")
+    for name in names:
+        row = db.params(name).get("typical_people")
+        if row and row["value"]:
+            print(f"  {name}: typical occupancy {int(row['value'])}. The source term is")
+            print(f"    stored per person but has only ever been fitted at that count.")
+    print("  Constants chosen against this flat and not validated elsewhere:")
+    print("    DEPARTURE_OFFSET_MIN=20 (its mixing time), SPIKE_IMPOSSIBLE_PPM=400")
+    print("    (its volume and occupancy), COMFORT_FLOOR_C=16.")
+    print()
+
+    print("Ground truth: what was measured rather than inferred")
+    any_truth = False
+    for name in names:
+        v = measured_volume(db, name)
+        if v:
+            any_truth = True
+            print(f"  {name}: volume {v} m3, by tape measure. Everything else this")
+            print(f"    system believes about {name} it worked out from the same CO2")
+            print(f"    trace it is trying to explain.")
+    if not any_truth:
+        print("  None. Every parameter is self-derived, so a self-consistent error")
+        print("  cannot be detected. `main.py volume <room> <m3>` fixes that.")
+    print()
+
+    chk = colocation_check(db)
+    if chk:
+        print("Do the two sensors agree about outdoor air?")
+        print(f"  {chk['note']}")
+        print()
+
+    print("Fits that were tested and failed")
+    failed = 0
+    for name in names:
+        for key, what in (("lambda_open_k", "open-window wind law"),
+                          ("lambda_wind_c", "infiltration weather law")):
+            row = db.params(name).get(key)
+            if not row or not row["detail"]:
+                continue
+            d = _json.loads(row["detail"])
+            if d.get("refuted"):
+                failed += 1
+                print(f"  {name} {what}: {d['refuted'][:160]}")
+    from analysis import estimators
+    for name in names:
+        try:
+            sp = estimators.by_spectrum(db, name)
+        except Exception:                            # noqa: BLE001
+            continue
+        if sp.get("lambda_h") is None and sp.get("slope_dec_per_dec") is not None:
+            failed += 1
+            print(f"  {name} spectral estimator: roll-off "
+                  f"{sp['slope_dec_per_dec']} dec/dec rejects first order, so it "
+                  f"returns no rate.")
+    if not failed:
+        print("  None recorded.")
+    print()
+
+    print("The forecast")
+    sk = db.forecast_skill()
+    if sk:
+        best = max(sk, key=lambda r: r["skill"])
+        print(f"  Scored against 'assume no change' on {sum(r['n'] for r in sk)} "
+              f"predictions. Best skill {best['skill']:+.0%} "
+              f"({best['location']}, {best['horizon_s'] // 60} min, {best['basis']}).")
+        if best["skill"] < 0:
+            print("  The model loses to persistence at every room, horizon and basis.")
+            print("  It is not an extrapolator and should not be read as one. What")
+            print("  persistence cannot do is compare options - 'what if I open the")
+            print("  window' has no persistence answer - and that is what it is for.")
+    else:
+        print("  No scored forecasts with a baseline yet.")
+    print()
+
+    print("Known and not fixed")
+    print("  - Per-fit stderrs are corrected for lag-1 autocorrelation only; where")
+    print("    residuals are structural rather than noisy that is still a floor.")
+    print("  - The purge cost adds ppm, degrees and ug.h/m3 with hand-picked")
+    print("    weights (ventilation.py), and no sensitivity sweep has been run.")
+    print("  - decay_events rows are deleted only inside the refit window, so a")
+    print("    longer window can still mix two eras of c_out.")
+    print("  - Episode verdicts: the accuracy metric exists but has n=1.")
+
+
+def cmd_backup(args, db):
+    """Take a consistent copy. Verified by row count, not by the file appearing."""
+    stamp = time.strftime("%Y%m%d-%H%M", time.localtime())
+    target = args.path or str(Path(db.path).parent / f"backup-{stamp}.db")
+    out = db.backup_to(target)
+    print(f"{out['path']}: {out['rows']} observations "
+          f"({'complete' if out['complete'] else 'INCOMPLETE'} "
+          f"against {out['live_rows']} live)")
+    if not out["complete"]:
+        raise SystemExit("the copy is short - do not trust it")
+
+
 def cmd_skill(args, db):
     """Forecast error against the forecast that assumes nothing changes.
 
@@ -253,7 +384,16 @@ def cmd_skill(args, db):
 
 def cmd_params(args, db):
     """What the system currently believes about each room, and how sure it is."""
-    from analysis.room_model import RoomModel, rooms
+    from analysis.room_model import RoomModel, colocation_check, rooms
+
+    # Before any per-room numbers: do the two sensors even agree about outdoor air?
+    # If they do not, the rooms are not comparable and nothing below is.
+    chk = colocation_check(db)
+    if chk:
+        flag = "ok" if chk["explained_by_sensors"] else "MISMATCH"
+        print(f"\nsensor cross-check  {flag}")
+        print(f"  {chk['note']}")
+
     for name in rooms(db):
         model = RoomModel(db, name)
         print()
@@ -536,6 +676,10 @@ def main():
     p.add_argument("--people", type=int, help="how many, for an occupancy label")
     p.set_defaults(fn=cmd_label)
     p = sub.add_parser("params"); p.set_defaults(fn=cmd_params)
+    p = sub.add_parser("limits", help="what this system does not know")
+    p.set_defaults(fn=cmd_limits)
+    p = sub.add_parser("backup", help="consistent copy of the database")
+    p.add_argument("path", nargs="?"); p.set_defaults(fn=cmd_backup)
     p = sub.add_parser("skill", help="forecast error vs 'assume no change'")
     p.add_argument("--days", type=int, default=3650); p.set_defaults(fn=cmd_skill)
     p = sub.add_parser("volume", help="record a tape-measured room volume: volume bedroom 18")

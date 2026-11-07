@@ -327,6 +327,13 @@ def _get_backend(db=None):
     return _backend
 
 
+# One floor, used by both paths. 350 censored 51 minutes of a window-open
+# test - the room went BELOW it - and that is exactly the data c_out is
+# measured from. The fix was once applied to the HTTP path only, leaving the
+# serial and simulate paths able to reintroduce the bug.
+CO2_FLOOR_PPM = 250
+
+
 def reading_to_obs(ts, co2, co2_max, t, rh, n, location=settings.SCD40_LOCATION, pm=None):
     """One node-averaged reading -> Observations ('partial' if under half the samples arrived)."""
     q = "ok" if n >= 6 else "partial"
@@ -351,7 +358,7 @@ def reading_to_obs(ts, co2, co2_max, t, rh, n, location=settings.SCD40_LOCATION,
 def summarise(samples, ts, window_s=settings.SCD40_WINDOW_S, location=settings.SCD40_LOCATION):
     """Samples -> Observations (mean of the window, plus CO2 max). Pure function."""
     expected = max(1, window_s // SAMPLE_PERIOD_S)
-    good = [s for s in samples if 350 <= s[0] <= 10000 and -10 <= s[1] <= 60 and 0 <= s[2] <= 100]
+    good = [s for s in samples if CO2_FLOOR_PPM <= s[0] <= 10000 and -10 <= s[1] <= 60 and 0 <= s[2] <= 100]
     if not good:
         raise CollectorError(f"no valid SCD40 samples in window ({len(samples)} received)")
     q = "ok" if len(good) >= expected / 2 else "partial"

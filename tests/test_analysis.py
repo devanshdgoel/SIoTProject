@@ -1438,3 +1438,115 @@ def test_skill_is_reported_against_persistence(db):
     assert r["mae"] == pytest.approx(90.0)        # model is 90 out
     assert r["naive_mae"] == pytest.approx(10.0)  # persistence is 10 out
     assert r["skill"] < 0, "a model this much worse must score negative skill"
+
+
+# --- error bars that mean something -------------------------------------------
+
+def test_effective_n_sees_through_correlated_residuals():
+    """Independent residuals must not be penalised; correlated ones must be."""
+    rng = np.random.default_rng(0)
+    white = rng.normal(0, 1, 200)
+    n_eff, infl = features.effective_n(white)
+    assert infl < 1.3 and n_eff > 150
+
+    smooth = np.cumsum(rng.normal(0, 1, 200))      # a wandering, highly correlated series
+    n_eff2, infl2 = features.effective_n(smooth)
+    assert infl2 > 5, infl2
+    assert n_eff2 < n_eff / 4
+
+
+def test_stderr_widens_when_residuals_are_correlated():
+    """A long decay reported +/-0.7% on lambda because linregress assumed its 65
+    five-minute residuals were independent. They are a smooth misfit arc."""
+    idx = pd.date_range("2026-11-03", periods=60, freq="5min", tz="UTC")
+    t = np.arange(60) * 5 / 60.0
+    # a decay with a deliberately wrong asymptote, so the residuals carry an arc
+    y = 500.0 + 900.0 * np.exp(-0.8 * t)
+    fit = features.fit_decay(pd.Series(y, index=idx), 358.0)
+    assert fit["autocorr_inflation"] > 2.0
+    assert fit["stderr"] > fit["stderr_iid"]
+    assert fit["n_eff"] < 60
+
+
+# --- the filter must not eat the signal ---------------------------------------
+
+def test_despike_keeps_an_excursion_too_big_to_be_noise():
+    """At a SYMMETRIC turning point the span collapses to zero, both monotonicity
+    tests pass trivially, and only the amplitude test was left - with no ceiling.
+    An 80 ppm one-sample peak was deleted exactly like a 10 ppm one."""
+    idx = pd.date_range("2026-11-01", periods=40, freq="5min", tz="UTC")
+
+    def apex(amp):
+        v = np.full(40, 500.0)
+        v[20] += amp
+        return features.despike(pd.Series(v, index=idx))[1]
+
+    assert apex(10) == 1, "ordinary noise should still go"
+    assert apex(80) == 0, "an event-sized excursion was deleted"
+    assert apex(250) == 0
+    assert apex(4500) == 1, "room air cannot do this; it is the sensor"
+
+
+def test_despike_still_leaves_a_clean_decay_alone():
+    """The invariant worth keeping: a point between its neighbours never trips."""
+    idx = pd.date_range("2026-11-01", periods=40, freq="5min", tz="UTC")
+    t = np.arange(40) * 5 / 60.0
+    clean, n = features.despike(pd.Series(358 + 800 * np.exp(-4.0 * t), index=idx))
+    assert n == 0
+
+
+# --- integrity ----------------------------------------------------------------
+
+def test_a_crash_mid_learn_leaves_the_previous_fit_in_place(db):
+    """learn() clears room_params then rewrites it, each write its own transaction.
+    Anything raising in between left the room with NOTHING, and RoomModel filled in
+    published defaults - reported as 'still on defaults', which is what a brand-new
+    room shows. A measured rate reverting to a textbook one changes every number."""
+    from unittest import mock
+
+    from analysis import room_model
+
+    now = simulate(db, days=4)
+    learn(db, "bedroom", days=5, now=now)
+    before = {k: v["value"] for k, v in db.params("bedroom").items()}
+    assert before
+
+    with mock.patch.object(room_model, "fit_weather", side_effect=RuntimeError("boom")):
+        with pytest.raises(RuntimeError):
+            learn(db, "bedroom", days=5, now=now)
+
+    after = {k: v["value"] for k, v in db.params("bedroom").items()}
+    assert after == before, "a failed fit destroyed the previous one"
+
+
+def test_a_window_with_no_data_says_the_old_fit_is_stale(db):
+    now = simulate(db, days=3)
+    learn(db, "bedroom", days=4, now=now)
+    out = learn(db, "bedroom", days=1, now=now - 30 * 86400)
+    assert out.get("stale") is True
+    assert "no longer current" in out["note"]
+    assert db.params("bedroom"), "the old fit should be kept, just flagged"
+
+
+def test_a_backup_is_verified_by_content(db, tmp_path):
+    """The three backups on disk pass integrity_check and hold about an hour of
+    data each: plain file copies of a WAL database, taken without the sidecar."""
+    simulate(db, days=2)
+    out = db.backup_to(tmp_path / "copy.db")
+    assert out["complete"] and out["rows"] == out["live_rows"] > 0
+
+
+def test_two_sensors_are_checked_against_their_own_colocation(db):
+    """The cheapest validation available, and it was unused."""
+    from analysis.room_model import colocation_check
+
+    now = simulate(db, days=3, location="bedroom")
+    simulate(db, days=3, location="desk", seed=1)
+    # stand them in the same air for an hour, agreeing closely
+    db.add_label("desk", "occupancy", "colocated", now - 7200, now - 3600)
+    learn(db, "bedroom", days=4, now=now)
+    learn(db, "desk", days=4, now=now)
+    chk = colocation_check(db)
+    if chk:                                    # needs paired minutes to exist
+        assert set(chk["rooms"]) == {"bedroom", "desk"}
+        assert "c_out" in chk and chk["n_paired"] >= 10

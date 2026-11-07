@@ -146,6 +146,73 @@ def volume_check(db, location, source_per_person, n, source_stderr=None):
     return out
 
 
+def colocation_check(db, settle_min=10):
+    """Is the gap between two rooms' fitted c_out bigger than the sensors themselves?
+
+    The cheapest validation in the project, and it was sitting unused. Both sensors
+    were once stood side by side in the same air for an hour, which measures exactly
+    one thing: how far apart these two UNITS read when the air is identical. Any
+    difference between rooms larger than that is a difference between rooms.
+
+    `c_out` is supposed to be outdoor CO2 as each sensor reads it, so two rooms in
+    one flat should agree to within the co-location spread. If they do not, at least
+    one of them is not measuring outdoor air - and since c_out is the subtrahend in
+    every excess, that room's whole model is describing a different quantity from
+    its neighbour's while both are labelled the same way.
+
+    Returns None when there is no co-location on record or fewer than two rooms.
+    """
+    colocated = [lb for lb in db.labels(kind="occupancy") if lb["value"] == "colocated"]
+    if not colocated:
+        return None
+    last = colocated[-1]
+    start = int(last["start_ts"]) + settle_min * 60     # a carried sensor is still settling
+    end = int(last["end_ts"])
+    locs = rooms(db)
+    if len(locs) < 2:
+        return None
+    a, b = locs[0], locs[1]
+    with db.conn() as c:
+        pairs = c.execute(
+            "SELECT x.value - y.value FROM observations x JOIN observations y "
+            "ON x.ts=y.ts AND y.source='scd40' AND y.metric=x.metric AND y.location=? "
+            "WHERE x.source='scd40' AND x.metric='co2_ppm' AND x.location=? "
+            "AND x.ts BETWEEN ? AND ?", (b, a, start, end)).fetchall()
+    diffs = [float(r[0]) for r in pairs if r[0] is not None]
+    if len(diffs) < 10:
+        return None
+    diffs.sort()
+    lo, hi = diffs[0], diffs[-1]
+    med = float(np.median(diffs))
+    spread = max(abs(lo), abs(hi))
+
+    params = {loc: db.params(loc).get("c_out") for loc in (a, b)}
+    if not all(params.values()):
+        return None
+    ca, cb = float(params[a]["value"]), float(params[b]["value"])
+    gap = abs(ca - cb)
+    out = {"rooms": [a, b], "n_paired": len(diffs), "median_offset": round(med, 1),
+           "worst_excursion": round(spread, 1),
+           "c_out": {a: round(ca, 1), b: round(cb, 1)}, "gap": round(gap, 1),
+           "explained_by_sensors": bool(gap <= spread)}
+    if out["explained_by_sensors"]:
+        out["note"] = (f"{a} and {b} fit c_out {gap:.0f} ppm apart, inside the "
+                       f"{spread:.0f} ppm these two units differ by when standing "
+                       f"in the same air ({len(diffs)} paired minutes). Consistent "
+                       f"with one outdoor baseline seen through two sensors.")
+    else:
+        higher = a if ca > cb else b
+        out["note"] = (
+            f"{a} and {b} fit c_out {gap:.0f} ppm apart, which is more than the "
+            f"{spread:.0f} ppm these two units differ by when standing in the same "
+            f"air ({len(diffs)} paired minutes). That is not sensor offset, so at "
+            f"least one is not measuring outdoor air - almost certainly {higher}, "
+            f"whose baseline is the level the flat settles at rather than the level "
+            f"outside. Every excess, ceiling and air-change rate in {higher} is "
+            f"computed against the wrong zero.")
+    return out
+
+
 MIN_R2 = 0.90                   # a decay fit below this was not a clean decay
 VENT_RATIO = 2.0                # an open window must at least double lambda to count
 
@@ -264,7 +331,50 @@ def learn(db, location, days=14, now=None):
     """Re-fit every parameter for one room from the last `days` of record.
 
     Returns a summary dict. Safe to run repeatedly: it is a fresh fit each time, so
-    nothing drifts through repeated self-application."""
+    nothing drifts through repeated self-application.
+
+    All or nothing. The fit clears room_params before rewriting it, and each write
+    used to be its own transaction, so anything that raised in between - a singular
+    design matrix, a solver that will not converge on one odd night - left the room
+    with NO parameters at all. RoomModel then silently filled in the published
+    defaults and the dashboard printed "still on defaults", which is the same thing
+    it prints for a room installed this morning. A measured 0.294/h reverting to a
+    textbook 0.5/h changes every recommendation, and nothing in the output
+    distinguishes that from a room that has not been measured yet. If the failure is
+    data-shaped it recurs every five minutes for ever.
+
+    So the previous parameters are snapshotted first and put back if the fit does
+    not finish. A stale fit that says so is better than a default pretending to be
+    one, and the caller still sees the exception.
+    """
+    saved = _snapshot_params(db, location)
+    try:
+        return _learn(db, location, days=days, now=now)
+    except Exception:
+        _restore_params(db, location, saved)
+        raise
+
+
+def _snapshot_params(db, location):
+    with db.conn() as c:
+        return [dict(r) for r in c.execute(
+            "SELECT * FROM room_params WHERE location=?", (location,))]
+
+
+def _restore_params(db, location, saved):
+    """Put back exactly what was there, in one transaction."""
+    if not saved:
+        return
+    cols = [k for k in saved[0] if k != "rowid"]
+    names = ",".join(cols)
+    marks = ",".join("?" * len(cols))
+    with db.conn() as c:
+        c.execute("DELETE FROM room_params WHERE location=?", (location,))
+        c.executemany(f"INSERT OR REPLACE INTO room_params ({names}) VALUES ({marks})",
+                      [tuple(r[k] for k in cols) for r in saved])
+
+
+def _learn(db, location, days=14, now=None):
     now = int(time.time()) if now is None else int(now)
     start = now - days * 86400
     raw = features.series(db, "co2_ppm", location, start, now)
@@ -272,6 +382,14 @@ def learn(db, location, days=14, now=None):
     summary = {"location": location, "points": int(co2.dropna().size), "spikes": spikes,
                "decays": 0, "plateaus": 0}
     if co2.dropna().size < 12:
+        # Deliberately before the wipe: a window with almost no data is not evidence
+        # that the old fit is wrong, so the previous parameters stay. They are now
+        # stale, though, and the summary has to say so rather than reporting an
+        # ordinary pass that happened to find nothing.
+        summary["stale"] = True
+        summary["note"] = (f"only {int(co2.dropna().size)} samples in the last "
+                           f"{days} days: previous parameters kept, unchanged and "
+                           f"no longer current")
         return summary
 
     # Outdoor CO2 as this sensor reads it. The low percentile of the record is only a
@@ -483,6 +601,15 @@ def learn(db, location, days=14, now=None):
             fit["lambda_usable"] = (fit["covered"] >= MIN_RISE_COVER
                                     and fit["r2"] >= MIN_RISE_R2)
             rises.append(fit)
+    # A rise too straight to read a rate off is too straight to read a source off.
+    # The source is lambda*(ceiling - c_out) and the ceiling is the half of the
+    # trade-off that is NOT observed, so a rise that covered half its climb is
+    # reporting a product of two numbers that swap freely. The gate was applied to
+    # lambda and not to S, and the two rises it excluded contributed the two lowest
+    # sources - which dragged the median down and the inferred volume up by 10%.
+    usable_rises = [r for r in rises if r["lambda_usable"]]
+    if usable_rises:
+        rises = usable_rises
     if rises:
         med, err, n = _robust([r["per_person"] for r in rises])
         counts = [r["people"] for r in rises]
@@ -490,6 +617,10 @@ def learn(db, location, days=14, now=None):
         db.set_param(location, "source_ppm_h", med, err, n, "ppm/h per person",
                      {"from": f"{n} occupied rise(s)", "people_seen": counts,
                       "ceilings": [round(r["ceiling"]) for r in rises],
+                      # How far up its own curve each rise got. Without this a
+                      # reader cannot tell how much of the source term rests on
+                      # extrapolation towards a ceiling the room never reached.
+                      "covered": [round(r["covered"], 2) for r in rises],
                       "lambda_from_rise": [round(r["lambda_h"], 3) for r in rises]})
         db.set_param(location, "typical_people", typical, None, n, "people",
                      {"from": "median headcount across the labelled occupied rises"})

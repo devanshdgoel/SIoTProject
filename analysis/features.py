@@ -86,7 +86,22 @@ def series(db, metric, location=None, start=None, end=None, step=GRID_S, kind=No
     return out
 
 
-def despike(s, k=4.0):
+# Above this, a one-sample excursion is not sensor noise. The SCD40's own noise on
+# the 5-minute grid measures about 2-3 ppm, so 60 ppm is ~20 sigma; whatever caused
+# it - a door, a cooking puff, or somebody leaning over the sensor - it is an event,
+# and quietly interpolating across events is how a filter destroys the thing it was
+# meant to clean.
+SPIKE_MAX_PPM = 60.0
+
+# ...but above THIS it is not an event either. One occupant raises this bedroom by
+# about 80 ppm in five minutes and the fastest flush measured removes roughly a
+# third of the excess in the same time, so room air cannot move several hundred ppm
+# in one step and come straight back. That is the sensor, and leaving it in would be
+# as wrong as deleting a real excursion.
+SPIKE_IMPOSSIBLE_PPM = 400.0
+
+
+def despike(s, k=4.0, cap=SPIKE_MAX_PPM, impossible=SPIKE_IMPOSSIBLE_PPM, window=25):
     """Remove single-sample excursions; returns (cleaned, n_replaced).
 
     A spike is a reading that disagrees with both of its neighbours while they agree
@@ -99,19 +114,50 @@ def despike(s, k=4.0):
     around twenty minutes, and across a median window that steep exponential looks
     exactly like a run of outliers - so Hampel deletes the very events the air-change
     model is trying to measure. A point lying between its two neighbours can never
-    trip the test below, however fast the room is changing.
+    trip the test below, however fast the room is changing: for monotone samples
+    |s-prev| + |s-nxt| = |nxt-prev| exactly, so neither term can exceed the span.
 
     A low-pass filter is not an alternative: a spike is broadband, so filtering
-    smears it across its neighbours rather than removing it."""
+    smears it across its neighbours rather than removing it.
+
+    TWO THINGS THE EARLIER VERSION GOT WRONG, both found by characterising it rather
+    than by reading it.
+
+    At a SYMMETRIC turning point prev and nxt are nearly equal, so the span collapses
+    to zero and the two monotonicity tests pass trivially. Only the amplitude test
+    was left, and that had no ceiling - so a symmetric one-sample peak was deleted
+    whatever its size, 10 ppm or 80. The filter was monotonicity-preserving and
+    turning-point-destroying, which is unfortunate in a file whose event detection
+    (`departures`) looks for turning points. `cap` closes it: an excursion too large
+    to be noise is left alone, because the honest response to "this is not noise" is
+    not to delete it. `impossible` closes the other end, since room air cannot move
+    several hundred ppm in one five-minute step and come straight back - that is the
+    sensor, and it goes. The filter now acts only in the band between them, and both
+    edges are physical rather than chosen to make the output look tidy.
+
+    The scale was also computed over the WHOLE record, so one threshold served a
+    quiet empty afternoon and a steep occupied rise whose genuine curvature is orders
+    of magnitude larger. It is now a rolling median, so the filter asks whether a
+    sample is strange for where it is rather than strange on average.
+
+    Measured cost of getting this wrong: on the desk record the old filter destroyed
+    one of nine detected departures, and the three-coefficient weather fit downstream
+    moved by about 50% as a result - from a single undeclared filtering decision.
+    """
     if s.dropna().size < 5:
         return s, 0
     prev, nxt = s.shift(1), s.shift(-1)
     straight = (prev + nxt) / 2.0
     resid = s - straight
-    scale = 1.4826 * float(resid.abs().median(skipna=True) or 0.0)
+    # Local, not global: a threshold set by the whole record is wrong everywhere.
+    local = resid.abs().rolling(window, center=True, min_periods=5).median()
+    scale = 1.4826 * local.fillna(float(resid.abs().median(skipna=True) or 0.0))
     span = (nxt - prev).abs()
-    bad = ((resid.abs() > max(k * scale, 1e-9))
+    bad = ((resid.abs() > (k * scale).clip(lower=1e-9))
            & ((s - prev).abs() > span) & ((s - nxt).abs() > span)).fillna(False)
+    # Too big to be noise but small enough to be real: an event, left in place.
+    event = bad & (resid.abs() > cap) & (resid.abs() <= impossible)
+    bad = bad & ~event
     return s.mask(bad, straight), int(bad.sum())
 
 
@@ -212,6 +258,45 @@ def plateau_windows(co2, c_out, min_minutes=30, max_slope_ppm_h=40.0,
     return keep
 
 
+def effective_n(resid):
+    """How many INDEPENDENT residuals a fit really has, and the factor to widen by.
+
+    Every stderr in this file came from a formula that assumes independent errors.
+    They are nothing of the sort. A decay is sampled every 5 minutes against a time
+    constant of hours, and what is left over after a one-exponential fit is mostly
+    model misfit - a smooth arc, not noise - so neighbouring residuals are almost
+    the same number. Measured lag-1 autocorrelation on this record's long decays
+    runs 0.59 to 0.95.
+
+    For an AR(1) process the variance of a mean is inflated by (1+rho)/(1-rho), so
+    the honest sample size is n*(1-rho)/(1+rho) and every standard error has to be
+    multiplied by the square root of that inflation. At rho = 0.88 that is a factor
+    of 4; at 0.95 it is 6. A decay reporting +/-0.7% on lambda was really reporting
+    +/-3%, and the longer and more informative the decay, the worse the
+    understatement - which is the opposite of what a reader assumes.
+
+    This is a floor on the honesty rather than a complete correction: when rho is
+    that high the residuals are structural, and no AR(1) adjustment turns a wrong
+    model into a right one with a wider error bar.
+
+    Returns (n_eff, inflation). rho is clamped at 0 because a negative lag-1
+    correlation does not license a NARROWER interval than independence would give.
+    """
+    r = np.asarray(resid, dtype=float)
+    r = r[np.isfinite(r)]
+    n = r.size
+    if n < 6:
+        return float(n), 1.0
+    r = r - r.mean()
+    denom = float(np.sum(r * r))
+    if denom <= 0:
+        return float(n), 1.0
+    rho = float(np.sum(r[:-1] * r[1:]) / denom)
+    rho = min(max(rho, 0.0), 0.98)               # 0.98 caps the inflation near 100x
+    infl = (1.0 + rho) / (1.0 - rho)
+    return max(2.0, n / infl), infl
+
+
 def fit_decay(seg, c_out):
     """Air-change rate from one decay, in air changes per hour, or None if unusable.
 
@@ -230,7 +315,14 @@ def fit_decay(seg, c_out):
     lam = -float(fit.slope)
     if not np.isfinite(lam) or lam <= 0:
         return None
-    out = {"lambda_h": lam, "stderr": float(fit.stderr), "r2": float(fit.rvalue) ** 2}
+    # linregress assumes independent residuals. These are a smooth misfit arc
+    # sampled every five minutes, so they are not; see `effective_n`.
+    log_resid = np.log(excess) - (fit.intercept + fit.slope * hours)
+    n_eff, infl = effective_n(log_resid)
+    out = {"lambda_h": lam, "stderr": float(fit.stderr) * float(np.sqrt(infl)),
+           "stderr_iid": float(fit.stderr), "n_eff": round(float(n_eff), 1),
+           "autocorr_inflation": round(float(infl), 1),
+           "r2": float(fit.rvalue) ** 2}
 
     def model(t, amp, rate):
         return amp * np.exp(-rate * t)
@@ -711,12 +803,15 @@ def fit_decay_free(seg, c_out):
         return None
     resid = float(np.sum((y - model(hours, *popt)) ** 2))
     total = float(np.sum((y - y.mean()) ** 2))
+    resid_v = y - model(hours, *popt)
+    n_eff, infl = effective_n(resid_v)
     try:
-        stderr = float(np.sqrt(pcov[2][2]))
+        stderr = float(np.sqrt(pcov[2][2])) * float(np.sqrt(infl))
     except (ValueError, TypeError, IndexError):
         stderr = None
     return {"lambda_h": rate, "c_inf": c_inf, "stderr": stderr, "rss": resid,
-            "r2": 1.0 - resid / total if total > 0 else 0.0, "n": int(seg.size)}
+            "r2": 1.0 - resid / total if total > 0 else 0.0, "n": int(seg.size),
+            "n_eff": float(n_eff), "autocorr_inflation": float(infl)}
 
 
 def _r2_ppm(seg, rss):
@@ -727,19 +822,42 @@ def _r2_ppm(seg, rss):
 
 
 def _rss_forced(seg, c_out, lam):
-    """Residual sum of squares of the forced-asymptote fit, on the same scale as above.
+    """Residual sum of squares of the BEST forced-asymptote fit, in ppm.
 
-    `fit_decay` works in log space, so its r2 is not comparable with a fit done on the
-    raw curve. Re-evaluating its answer as ppm is what makes the two models rivals
-    rather than two numbers that merely look alike."""
+    An F-test compares nested models, and the restricted model has to be fitted
+    under its own restriction or the comparison is rigged. The earlier version held
+    lambda at the value `fit_decay` obtained from a LOG-space regression and
+    re-estimated only the amplitude. Log-space least squares is not the ppm-space
+    minimiser - it over-weights the tail, which is the whole reason fit_decay seeds
+    a nonlinear fit afterwards - so that RSS was larger than the restricted model
+    can actually achieve. The F numerator is the difference of the two, so inflating
+    one of them makes the free asymptote win more often than it has earned.
+
+    So both free parameters are fitted here, with c_inf pinned to c_out, which is
+    exactly the null the test is supposed to be against. `lam` is only a starting
+    point now.
+    """
     seg = seg.dropna()
     hours = (seg.index - seg.index[0]).total_seconds().to_numpy() / 3600.0
     y = seg.to_numpy(dtype=float)
-    # Only the amplitude is re-estimated; lambda and the asymptote are both fixed, so
-    # this is the best the forced model can possibly do with the rate it reported.
+
+    def model(t, amp, rate):
+        return c_out + amp * np.exp(-rate * t)
+
+    # Closed form for the amplitude at a fixed rate, as the fallback and the seed.
     basis = np.exp(-lam * hours)
-    amp = float(np.sum((y - c_out) * basis) / np.sum(basis ** 2))
-    return float(np.sum((y - (c_out + amp * basis)) ** 2))
+    amp0 = float(np.sum((y - c_out) * basis) / np.sum(basis ** 2))
+    best = float(np.sum((y - (c_out + amp0 * basis)) ** 2))
+    try:
+        popt, _ = optimize.curve_fit(model, hours, y, p0=[amp0, lam],
+                                     bounds=([-20000.0, 0.01], [20000.0, 30.0]),
+                                     maxfev=20000)
+        rss = float(np.sum((y - model(hours, *popt)) ** 2))
+        if np.isfinite(rss):
+            best = min(best, rss)
+    except (RuntimeError, ValueError, TypeError):
+        pass
+    return best
 
 
 ASYM_LATER_H = 2.0            # how far past the fit to look for a contradiction
@@ -790,14 +908,21 @@ def asymptote_test(seg, c_out, forced_lambda, later=None, p=ASYM_P):
     if free is None:
         return {"free": False, "reason": "no free-asymptote fit converged"}
     rss_forced = _rss_forced(seg, c_out, forced_lambda)
-    dof = free["n"] - 3
+    # Against the EFFECTIVE sample size, not the nominal one. With residuals this
+    # correlated, n-3 overstates the degrees of freedom several-fold, and an F-test
+    # handed too many of them is far too eager: at an inflation of 20, a nominal
+    # p = 0.01 is really nearer p = 0.25. That made ASYM_P a 25% test wearing a 1%
+    # label, and it decided which decays got a free asymptote.
+    dof = free.get("n_eff", free["n"]) - 3
     if dof < 2 or free["rss"] <= 0:
-        return {"free": False, "reason": "too few samples to spend a parameter on"}
+        return {"free": False, "reason": "too few independent samples to spend a "
+                                         "parameter on"}
     f_stat = (rss_forced - free["rss"]) / (free["rss"] / dof)
     p_value = float(stats.f.sf(f_stat, 1, dof)) if f_stat > 0 else 1.0
     above = free["c_inf"] - c_out
     out = {"c_inf": free["c_inf"], "lambda_h": free["lambda_h"], "r2": free["r2"],
            "stderr": free["stderr"], "f": float(f_stat), "p": p_value,
+           "n_eff": round(float(free.get("n_eff", free["n"])), 1),
            "above_c_out": above}
     went = _asymptote_contradicted(free["c_inf"], later, seg.dropna().index[-1])
     if above < ASYM_MIN_ABOVE:

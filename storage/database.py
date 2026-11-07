@@ -210,6 +210,36 @@ class Database:
                       (location, param, value, stderr, int(n), unit, int(time.time()),
                        json.dumps(detail) if detail is not None else None))
 
+    def backup_to(self, path):
+        """A consistent single-file copy, safe to take while the collector writes.
+
+        The three ad-hoc backups in data/ are plain file copies of a WAL-mode
+        database taken without the -wal sidecar, so each holds only what had been
+        checkpointed into the main file at that instant: 19, 31 and 60 CO2 rows
+        against the live 49,000. They open, they pass integrity_check, and
+        restoring from the newest would silently lose six days. integrity_check
+        verifies b-tree structure, not that the data is there, which is why nobody
+        noticed.
+
+        sqlite3's own backup API reads through the WAL and takes a proper snapshot.
+        The row count is returned so a caller can verify by content rather than by
+        the file existing."""
+        import sqlite3 as _sq
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with self.conn() as src:
+            dst = _sq.connect(path)
+            try:
+                src.backup(dst)
+                n = dst.execute("SELECT COUNT(*) FROM observations").fetchone()[0]
+            finally:
+                dst.close()
+        live = 0
+        with self.conn() as c:
+            live = c.execute("SELECT COUNT(*) FROM observations").fetchone()[0]
+        return {"path": str(path), "rows": int(n), "live_rows": int(live),
+                "complete": int(n) == int(live)}
+
     def params(self, location):
         """Learned parameters for one room as {param: Row}."""
         with self.conn() as c:

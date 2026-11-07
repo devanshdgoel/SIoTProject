@@ -25,7 +25,10 @@ from config import settings
 
 STEP_MIN = 5
 CO2_TARGETS = (1000.0, 1400.0, 2000.0)
-PM25_LIMIT = 25.0          # above this, prefer a short purge to a long opening
+# PM25_LIMIT lived here with a comment describing a rule that does not exist:
+# nothing branched on it, and the real behaviour is the intake term in the
+# purge cost below. A constant that documents imaginary behaviour is worse
+# than no constant. analysis_human.PM25_PURGE is the one that is actually used.
 COMFORT_FLOOR_C = 16.0     # below this indoors the heat cost stops being acceptable
 
 # Air-change rates to compare, in air changes per hour. "shut" and "open" come from
