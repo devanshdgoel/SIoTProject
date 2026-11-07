@@ -20,6 +20,7 @@
   #define ROOM_NAME   "desk"
   #define HAS_OLED    1
   #define HAS_PMS     0
+  #define HAS_TOUCH 1        // conductive panel on GPIO27, same node as the display
   // Uncomment to match the panel if the display stays blank or looks shifted:
   // #define OLED_SH1106 1    // controller is SH1106, not SSD1306
   // #define OLED_H      32   // panel is 128x32, not 128x64
@@ -28,6 +29,7 @@
   #define ROOM_NAME   "bedroom"
   #define HAS_OLED    0
   #define HAS_PMS     1    // PMS5003 particle counter on UART2 (GPIO25 RX, GPIO26 TX)
+  #define HAS_TOUCH 0        // conductive panel on GPIO27, same node as the display
 #else
   #error "Set NODE to 1 (desk) or 2 (bedroom)"
 #endif

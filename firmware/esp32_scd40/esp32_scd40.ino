@@ -48,6 +48,11 @@
 #ifndef HAS_OLED
 #define HAS_OLED 0        // 1 only on the node that has a display wired
 #endif
+// Capacitive touch on one pin, for the conductive panel on the pet's back. Needs no
+// sensor of its own: see pet_touch.h for how the ESP32 does this with a bare wire.
+#ifndef HAS_TOUCH
+#define HAS_TOUCH 0
+#endif
 
 // Display panel. Defaults suit the common 0.96" 128x64 SSD1306 module; override in
 // secrets.h if the controller is an SH1106 (0.96"/1.3" clones) or the panel is 32 px tall.
@@ -100,6 +105,13 @@ static bool  haveReading = false, timeOk = false, uploadOk = false, uploadTried 
 static uint32_t lastUpload = 0;                  // used by upload() to pace catching up
 static char  dispExpr[16] = "";                  // from the host; empty until it replies
 static char  dispMsg[64]  = "";
+// Lines for the info screen, filled by the host. The node renders whatever it is
+// given and knows nothing about air quality: deciding what is worth saying needs the
+// forecast, the weather and the room model, none of which live on a microcontroller.
+#define INFO_LINES 4
+#define INFO_CHARS 24
+static char  dispInfo[INFO_LINES][INFO_CHARS] = {{0}};
+static uint8_t dispInfoN = 0;
 
 // ---------------------------------------------------------------- PMS5003
 #if HAS_PMS
@@ -284,6 +296,7 @@ static bool scdMeasure(float &co2, float &t, float &rh) {
 // ---------------------------------------------------------------- OLED
 #if HAS_OLED
 #include <U8g2lib.h>
+#include "pet_face.h"
 
 #if OLED_SH1106
   U8G2_SH1106_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE);
@@ -433,6 +446,128 @@ static void oledBoot(const char *) {}
 static void oledRender() {}
 #endif
 
+// ---------------------------------------------------------------- the pet
+/* Everything below is the face as a face: full screen, animated, and answering to
+ * being touched. The small-panel layout above is left exactly as it was, because a
+ * 128x32 strip has no room for a face and numbers and the numbers are the point
+ * there.
+ */
+#if HAS_OLED && OLED_H != 32
+#if HAS_TOUCH
+#include "pet_touch.h"
+#endif
+
+enum PetMode { PET_FACE, PET_INFO };
+static PetMode  petMode      = PET_FACE;
+static uint32_t petModeUntil = 0;       // when the info screen gives up and goes back
+static uint32_t petReactUntil = 0;      // while set, the pet's own mood beats the host's
+static char     petReact[16] = "";
+static uint32_t lastFrameMs = 0, lastTickMs = 0;
+static const uint32_t FRAME_MS    = 33;     // ~30 fps, which is enough for a blink
+static const uint32_t INFO_HOLD_MS = 12000;
+
+/* The face the pet should be wearing, in priority order.
+ *
+ * Being stroked outranks the host, and briefly. The host's expression is a judgement
+ * about the air that is still true a second later, so if petting merely nudged a
+ * queue it would be overwritten by the next reply and the pet would ignore you. A
+ * short override that expires is what makes the reaction feel like a reaction. */
+static const char *petExpression(uint32_t now) {
+  if (petReact[0] && now < petReactUntil) return petReact;
+  return currentExpr();
+}
+
+static void petReactNow(const char *expr, uint32_t now, uint32_t ms) {
+  strncpy(petReact, expr, sizeof petReact - 1);
+  petReact[sizeof petReact - 1] = 0;
+  petReactUntil = now + ms;
+}
+
+static void drawInfoScreen() {
+  u8g2.setFont(u8g2_font_6x10_tf);
+  if (!dispInfoN) {
+    u8g2.drawStr(0, 12, "no advice yet");
+    u8g2.setFont(u8g2_font_4x6_tf);
+    u8g2.drawStr(0, 26, "the host has not answered");
+    u8g2.drawStr(0, 34, "with anything to show.");
+  } else {
+    for (uint8_t i = 0; i < dispInfoN && i < INFO_LINES; i++)
+      u8g2.drawStr(0, 11 + 13 * i, dispInfo[i]);
+  }
+  u8g2.setFont(u8g2_font_4x6_tf);
+  char st[32];
+  snprintf(st, sizeof st, "%s  %s  Q%d", ROOM_NAME,
+           WiFi.status() == WL_CONNECTED ? "wifi" : "----", bufCount);
+  u8g2.drawStr(0, 63, st);
+}
+
+/* One frame. The I2C clock is raised for the transfer and put back afterwards.
+ *
+ * A full 128x64 frame is 1024 bytes, and at the 100 kHz the SCD4x is specified for
+ * that is about 90 ms on the wire - under 11 fps, with the processor blocked for all
+ * of it. The display is good for 400 kHz even though the sensor is not, and nothing
+ * else is on the bus mid-frame, so the clock goes up for the transfer and comes back
+ * down before anything speaks to the sensor again. The same frame then costs about
+ * 23 ms and the blink looks like a blink. */
+static void petRender(uint32_t now) {
+  if (!oledOk) return;
+  u8g2.clearBuffer();
+  if (petMode == PET_INFO) drawInfoScreen();
+  else                     drawPetFace(now);
+  Wire.setClock(400000);
+  u8g2.sendBuffer();
+  Wire.setClock(100000);
+}
+
+/* Run the face and the touch pad for about `ms`, instead of sleeping through it.
+ *
+ * The main loop used to end in delay(1000), which is fine for a display that shows
+ * numbers and fatal for one that animates: nothing can blink if the processor is
+ * asleep 97% of the time. The per-second work above is untouched - this only fills
+ * the gap that was already idle. */
+static void petIdle(uint32_t ms) {
+  uint32_t until = millis() + ms;
+  for (;;) {
+    uint32_t now = millis();
+    if ((int32_t)(now - until) >= 0) break;
+
+#if HAS_TOUCH
+    switch (petTouchPoll(now)) {
+      case TOUCH_PET:
+        // Being stroked. Up on the hind legs, which is the one expression the air
+        // quality can never produce, so it always reads as "that was you".
+        petReactNow("excited", now, 2500);
+        petMode = PET_FACE;
+        break;
+      case TOUCH_DOUBLE:
+        petMode = PET_INFO;
+        petModeUntil = now + INFO_HOLD_MS;
+        break;
+      case TOUCH_TAP:
+        // A single tap acknowledges rather than navigates: it looks at you. Leaving
+        // it inert would make the pad feel broken on the way to a double tap.
+        if (petMode == PET_INFO) { petMode = PET_FACE; }
+        else                     { petReactNow("alert", now, 1200); }
+        break;
+      default: break;
+    }
+#endif
+    if (petMode == PET_INFO && (int32_t)(now - petModeUntil) >= 0) petMode = PET_FACE;
+
+    faceGoal = faceFor(petExpression(now));
+    uint32_t dt = lastTickMs ? now - lastTickMs : FRAME_MS;
+    if (dt > 500) dt = 500;        // came back from a long HTTP post; do not lurch
+    lastTickMs = now;
+    faceTick(now, dt);
+
+    if (now - lastFrameMs >= FRAME_MS) { lastFrameMs = now; petRender(now); }
+    delay(4);
+  }
+}
+#else
+static void petIdle(uint32_t ms) { delay(ms); }
+#endif
+
 // ---------------------------------------------------------------- diagnostics
 static void i2cScan() {
   Serial.println("[i2c] scanning bus (SDA=GPIO21, SCL=GPIO22)...");
@@ -501,6 +636,33 @@ static bool jsonStr(const String &s, const char *key, char *out, size_t n) {
   return true;
 }
 
+/* Pull "info":["a","b"] out of the reply into dispInfo. Returns how many it found.
+ *
+ * Hand-written for the same reason jsonStr is: pulling in a JSON library to read two
+ * keys would cost more flash than the whole display does. It scans the array between
+ * its brackets and takes quoted strings, which is enough for a field this node only
+ * ever renders and never interprets. */
+static uint8_t jsonStrArray(const String &s, const char *key,
+                            char out[][INFO_CHARS], uint8_t maxN) {
+  String pat = String("\"") + key + "\":[";
+  int i = s.indexOf(pat);
+  if (i < 0) return 0;
+  i += pat.length();
+  int end = s.indexOf(']', i);
+  if (end < 0) return 0;
+  uint8_t n = 0;
+  while (n < maxN) {
+    int a = s.indexOf('"', i);
+    if (a < 0 || a > end) break;
+    int b = s.indexOf('"', a + 1);
+    if (b < 0 || b > end) break;
+    s.substring(a + 1, b).toCharArray(out[n], INFO_CHARS);
+    n++;
+    i = b + 1;
+  }
+  return n;
+}
+
 /* Send one batch. Returns 1 sent, 0 nothing to send, -1 the host would not take it. */
 static int uploadBatch() {
   if (bufCount == 0) return 0;
@@ -557,6 +719,11 @@ static int uploadBatch() {
       }
       if (changed) Serial.printf("[oled] host says: %s - \"%s\"\n", dispExpr, dispMsg);
     }
+    // Lines for the info screen. Absent is not empty: if the host sent no "info" at
+    // all the previous lines stay up, because a reply that simply did not mention it
+    // is not the host saying there is nothing to report.
+    uint8_t ni = jsonStrArray(resp, "info", dispInfo, INFO_LINES);
+    if (ni) dispInfoN = ni;
     Serial.printf("[upload] OK - host accepted %d reading(s). Backlog now %d. THE WHOLE CHAIN WORKS.\n", n, bufCount);
     http.end();
     return 1;
@@ -703,6 +870,10 @@ void loop() {
   }
 
   if (millis() - lastUpload > UPLOAD_EVERY_MS) { lastUpload = millis(); upload(); }
+#if HAS_OLED && OLED_H != 32
+  petIdle(1000);          // the second that used to be delay(1000), spent animating
+#else
   oledRender();
   delay(1000);
+#endif
 }
