@@ -46,6 +46,104 @@ DEFAULTS = {
 MIN_N = {"c_out": 12, "lambda_sealed": 2, "lambda_open": 2, "source_ppm_h": 2, "tau_t_h": 2}
 
 CO2_PER_PERSON_LH = 18.7        # seated adult at rest, litres of CO2 per hour
+
+# Parameters that came from outside the sensors. `learn()` clears everything it is
+# about to re-derive, and these are the ones it cannot re-derive, so they survive it.
+MEASURED_PARAMS = ("volume_measured_m3",)
+
+
+def measured_volume(db, location):
+    """A tape-measured volume, if the user has given one. None otherwise.
+
+    Stored under its own name so that `learn()` can never overwrite it. Everything
+    else here is inferred and may be re-inferred; this one is the only number in the
+    system that came from outside the sensors, which makes it the only thing capable
+    of checking them."""
+    row = db.params(location).get("volume_measured_m3")
+    return float(row["value"]) if row and row["value"] else None
+
+
+# What an adult actually exhales, per hour, asleep. The 18.7 L/h above is a textbook
+# figure for a SEATED adult at about 1.2 MET; sleep is nearer 0.8 MET, and CO2 output
+# scales with metabolic rate, so the nights this source term is fitted from should sit
+# well below it. The band is wide because body mass and fitness move it several
+# litres either way - it is there to be failed by a real discrepancy, not by biology.
+SLEEP_CO2_LH = (11.0, 15.0)
+
+
+def volume_check(db, location, source_per_person, n, source_stderr=None):
+    """Compare the inferred volume with the measured one, and invert the comparison.
+
+    volume = CO2_PER_PERSON_LH / source, so measuring the volume independently turns
+    the relation round and solves for the CO2 the occupant actually produces:
+
+        L/h = source_ppm_h * volume_m3 / 1000
+
+    That is worth more than the agreement itself, because it is a quantity with a
+    known answer that nothing in this system was fitted to. The room stops being a
+    way of assuming a person and becomes a way of measuring one.
+
+    The test has to be TWO-SIDED or it is not a test. An earlier version of this
+    noted only that sleeping output should be lower than the seated figure, so any
+    value below 18.7 read as confirmation - which is the same "cannot fail" structure
+    `fit_open_wind` was criticised for, written by the same hand a day later. A result
+    above the band is as informative as one below it, and here the result IS above it.
+    """
+    truth = measured_volume(db, location)
+    if truth is None or not source_per_person:
+        return None
+    inferred = CO2_PER_PERSON_LH * 1000.0 / source_per_person
+    implied_lh = source_per_person * truth / 1000.0
+    err = (inferred - truth) / truth
+
+    # The inferred volume is 18700/S, so its relative error is exactly the source's.
+    # Reporting the volume without it invites an 8% gap to be read as agreement when
+    # the interval is wider than the gap.
+    rel = (source_stderr / source_per_person) if source_stderr else None
+    lo = hi = None
+    if rel:
+        lo, hi = inferred * (1 - rel), inferred * (1 + rel)
+
+    band_lo, band_hi = SLEEP_CO2_LH
+    implied_err = implied_lh * rel if rel else 0.0
+    agrees = (implied_lh - implied_err) <= band_hi and (implied_lh + implied_err) >= band_lo
+
+    out = {"measured_m3": truth, "inferred_m3": round(inferred, 1),
+           "inferred_lo": None if lo is None else round(lo, 1),
+           "inferred_hi": None if hi is None else round(hi, 1),
+           "error_pct": round(err * 100, 1), "n": n,
+           "implied_co2_lh": round(implied_lh, 2),
+           "implied_co2_lh_err": round(implied_err, 2),
+           "sleep_band_lh": list(SLEEP_CO2_LH),
+           "assumed_co2_lh": CO2_PER_PERSON_LH,
+           "agrees": bool(agrees)}
+
+    span = (f" (+/-{rel * 100:.0f}%, {lo:.1f}-{hi:.1f})" if rel else
+            " (no interval: the source term carries no stderr)")
+    if agrees:
+        out["note"] = (
+            f"source from {n} night(s) implies {inferred:.1f} m3{span} against "
+            f"{truth:.1f} m3 measured, {err * 100:+.0f}%. Inverted, the occupant "
+            f"produces {implied_lh:.1f}+/-{implied_err:.1f} L/h of CO2, inside the "
+            f"{band_lo:.0f}-{band_hi:.0f} L/h expected of an adult asleep.")
+    else:
+        # Say which way it failed and what that implies, because the direction is
+        # the diagnostic: too much CO2 per hour for the measured room means the
+        # source term is too big, which makes the inferred volume too small.
+        way = "above" if implied_lh > band_hi else "below"
+        out["note"] = (
+            f"source from {n} night(s) implies {inferred:.1f} m3{span} against "
+            f"{truth:.1f} m3 measured, {err * 100:+.0f}%. But inverted it FAILS: the "
+            f"occupant would have to produce {implied_lh:.1f}+/-{implied_err:.1f} L/h "
+            f"of CO2, {way} the {band_lo:.0f}-{band_hi:.0f} L/h an adult asleep "
+            f"actually does. So the {err * 100:+.0f}% volume agreement is luck, not "
+            f"accuracy - the source term is about "
+            f"{abs(1 - implied_lh / ((band_lo + band_hi) / 2)) * 100:.0f}% too "
+            f"{'high' if way == 'above' else 'low'} and the volume error happens to "
+            f"be small because both are wrong in the same direction.")
+    return out
+
+
 MIN_R2 = 0.90                   # a decay fit below this was not a clean decay
 VENT_RATIO = 2.0                # an open window must at least double lambda to count
 
@@ -133,8 +231,17 @@ def learn(db, location, days=14, now=None):
     # behind. Without this a parameter that can no longer be measured keeps its old
     # number for ever - which is how a bedroom went on claiming 325 cubic metres,
     # from a source term measured before occupancy was required.
+    # ...except for anything that was MEASURED rather than fitted. The wipe exists so
+    # that a parameter which can no longer be derived stops being served; a tape
+    # measure cannot stop being derivable, and re-deriving it is exactly what it is
+    # here to make unnecessary. Without this exclusion the user records a volume, the
+    # cross-check prints, and the next analysis pass five minutes later silently
+    # deletes the only external calibration in the system.
     with db.conn() as conn:
-        conn.execute("DELETE FROM room_params WHERE location=?", (location,))
+        conn.execute(
+            "DELETE FROM room_params WHERE location=? AND param NOT IN (%s)"
+            % ",".join("?" * len(MEASURED_PARAMS)),
+            (location, *MEASURED_PARAMS))
 
     # Best evidence first. An empty room with the window open has equilibrated with
     # the air outside, so what the sensor reads then IS outdoor CO2 as that sensor
@@ -294,12 +401,24 @@ def learn(db, location, days=14, now=None):
         db.set_param(location, "typical_people", typical, None, n, "people",
                      {"from": "median headcount across the labelled occupied rises"})
         volume = CO2_PER_PERSON_LH * 1000.0 / med
-        db.set_param(location, "volume_m3", volume, None, n, "m3",
-                     {"assumes": "one seated adult at 18.7 L/h; compare with a tape measure"})
+        # V = 18700/S exactly, so V's relative error IS S's. Storing None here was
+        # claiming a precision the source term does not have, and it is the number a
+        # reader compares against a tape measure.
+        v_err = volume * (err / med) if err else None
+        db.set_param(location, "volume_m3", volume, v_err, n, "m3",
+                     {"assumes": "one seated adult at 18.7 L/h; compare with a tape measure",
+                      "stderr_from": "the source term's own spread; the 18.7 L/h "
+                                     "constant carries a further systematic this "
+                                     "does not include"})
         summary["rises"] = n
         summary["source_ppm_h"] = (round(med, 1), n)
         summary["typical_people"] = typical
         summary["volume_m3"] = round(volume, 1)
+        # The one number in the system that did not come from the sensors. It is a
+        # check on them, so it is reported whether it agrees or not.
+        check = volume_check(db, location, med, n, source_stderr=err)
+        if check:
+            summary["volume_check"] = check
 
     # A rise measures the same air-change rate a decay does. The loss term of the
     # mass balance is lambda*(C - C_out) whether the room is filling or emptying, so
@@ -602,7 +721,14 @@ class RoomModel:
                 self.stderr[name] = None
                 self.n[name] = 0 if row is None else int(row["n"])
                 self.basis[name] = "default"
+        # A measured volume beats an inferred one everywhere it is used, and the
+        # inferred value stays on the record beside it as the thing being checked.
         self.volume_m3 = stored["volume_m3"]["value"] if "volume_m3" in stored else None
+        self.volume_inferred_m3 = self.volume_m3
+        if "volume_measured_m3" in stored and stored["volume_measured_m3"]["value"]:
+            self.volume_m3 = float(stored["volume_measured_m3"]["value"])
+        self.volume_basis = ("measured" if "volume_measured_m3" in stored
+                             and stored["volume_measured_m3"]["value"] else "inferred")
         # How many people usually occupy it, when it is occupied at all.
         row = stored.get("typical_people")
         self.occupants = max(1, int(row["value"])) if row and row["value"] else 1

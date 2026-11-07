@@ -1223,3 +1223,72 @@ def test_a_rise_too_straight_to_read_is_counted_but_not_used(db):
     usable = [r["lambda_h"] for r in rises
               if r["covered"] >= MIN_RISE_COVER and r["r2"] >= 0.95]
     assert usable == [0.25], "a near-linear rise reached the pooled rate"
+
+
+# --- the one number that did not come from the sensors ------------------------
+
+def test_a_measured_volume_survives_relearning(db):
+    """learn() clears what it is about to re-derive. It cannot re-derive a tape measure.
+
+    This failed in the field, not in theory: the volume was recorded, the cross-check
+    printed, and the collector's next analysis pass five minutes later deleted it.
+    The delete was scoped to the room rather than to the parameters being rewritten,
+    so it took the external calibration with it and the room quietly went back to
+    checking itself. Nothing logged anything."""
+    from analysis.room_model import measured_volume
+
+    now = simulate(db, days=4)
+    learn(db, "bedroom", days=5, now=now)
+    db.set_param("bedroom", "volume_measured_m3", 18.0, None, 1, "m3",
+                 {"from": "tape measure"})
+    assert measured_volume(db, "bedroom") == 18.0
+
+    learn(db, "bedroom", days=5, now=now)
+    assert measured_volume(db, "bedroom") == 18.0, "relearning deleted the tape measure"
+    assert "c_out" in db.params("bedroom")      # and the rest is still re-derived
+
+
+def test_a_measured_volume_is_what_the_model_uses(db):
+    now = simulate(db, days=4)
+    learn(db, "bedroom", days=5, now=now)
+    inferred = RoomModel(db, "bedroom").volume_m3
+    db.set_param("bedroom", "volume_measured_m3", 18.0, None, 1, "m3", {})
+    model = RoomModel(db, "bedroom")
+    assert model.volume_m3 == 18.0
+    assert model.volume_basis == "measured"
+    assert model.volume_inferred_m3 == inferred     # kept, as the thing being checked
+
+
+def test_the_volume_cross_check_can_actually_fail(db):
+    """A one-sided check is not a check.
+
+    The first version of this only observed that a sleeping rate should come out
+    below the seated 18.7 L/h, so every value in (0, 18.7) read as confirmation -
+    the same cannot-fail shape this codebase already criticises in fit_open_wind,
+    written a day later by the same hand. The real bedroom fails it: 960 ppm/h in
+    18 m3 demands 17.3 L/h, and an adult asleep produces 11-15."""
+    from analysis.room_model import SLEEP_CO2_LH, volume_check
+
+    db.set_param("r", "volume_measured_m3", 18.0, None, 1, "m3", {})
+
+    bad = volume_check(db, "r", 960.2, 6, source_stderr=90.4)
+    assert bad["agrees"] is False
+    assert bad["implied_co2_lh"] == pytest.approx(17.3, abs=0.1)
+    assert "FAILS" in bad["note"]
+
+    # A source implying a rate inside the band passes, so the test has two sides.
+    mid = (SLEEP_CO2_LH[0] + SLEEP_CO2_LH[1]) / 2 * 1000.0 / 18.0
+    good = volume_check(db, "r", mid, 6, source_stderr=mid * 0.05)
+    assert good["agrees"] is True
+    assert "FAILS" not in good["note"]
+
+
+def test_the_inferred_volume_carries_the_sources_error(db):
+    """volume = 18700/S exactly, so its relative error IS the source's. Storing None
+    invited an 8% gap to be read as agreement when the interval is wider than it."""
+    from analysis.room_model import volume_check
+
+    db.set_param("r", "volume_measured_m3", 18.0, None, 1, "m3", {})
+    chk = volume_check(db, "r", 1000.0, 6, source_stderr=100.0)
+    assert chk["inferred_lo"] == pytest.approx(18.7 * 0.9, abs=0.1)
+    assert chk["inferred_hi"] == pytest.approx(18.7 * 1.1, abs=0.1)

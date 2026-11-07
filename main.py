@@ -196,6 +196,27 @@ def cmd_label(args, db):
           f"{_fmt(start)} -> {_fmt(end)} UTC  ({(end - start) / 60:.0f} min)")
 
 
+def cmd_volume(args, db):
+    """Record a volume that was measured rather than inferred.
+
+    This is the only ground truth the system has. Everything else it believes about a
+    room it worked out from the same CO2 trace it is trying to explain, so a number
+    from a tape measure is the one thing capable of catching a self-consistent error.
+    It is stored under its own name so that re-running the analysis cannot overwrite
+    it."""
+    from analysis.room_model import RoomModel, volume_check
+    if not 2.0 <= args.m3 <= 2000.0:
+        raise SystemExit(f"{args.m3} m3 is not a room")
+    db.set_param(args.room, "volume_measured_m3", args.m3, None, 1, "m3",
+                 {"from": "tape measure"})
+    src = db.params(args.room).get("source_ppm_h")
+    print(f"{args.room}: volume measured at {args.m3} m3")
+    chk = volume_check(db, args.room, float(src["value"]), int(src["n"]),
+                       src["stderr"]) if src else None
+    print("  " + chk["note"] if chk else
+          "  no source term fitted yet, so nothing to check it against")
+
+
 def cmd_params(args, db):
     """What the system currently believes about each room, and how sure it is."""
     from analysis.room_model import RoomModel, rooms
@@ -208,7 +229,16 @@ def cmd_params(args, db):
             print(f"  {key:16s}{value:9.3f} {('+/-' + format(err, '.3f')) if err else '':10s}"
                   f" n={model.n[key]:<4d} {model.basis[key]}")
         if model.volume_m3:
-            print(f"  volume_m3       {model.volume_m3:9.1f}            inferred; check it with a tape measure")
+            print(f"  volume_m3       {model.volume_m3:9.1f}            {model.volume_basis}"
+                  + ("" if model.volume_basis == "measured"
+                     else "; check it with a tape measure"))
+        if model.volume_basis == "measured" and model.volume_inferred_m3:
+            from analysis.room_model import volume_check
+            src = db.params(name).get("source_ppm_h")
+            chk = volume_check(db, name, float(src["value"]), int(src["n"]),
+                                   src["stderr"]) if src else None
+            if chk:
+                print(f"  volume            cross-check: {chk['note']}")
         rows = db.decays(name, min_r2=0.9)
         if rows:
             vent = sum(1 for r in rows if r["inferred"] == "ventilated")
@@ -452,6 +482,9 @@ def main():
     p.add_argument("--people", type=int, help="how many, for an occupancy label")
     p.set_defaults(fn=cmd_label)
     p = sub.add_parser("params"); p.set_defaults(fn=cmd_params)
+    p = sub.add_parser("volume", help="record a tape-measured room volume: volume bedroom 18")
+    p.add_argument("room"); p.add_argument("m3", type=float)
+    p.set_defaults(fn=cmd_volume)
     p = sub.add_parser("ventilate", help="tonight under each option, and when to air out")
     p.add_argument("--room", default="bedroom"); p.add_argument("--hours", type=float, default=8.0)
     p.add_argument("--horizon", type=float, default=12.0); p.set_defaults(fn=cmd_ventilate)
