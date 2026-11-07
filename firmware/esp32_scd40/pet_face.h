@@ -36,6 +36,14 @@
 #ifndef PET_FACE_H
 #define PET_FACE_H
 
+/* This header draws on the sketch's `u8g2` object, so it has to be included after
+ * that object is declared. Getting it the wrong way round produces five copies of
+ * "'u8g2' was not declared in this scope; did you mean 'U8G2'?", which points at
+ * this file rather than at the include that is actually misplaced. */
+#ifndef PET_FACE_U8G2_READY
+#error "include pet_face.h AFTER the u8g2 display object is declared"
+#endif
+
 // ---------------------------------------------------------------- geometry
 // Laid out for a 128x64 panel. The eyes sit high and wide and the mouth low, which
 // is what makes it read as a face at arm's length rather than as three shapes.

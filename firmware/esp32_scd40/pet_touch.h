@@ -77,8 +77,9 @@ static void petTouchBegin() {
   for (int i = 0; i < 16; i++) { sum += touchRead(TOUCH_PIN); delay(2); }
   touchBase = sum / 16.0f;
   touchBaseInit = touchBase > 0;
-  Serial.printf("[touch] self-capacitance on GPIO%d, baseline %.0f counts\n",
-                digitalPinToGPIONumber(TOUCH_PIN), touchBase);
+  Serial.printf("[touch] self-capacitance on T%d, baseline %.0f counts. Touch the "
+                "pad now - you should see a line each time.\n",
+                (int)TOUCH_PIN, touchBase);
   if (!touchBaseInit)
     Serial.println("[touch] baseline read as zero - the pin is probably shorted to ground");
 }
@@ -103,6 +104,24 @@ static TouchEvent petTouchPoll(uint32_t now) {
 
   float drop = (touchBase - raw) / touchBase;
   bool  near = drop > (touchHeld ? RELEASE_DROP : TOUCH_DROP);
+
+  /* Say something whenever the pad notices ANYTHING.
+   *
+   * Without this the only two observable states are "a gesture fired" and
+   * silence, and silence has far too many causes: a wire that fell off, an
+   * electrode too small, a threshold too high for this panel, or - as actually
+   * happened - an initialiser that was written and never called. Printing the raw
+   * count beside the baseline separates them at a glance. No line at all while
+   * you touch it means the electrode is not connected; a line whose drop never
+   * reaches the threshold means TOUCH_DROP is too high. Rate-limited so a resting
+   * hand cannot flood the log. */
+  static uint32_t lastSay = 0;
+  if (drop > TOUCH_DROP / 4.0f && now - lastSay > 1000) {
+    lastSay = now;
+    Serial.printf("[touch] raw %u  baseline %.0f  drop %.0f%%  (need %.0f%%)%s\n",
+                  raw, touchBase, drop * 100.0f, TOUCH_DROP * 100.0f,
+                  near ? "  <- registering" : "");
+  }
 
   // The baseline only learns while nothing is on the pad, so a hand held still for
   // ten seconds stays a hand rather than becoming the new normal.

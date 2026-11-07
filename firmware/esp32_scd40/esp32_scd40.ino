@@ -75,7 +75,7 @@ static const float    TEMP_OFFSET_C  = 4.0;      // self-heating compensation
 // and running the board out of DRAM would cost every reading, not just the old ones.
 static const int      BUF_SIZE       = 1440;     // minutes of backlog (~24 h)
 #else
-static const int      BUF_SIZE       = 2880;     // minutes of backlog (~48 h)
+static const int      BUF_SIZE       = 720;     // minutes of backlog (~12 h)
 #endif
 static const int      BATCH_MAX      = 30;       // readings per POST
 static const int      MAX_BATCHES_PER_CALL = 8;  // keep sampling while a backlog drains
@@ -297,7 +297,6 @@ static bool scdMeasure(float &co2, float &t, float &rh) {
 // ---------------------------------------------------------------- OLED
 #if HAS_OLED
 #include <U8g2lib.h>
-#include "pet_face.h"
 
 #if OLED_SH1106
   U8G2_SH1106_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE);
@@ -306,6 +305,14 @@ static bool scdMeasure(float &co2, float &t, float &rh) {
 #else
   U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE);
 #endif
+
+// pet_face.h draws on the u8g2 object above and must come after it. Including it
+// before the declaration is a compile error with a confusing message ("'u8g2' was
+// not declared in this scope; did you mean 'U8G2'?"), so the header checks for
+// this marker and says what is actually wrong.
+#define PET_FACE_U8G2_READY 1
+#include "pet_face.h"
+
 
 static bool oledOk = false;
 
@@ -458,6 +465,22 @@ static void oledRender() {}
 #include "pet_touch.h"
 #endif
 
+/* Bring up anything the pet needs. Called from setup().
+ *
+ * petTouchBegin() existed and was never called, so touchBaseInit stayed false and
+ * petTouchPoll() returned on its first line for ever: the pad read as permanently
+ * untouched, every gesture was dead, and nothing anywhere said so. A sensor that
+ * is never initialised and never complains is the worst shape of bug, so the
+ * no-touch build now prints that it has none rather than staying silent - the
+ * serial log should always say what the board thinks it has. */
+static void petBegin() {
+#if HAS_TOUCH
+  petTouchBegin();
+#else
+  Serial.println("[touch] not built in on this node (HAS_TOUCH is 0)");
+#endif
+}
+
 enum PetMode { PET_FACE, PET_INFO };
 static PetMode  petMode      = PET_FACE;
 static uint32_t petModeUntil = 0;       // when the info screen gives up and goes back
@@ -567,6 +590,7 @@ static void petIdle(uint32_t ms) {
 }
 #else
 static void petIdle(uint32_t ms) { delay(ms); }
+static void petBegin() {}
 #endif
 
 // ---------------------------------------------------------------- diagnostics
@@ -725,8 +749,7 @@ static int uploadBatch() {
     } else {
       rejectStreak++;
       Serial.printf("[upload] host accepted only %d of %d - KEEPING the batch "
-                    "(attempt %d). Check the clock and the CO2 range.
-",
+                    "(attempt %d). Check the clock and the CO2 range.",
                     acc, n, rejectStreak);
       if (rejectStreak >= 2) {
         bufHead = (bufHead + n) % BUF_SIZE; bufCount -= n;
@@ -828,6 +851,7 @@ void setup() {
 #endif
   i2cScan();
   oledBegin();
+  petBegin();
   oledBoot("sensor...");
 
   sensorOk = scdInit();
