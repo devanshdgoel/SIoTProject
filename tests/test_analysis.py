@@ -2,6 +2,7 @@
 checked against the truth that generated them rather than against themselves."""
 
 import datetime as dt
+import json
 import math
 import time
 
@@ -706,3 +707,123 @@ def test_threshold_windows_do_not_duplicate_a_standardised_one(db):
     for i, (a1, b1, _m1) in enumerate(spans):
         for a2, b2, _m2 in spans[i + 1:]:
             assert not (a1 <= b2 and a2 <= b1), f"overlapping rows {spans}"
+
+
+# --- an unfinished flush must not be mistaken for a baseline measurement -------
+
+def _flush(minutes, lam, c0=1150.0, c_out=356.0, step=5):
+    """Synthetic open-window decay towards c_out at rate lam, sampled every `step`."""
+    n = minutes // step + 1
+    idx = pd.date_range("2026-11-06 22:00", periods=n, freq=f"{step}min", tz="UTC")
+    t = np.arange(n) * (step / 60.0)
+    return pd.Series(c_out + (c0 - c_out) * np.exp(-lam * t), index=idx)
+
+
+def test_settled_baseline_accepts_a_flush_that_equilibrated():
+    # Three hours at 4.5/h leaves the room sitting on outdoor air.
+    got = features.settled_baseline(_flush(180, 4.5), 400.0)
+    assert got is not None
+    assert abs(got - 356.0) < features.SETTLE_PPM
+
+
+def test_settled_baseline_rejects_a_flush_still_falling():
+    # One hour at 0.87/h - the 6 Nov still-air test - stops far short, and its
+    # floor is an upper bound on outdoor CO2 rather than a measurement of it.
+    seg = _flush(60, 0.87)
+    assert seg.iloc[-1] - 356.0 > features.SETTLE_PPM     # genuinely unfinished
+    assert features.settled_baseline(seg, 400.0) is None
+
+
+def test_settled_baseline_accepts_an_already_flat_segment():
+    idx = pd.date_range("2026-11-06 22:00", periods=10, freq="5min", tz="UTC")
+    flat = pd.Series(np.full(10, 357.0) + np.array([0, 2, -1, 1, 0, -2, 1, 0, -1, 1]),
+                     index=idx)
+    got = features.settled_baseline(flat, 400.0)
+    assert got is not None and abs(got - 357.0) < 3.0
+
+
+def test_unfinished_flush_does_not_inflate_the_baseline_or_lambda(db):
+    """The regression this guard exists for.
+
+    A still-air opening that is over before the room reaches outdoor air used to set
+    c_out from its lowest reading. On the real bedroom that lifted the baseline from
+    358 to 440 ppm, and because every excess is measured against the baseline, the
+    sealed air-change rate came out at 0.42/h instead of 0.27 - one unfinished flush
+    inflating the room's defining parameter by more than half.
+    """
+    now = simulate(db, days=3, lam_open=0.9)      # too slow to finish in the 2h airing
+    out = learn(db, "bedroom", days=4, now=now)
+    note = json.loads(db.params("bedroom")["c_out"]["detail"])["method"]
+
+    assert "still flushing" in note, note
+    assert out["c_out"] < TRUE["c_out"] + 120      # not dragged up to the flush floor
+    assert abs(out["lambda_sealed"][0] - TRUE["lam_sealed"]) < 0.2, out
+
+
+def test_a_finished_flush_is_still_used_as_a_direct_measurement(db):
+    # The guard must not cost us the measurement when the room really did settle:
+    # two hours at 3/h leaves a couple of ppm of excess, and that IS outdoor air.
+    now = simulate(db, days=3)
+    out = learn(db, "bedroom", days=4, now=now)
+    note = json.loads(db.params("bedroom")["c_out"]["detail"])["method"]
+    assert "measured directly" in note, note
+    assert abs(out["c_out"] - TRUE["c_out"]) < 15
+
+
+# --- rounded self-reported times must still match their decay -----------------
+
+def test_label_over_matches_a_decay_whose_midpoint_falls_outside():
+    """The 4 Nov window test: fit 19:40-20:10, label reported as 20:00-23:30.
+
+    The fit's edges come from the data, the label's from somebody rounding to the
+    hour, so the midpoint lands five minutes short and strict containment loses the
+    fastest, cleanest ventilation measurement in the record.
+    """
+    S = lambda s: int(pd.Timestamp(s, tz="UTC").timestamp())
+    labels = [{"kind": "window", "value": "open",
+               "start_ts": S("2026-11-04 20:00"), "end_ts": S("2026-11-04 23:30")}]
+    a, b = S("2026-11-04 19:40"), S("2026-11-04 20:10")
+    assert features.label_at(labels, (a + b) // 2, "window") is None   # the old test
+    assert features.label_over(labels, a, b, "window") == "open"       # the new one
+
+
+def test_label_over_ignores_a_label_that_barely_clips_the_decay():
+    # The 3 Nov morning door flush: a window=closed label ends just as it starts,
+    # so slack alone must not sweep it up.
+    S = lambda s: int(pd.Timestamp(s, tz="UTC").timestamp())
+    labels = [{"kind": "window", "value": "closed",
+               "start_ts": S("2026-11-03 00:15"), "end_ts": S("2026-11-03 08:40")}]
+    a, b = S("2026-11-03 08:45"), S("2026-11-03 09:10")
+    assert features.label_over(labels, a, b, "window") is None
+
+
+def test_label_over_prefers_the_longer_overlap():
+    S = lambda s: int(pd.Timestamp(s, tz="UTC").timestamp())
+    labels = [{"kind": "window", "value": "closed",
+               "start_ts": S("2026-11-04 18:00"), "end_ts": S("2026-11-04 19:50")},
+              {"kind": "window", "value": "open",
+               "start_ts": S("2026-11-04 19:50"), "end_ts": S("2026-11-04 23:30")}]
+    a, b = S("2026-11-04 19:45"), S("2026-11-04 20:45")
+    assert features.label_over(labels, a, b, "window") == "open"
+
+
+def test_one_unfinished_opening_cannot_drag_a_measured_baseline(db):
+    """The real bedroom: two labelled openings, only one of which finished.
+
+    4 Nov ran three and a half hours at 4.5/h and reached outdoor air. 6 Nov ran one
+    hour in still air at 0.87/h and stopped 150 ppm short. Pooling both put the
+    baseline at 440 instead of 358. The finished one has to carry it alone.
+    """
+    now = simulate(db, days=3)
+    base = T0 + 2 * 86400
+    # Label an ordinary sealed morning decay as an opening. At 0.5/h it is nowhere
+    # near outdoor air by the time it ends, which is exactly the shape of a still-air
+    # airing that was shut too early.
+    db.add_label("bedroom", "window", "open", base + 7 * 3600, base + 8 * 3600)
+    out = learn(db, "bedroom", days=4, now=now)
+    note = json.loads(db.params("bedroom")["c_out"]["detail"])["method"]
+
+    assert "measured directly during 3" in note, note
+    assert "1 further opening(s) ignored" in note, note
+    assert abs(out["c_out"] - TRUE["c_out"]) < 15, out
+    assert abs(out["lambda_sealed"][0] - TRUE["lam_sealed"]) < 0.15, out

@@ -429,6 +429,46 @@ def occupancy_prior(db, location, start, end, step_s=GRID_S):
             "spell_min": round(spell_min), "runs": len(runs)}
 
 
+SETTLE_PPM = 25.0             # residual excess a sensor cannot tell from its own noise
+
+
+def settled_baseline(seg, c_out_guess):
+    """Outdoor CO2 read off an aired room - but only once the airing has finished.
+
+    A room approaches outdoor air exponentially: after a time t at rate lambda the
+    excess that remains is exp(-lambda*t) of the excess it started with. The sensor
+    reads outdoor air only once that remainder has fallen below what it can resolve.
+    A short opening, or one in still air where lambda is small, stops well short of
+    that, and its lowest reading is then an UPPER BOUND on outdoor CO2 rather than a
+    measurement of it. Treating the bound as a measurement biases the baseline up,
+    which shrinks every excess the model computes and so inflates every air-change
+    rate fitted against it - one unfinished flush is enough to corrupt the room.
+
+    So the segment has to earn it: either it is already flat, or its own fitted
+    asymptote has to sit within sensor noise of where it actually ended up.
+
+    Returns the settled level in ppm, or None if the trace was still falling.
+    """
+    seg = seg.dropna()
+    if seg.size < 6:
+        return None
+    if float(seg.max() - seg.min()) <= SETTLE_PPM:
+        return float(seg.median())          # flat throughout: already equilibrated
+    fit = fit_asymptote(seg, c_out_guess)
+    if fit is None or fit["r2"] < 0.9:
+        return None                         # no usable curve, so no usable asymptote
+    # Judge the settling on the median of the tail, not on the final sample. The
+    # label's end is a rounded, self-reported time and the decimation window there
+    # straddles it, so the last point picks up whatever the room did next - being
+    # reoccupied, usually, which pushes it back up. That one point is the most
+    # contaminated in the segment and the worst possible thing to test.
+    tail = max(3, seg.size // 4)
+    level = float(seg.tail(tail).median())
+    if level - fit["c_inf"] > SETTLE_PPM:
+        return None                         # still descending towards its asymptote
+    return level
+
+
 DEPARTURE_OFFSET_MIN = 20     # let the room settle after the door closes
 DEPARTURE_WINDOW_MIN = 60     # then measure over a fixed span, every time
 
@@ -525,3 +565,33 @@ def label_at(labels, ts, kind):
         if lb["kind"] == kind and lb["start_ts"] <= ts <= lb["end_ts"]:
             return lb["value"]
     return None
+
+
+LABEL_SLACK_S = 15 * 60       # people report times to the nearest quarter hour
+LABEL_COVER = 0.5             # the label must account for most of the decay
+
+
+def label_over(labels, start_ts, end_ts, kind, slack=LABEL_SLACK_S):
+    """The user's stated state of `kind` spanning a decay, matched by overlap.
+
+    `label_at` asks whether one instant sits inside a label, which is too brittle
+    for a fitted decay: the fit's own edges come from the data, the label's come
+    from somebody remembering what time they opened a window, and those are rounded
+    to the nearest five or fifteen minutes. A fast flush is over in half an hour, so
+    a quarter-hour of rounding is enough to push its midpoint outside the label and
+    throw the measurement away - the cleanest events, the fastest ones, are exactly
+    the ones lost that way.
+
+    So the label is widened by `slack` at both ends and has to cover at least half
+    the decay. Where several labels of the kind qualify, the longest overlap wins.
+    """
+    best, best_overlap = None, 0.0
+    span = max(float(end_ts - start_ts), 1.0)
+    for lb in labels:
+        if lb["kind"] != kind:
+            continue
+        lo, hi = lb["start_ts"] - slack, lb["end_ts"] + slack
+        overlap = min(end_ts, hi) - max(start_ts, lo)
+        if overlap / span >= LABEL_COVER and overlap > best_overlap:
+            best, best_overlap = lb["value"], overlap
+    return best

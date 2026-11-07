@@ -141,14 +141,19 @@ def learn(db, location, days=14, now=None):
     # reads it - calibration offset included, which is the number the model wants.
     # Nothing is fitted; it is simply observed. The first half hour is skipped while
     # the room is still flushing.
-    direct = []
+    direct, unfinished = [], 0
     for lb in labels:
         if lb["kind"] != "window" or lb["value"] != "open":
             continue
         seg = co2.loc[pd.Timestamp(lb["start_ts"] + 1800, unit="s", tz="UTC"):
                       pd.Timestamp(lb["end_ts"], unit="s", tz="UTC")].dropna()
-        if seg.size >= 6:
-            direct.append(float(seg.quantile(0.25)))
+        if seg.size < 6:
+            continue
+        level = features.settled_baseline(seg, features.outdoor_baseline(co2))
+        if level is None:
+            unfinished += 1      # still flushing: its floor is an upper bound only
+        else:
+            direct.append(level)
 
     c_out = features.outdoor_baseline(co2)
     method = "5th percentile of this sensor's own record"
@@ -167,6 +172,9 @@ def learn(db, location, days=14, now=None):
     elif refined:
         c_out = float(np.median(tails))
         method = f"asymptote of {len(tails)} deep decays"
+    if unfinished:
+        method += (f"; {unfinished} further opening(s) ignored for the baseline, "
+                   f"still flushing when the window shut")
     # If the percentile had to be clamped and no decay settled, the room was never
     # observed near outdoor air. The clamp is then a guess wearing a measurement's
     # clothes, so it is stored with n=0 and the published default keeps being used.
@@ -193,7 +201,8 @@ def learn(db, location, days=14, now=None):
                 "c_out": c_out,
                 "delta_t_c": None if t_in is None or t_out is None else t_in - t_out,
                 "wind_ms": features.at(wind, mid), "method": method,
-                "labelled": features.label_at(labels, mid, "window")}
+                "labelled": features.label_over(labels, int(a.timestamp()),
+                                                int(b.timestamp()), "window")}
 
     rows, lams, marks = [], [], []
 
