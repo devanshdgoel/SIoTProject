@@ -1550,3 +1550,82 @@ def test_two_sensors_are_checked_against_their_own_colocation(db):
     if chk:                                    # needs paired minutes to exist
         assert set(chk["rooms"]) == {"bedroom", "desk"}
         assert "c_out" in chk and chk["n_paired"] >= 10
+
+
+# --- running it twice ---------------------------------------------------------
+
+def test_only_one_collector_per_database(tmp_path):
+    """A second collector does not share the work, it duplicates it: two ingest
+    servers racing for the port, two analysis loops interleaving their rewrites of
+    room_params, and two copies of every rate-limited API call."""
+    import single_instance
+
+    key = str(tmp_path / "siot.db")
+    first = single_instance.acquire(key)
+    assert first is not None
+    assert single_instance.acquire(key) is None, "two collectors got the same lock"
+
+    # Releasing lets the next one in, so a restart is never blocked by the last run.
+    single_instance.release(first)
+    second = single_instance.acquire(key)
+    assert second is not None
+    single_instance.release(second)
+
+
+def test_two_databases_do_not_block_each_other(tmp_path):
+    """The hazard is two collectors on ONE database; a test run or a second
+    project must not be locked out by an unrelated one."""
+    import single_instance
+
+    a = single_instance.acquire(str(tmp_path / "a.db"))
+    b = single_instance.acquire(str(tmp_path / "b.db"))
+    assert a is not None and b is not None
+    single_instance.release(a)
+    single_instance.release(b)
+
+
+def test_concurrent_analysis_passes_do_not_interleave(db):
+    """run() is reachable from the collector loop and from the dashboard's button,
+    in different processes. Both clear room_params and rewrite it, so overlapping
+    passes can leave whichever subset the second DELETE missed - with no exception
+    and no log line."""
+    import threading
+
+    simulate(db, days=3)
+    results = []
+
+    def go():
+        results.append(analysis_human.run(db))
+
+    threads = [threading.Thread(target=go) for _ in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    ran = [r for r in results if not r.get("skipped")]
+    assert len(ran) == 1, f"{len(ran)} passes ran at once"
+    assert all("another analysis pass" in r["skipped"]
+               for r in results if r.get("skipped"))
+    assert db.lock_holder("analysis") is None, "the lock was not released"
+
+
+def test_an_expired_lock_does_not_wedge_the_system(db):
+    """A holder that dies without releasing must not lock everyone out for ever."""
+    import time as _t
+
+    with db.conn() as c:
+        c.execute("INSERT INTO locks (name, holder, acquired_at, expires_at) "
+                  "VALUES ('analysis','a ghost',?,?)",
+                  (int(_t.time()) - 9999, int(_t.time()) - 1))
+    assert db.lock_holder("analysis") is None      # already expired
+    with db.advisory_lock("analysis") as got:
+        assert got, "an expired lock blocked a new holder"
+
+
+def test_the_lock_is_released_even_when_the_body_raises(db):
+    with pytest.raises(ValueError):
+        with db.advisory_lock("analysis") as got:
+            assert got
+            raise ValueError("boom")
+    assert db.lock_holder("analysis") is None

@@ -240,6 +240,58 @@ class Database:
         return {"path": str(path), "rows": int(n), "live_rows": int(live),
                 "complete": int(n) == int(live)}
 
+    @contextmanager
+    def advisory_lock(self, name, ttl_s=300, holder=None):
+        """Hold a named lock for the duration of the block, or yield False.
+
+        SQLite serialises writers, so a single conditional UPDATE/INSERT is enough
+        to decide a winner without any further coordination. The lock expires so a
+        process that dies mid-pass cannot wedge the system: the next attempt after
+        `ttl_s` takes it over.
+
+        Used so that an analysis pass from the collector and one from the
+        dashboard's button cannot interleave. Both clear a room's parameters and
+        rewrite them, and interleaving leaves whichever subset the second DELETE
+        did not catch - silently, since neither raises.
+        """
+        import os as _os
+        import threading as _th
+        import uuid as _uuid
+        # The token has to identify this ACQUIRER, not this process. Using the pid
+        # alone meant two threads in one process both read their own name back and
+        # both believed they had won - which is exactly the case a dashboard
+        # serving requests on threads produces.
+        holder = holder or (f"pid {_os.getpid()} thread {_th.get_ident()} "
+                            f"{_uuid.uuid4().hex[:8]}")
+        now = int(time.time())
+        got = False
+        with self.conn() as c:
+            c.execute(
+                "INSERT INTO locks (name, holder, acquired_at, expires_at) "
+                "VALUES (?,?,?,?) ON CONFLICT(name) DO UPDATE SET "
+                "holder=excluded.holder, acquired_at=excluded.acquired_at, "
+                "expires_at=excluded.expires_at WHERE locks.expires_at <= ?",
+                (name, holder, now, now + int(ttl_s), now))
+            row = c.execute("SELECT holder, acquired_at FROM locks WHERE name=?",
+                            (name,)).fetchone()
+            got = bool(row and row["holder"] == holder)
+        try:
+            yield got
+        finally:
+            if got:
+                with self.conn() as c:
+                    c.execute("DELETE FROM locks WHERE name=? AND holder=?",
+                              (name, holder))
+
+    def lock_holder(self, name):
+        """Who holds `name`, or None if nobody does or it has expired."""
+        with self.conn() as c:
+            row = c.execute("SELECT holder, expires_at FROM locks WHERE name=?",
+                            (name,)).fetchone()
+        if not row or int(row["expires_at"]) <= int(time.time()):
+            return None
+        return row["holder"]
+
     def params(self, location):
         """Learned parameters for one room as {param: Row}."""
         with self.conn() as c:

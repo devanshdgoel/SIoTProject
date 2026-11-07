@@ -192,6 +192,18 @@ CREATE TABLE IF NOT EXISTS decay_events (
 
 -- Every forecast is written before its outcome is known and scored later. The
 -- rolling error over these rows is the evidence that the system is improving.
+-- Advisory locks, so that work which rewrites a derived table can refuse to run
+-- twice at once. The socket in single_instance.py stops two COLLECTORS; this stops
+-- two analysis passes, which can also arrive from the dashboard process pressing
+-- its own button. Expiry rather than cleanup: a holder that dies without releasing
+-- must not lock the system out for ever.
+CREATE TABLE IF NOT EXISTS locks (
+    name        TEXT    PRIMARY KEY,
+    holder      TEXT    NOT NULL,
+    acquired_at INTEGER NOT NULL,
+    expires_at  INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS predictions (
     id        INTEGER PRIMARY KEY AUTOINCREMENT,
     issued_at INTEGER NOT NULL,

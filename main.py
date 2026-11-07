@@ -101,6 +101,20 @@ def _catch_up(db):
 
 
 def cmd_collect(args, db):
+    # One collector per database. A second one does not share the work, it
+    # duplicates it: two ingest servers racing for the port, two analysis loops
+    # interleaving their rewrites of room_params, and two copies of every API call.
+    # See single_instance for why the lock is a socket and not a file.
+    import single_instance
+
+    lock = single_instance.acquire(db.path)
+    if lock is None:
+        print(f"a collector is already running for {db.path}")
+        print(f"  held by {single_instance.describe(db.path)}")
+        print("  stop that one first, or point this at another database with --db")
+        raise SystemExit(1)
+    single_instance.record(db.path, f"started {time.strftime('%Y-%m-%d %H:%M:%S')}")
+
     if not args.no_catchup:
         _catch_up(db)
     stop = threading.Event()
@@ -118,6 +132,8 @@ def cmd_collect(args, db):
     except KeyboardInterrupt:
         stop.set()
         log.info("stopping")
+    finally:
+        single_instance.release(lock)
 
 
 def cmd_once(args, db):
@@ -481,6 +497,9 @@ def cmd_params(args, db):
 
 def cmd_analyse(args, db):
     out = analysis_human.run(db)
+    if out.get("skipped"):
+        print(out["skipped"] + " - nothing done here")
+        return
     print(f"scored {out['scored']} past forecasts | strictness {out['strictness']} "
           f"(recovery z={out['recovery_z']}) | quiet hours={out['quiet']}")
     for name, fit in out["fits"].items():

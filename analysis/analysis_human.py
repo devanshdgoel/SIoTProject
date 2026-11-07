@@ -187,7 +187,23 @@ def forecast_rows(model, state, now, prior=None):
 
 
 def run(db, now=None, relearn_days=14):
-    """One full analysis pass. Returns a summary dict; never raises on thin data."""
+    """One full analysis pass. Returns a summary dict; never raises on thin data.
+
+    Only one at a time per database. This is reachable from two processes - the
+    collector's loop and the dashboard's /api/analyse button - and it rewrites
+    room_params and decay_events for every room, so two passes overlapping can
+    leave either table holding half of each. Skipping is the right answer rather
+    than queuing: the next pass is five minutes away and will see newer data.
+    """
+    with db.advisory_lock("analysis") as got:
+        if not got:
+            return {"skipped": f"another analysis pass is running "
+                                f"({db.lock_holder('analysis')})",
+                    "scored": 0, "fits": {}, "decision": None}
+        return _run(db, now=now, relearn_days=relearn_days)
+
+
+def _run(db, now=None, relearn_days=14):
     now = int(time.time()) if now is None else int(now)
     t0 = time.time()
     scored = db.score_due(now)
