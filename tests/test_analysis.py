@@ -865,21 +865,57 @@ def test_the_law_uses_only_openings_the_user_confirmed(db):
     an event that was not a window at all."""
     from analysis.room_model import fit_open_wind
 
-    rows = [_opening(0, 0.869, 0.76), _opening(1, 4.547, 3.72),
+    rows = [_opening(0, 2.575, 0.76), _opening(1, 4.547, 3.72),
             _opening(2, 1.197, 4.20, labelled=None)]      # the door, high wind, low rate
     db.save_decays(rows)
     out = fit_open_wind(db, "r")
     assert out["n"] == 2, "an unconfirmed opening entered the fit"
-    assert out["k"] == pytest.approx(1.221, rel=0.02)
 
 
 def test_two_openings_are_marked_as_untestable(db):
     from analysis.room_model import fit_open_wind
 
-    db.save_decays([_opening(0, 0.869, 0.76), _opening(1, 4.547, 3.72)])
+    db.save_decays([_opening(0, 1.0, 0.8), _opening(1, 4.6, 3.7)])
     out = fit_open_wind(db, "r")
     assert out["r2"] > 0.99                         # and yet
     assert "provisional" in out, "a fit that cannot fail must say so"
+
+
+def test_this_rooms_own_openings_refute_proportionality_to_wind(db):
+    """The measurement that killed the law, kept as the record of it.
+
+    4.55/h in 3.7 m/s and 2.58/h in 0.75 m/s is a factor of 1.8 for a factor of five
+    in wind. A line through the origin cannot do that: it has to put the still-air
+    opening near 1/h, a third of what was measured, and it ends up explaining LESS
+    than the mean of the two does. An open window here is mostly buoyancy-driven, and
+    a law that has failed must not be stored as if it had passed."""
+    from analysis.room_model import RoomModel, fit_open_wind
+
+    db.save_decays([_opening(0, 2.575, 0.75), _opening(1, 4.547, 3.72)])
+    out = fit_open_wind(db, "r")
+    assert out["r2"] < 0, out
+    assert "refuted" in out
+    assert "buoyancy" in out["refuted"]
+    # Stored with n=0, so nothing downstream can predict from it.
+    assert db.params("r")["lambda_open_k"]["n"] == 0
+    assert db.params("r")["lambda_open_k"]["value"] is None
+
+
+def test_a_refuted_law_is_shown_but_never_used(db):
+    from analysis.room_model import RoomModel, fit_open_wind
+
+    simulate(db, days=3)
+    db.save_decays([dict(_opening(0, 2.575, 0.75), location="bedroom"),
+                    dict(_opening(1, 4.547, 3.72), location="bedroom")])
+    fit_open_wind(db, "bedroom")
+    model = RoomModel(db, "bedroom")
+
+    assert model.open_wind is None, "a refuted law must not be available to predict"
+    assert model.open_wind_fit["refuted"]            # but it is still on the record
+    for wind in (0.8, 2.0, 3.7):
+        lam, basis = model.lambda_open_at(wind)
+        assert lam == pytest.approx(model.value["lambda_open"])
+        assert "wind law" not in basis
 
 
 def test_the_law_is_held_inside_the_winds_it_was_measured_in(db):
@@ -905,8 +941,8 @@ def test_lambda_open_follows_the_wind_and_falls_back_without_it(db):
     from analysis.room_model import RoomModel, fit_open_wind
 
     simulate(db, days=3)                            # gives the room its other params
-    db.save_decays([dict(_opening(0, 0.869, 0.76), location="bedroom"),
-                    dict(_opening(1, 4.547, 3.72), location="bedroom")])
+    db.save_decays([dict(_opening(0, 0.95, 0.76), location="bedroom"),
+                    dict(_opening(1, 4.55, 3.72), location="bedroom")])
     fit_open_wind(db, "bedroom")
     model = RoomModel(db, "bedroom")
 
@@ -927,8 +963,8 @@ def test_the_night_plan_changes_with_the_forecast_wind(db):
     from analysis.ventilation import options
 
     simulate(db, days=3)
-    db.save_decays([dict(_opening(0, 0.869, 0.76), location="bedroom"),
-                    dict(_opening(1, 4.547, 3.72), location="bedroom")])
+    db.save_decays([dict(_opening(0, 0.95, 0.76), location="bedroom"),
+                    dict(_opening(1, 4.55, 3.72), location="bedroom")])
     fit_open_wind(db, "bedroom")
     model = RoomModel(db, "bedroom")
 
@@ -1042,3 +1078,86 @@ def test_the_openings_figure_prefers_the_fit_start(db, tmp_path):
     fits = [r for r in db.decays("bedroom", min_r2=0.9) if r["labelled"] == "open"]
     assert len(fits) == 1
     assert int(fits[0]["start_ts"]) - peak_at == 35 * 60
+
+
+# --- free asymptotes: what was the room actually emptying into? ----------------
+
+def _decay(c_inf, c0, lam, minutes=60, step=5, start="2026-11-06 22:00", noise=0.0):
+    """A synthetic exponential approach to c_inf, sampled on the 5-minute grid."""
+    n = minutes // step + 1
+    idx = pd.date_range(start, periods=n, freq=f"{step}min", tz="UTC")
+    t = np.arange(n) * step / 60.0
+    y = c_inf + (c0 - c_inf) * np.exp(-lam * t)
+    if noise:
+        y = y + np.random.default_rng(0).normal(0, noise, n)
+    return pd.Series(y, index=idx)
+
+
+def test_a_decay_towards_house_air_recovers_its_own_asymptote():
+    """The whole point: a room emptying into the flat is not emptying into outdoors."""
+    seg = _decay(c_inf=480.0, c0=1140.0, lam=3.0, minutes=70)
+    got = features.fit_decay_free(seg, c_out=358.0)
+    assert got is not None
+    assert got["c_inf"] == pytest.approx(480.0, abs=5.0)
+    assert got["lambda_h"] == pytest.approx(3.0, rel=0.05)
+
+
+def test_forcing_the_wrong_asymptote_understates_the_rate():
+    """Why this matters, stated as a measurement rather than an argument.
+
+    The same curve fitted against outdoor air comes out far too slow, because the
+    only way an exponential aimed at 358 ppm can pass through a trace that stops at
+    480 is to be much shallower than the trace really is."""
+    seg = _decay(c_inf=480.0, c0=1140.0, lam=3.0, minutes=70)
+    forced = features.fit_decay(seg, c_out=358.0)
+    assert forced["lambda_h"] < 0.6 * 3.0
+
+
+def test_a_real_leak_to_outdoors_keeps_its_forced_asymptote():
+    """The guard has to be two-sided or it is just a licence to raise every rate."""
+    seg = _decay(c_inf=358.0, c0=1100.0, lam=1.2, minutes=180, noise=3.0)
+    got = features.asymptote_test(seg, 358.0, 1.2)
+    assert got["free"] is False
+    assert "noise" in got["reason"] or "fits as well" in got["reason"]
+
+
+def test_a_knee_is_not_an_asymptote():
+    """Two regimes in one window look exactly like one fast decay that has arrived.
+
+    This is the 3 November bedroom morning: a door-open flush from 2970 to 1305 in
+    forty minutes, then a slow crawl once it shut. A one-hour slice of that fits as
+    lambda=4.5 settling at 1246 ppm, and the only thing in the record that refutes it
+    is the room walking straight through 1246 afterwards."""
+    fast = _decay(c_inf=1240.0, c0=2970.0, lam=4.5, minutes=60)
+    slow = _decay(c_inf=360.0, c0=1300.0, lam=0.25, minutes=180,
+                  start="2026-11-03 09:50")
+    whole = pd.concat([fast, slow])
+    free = features.fit_decay_free(fast, c_out=358.0)
+    assert free["c_inf"] > 1000.0                 # the bogus fit is available...
+    got = features.asymptote_test(fast, 358.0, 1.0, later=whole)
+    assert got["free"] is False                   # ...and the later record kills it
+    assert "later reached" in got["reason"]
+
+
+def test_the_asymptote_competes_during_the_offset_search_not_after_it():
+    """The bug this was built to fix, as a regression test.
+
+    Choosing the start offset by R-squared UNDER THE FORCED ASYMPTOTE silently
+    discards the informative part of the curve: no offset can make an exponential
+    aimed at 358 ppm fit a steep drop that stops at 480, so the best-conditioned
+    forced fit is always the shallow far tail - and the reported rate comes out
+    several times too low from a fit that looks excellent."""
+    seg = _decay(c_inf=480.0, c0=1140.0, lam=3.0, minutes=70)
+    best = features.best_decay_fit(seg, c_out=358.0)
+    assert best is not None
+    assert best["c_inf"] == pytest.approx(480.0, abs=10.0)
+    assert best["lambda_h"] == pytest.approx(3.0, rel=0.1)
+    # and it used the whole curve rather than retreating into the tail
+    assert best["start"] == seg.index[0]
+
+
+def test_an_asymptote_within_sensor_noise_of_outdoors_is_not_worth_a_parameter():
+    seg = _decay(c_inf=368.0, c0=1100.0, lam=1.5, minutes=150, noise=2.0)
+    got = features.asymptote_test(seg, 358.0, 1.5)
+    assert got["free"] is False
+    assert "sensor noise" in got["reason"]

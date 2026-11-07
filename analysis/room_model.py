@@ -194,11 +194,21 @@ def learn(db, location, days=14, now=None):
     def record(fit, a, b, method):
         mid = int((a.timestamp() + b.timestamp()) / 2)
         t_in, t_out = features.at(temp_in, mid), features.at(temp_out, mid)
+        seg = co2.loc[a:b]
+        # The asymptote was already chosen where the curve was fitted - it has to be,
+        # because which asymptote is right changes which stretch of the curve fits
+        # best, so it cannot be a correction applied afterwards. Here it is only read
+        # off and recorded, so that a lambda can always be traced to what the room was
+        # actually emptying into.
+        asym = fit.get("asym") or {}
+        c_inf = fit.get("c_inf", c_out)
+        if asym.get("free"):
+            method += " +free asymptote"
         return {"location": location, "start_ts": int(a.timestamp()),
                 "end_ts": int(b.timestamp()), "lambda_h": fit["lambda_h"],
                 "stderr": fit.get("stderr"), "r2": fit["r2"],
-                "c_start": float(co2.loc[a:b].iloc[0]), "c_end": float(co2.loc[a:b].iloc[-1]),
-                "c_out": c_out,
+                "c_start": float(seg.iloc[0]), "c_end": float(seg.iloc[-1]),
+                "c_out": c_out, "c_inf": c_inf, "asym_note": asym.get("reason"),
                 "delta_t_c": None if t_in is None or t_out is None else t_in - t_out,
                 "wind_ms": features.at(wind, mid), "method": method,
                 "labelled": features.label_over(labels, int(a.timestamp()),
@@ -223,7 +233,7 @@ def learn(db, location, days=14, now=None):
     for a, b in features.decay_windows(co2, c_out):
         if any(a <= end and start <= b for start, end in taken):
             continue                             # already measured, and measured better
-        fit = features.best_decay_fit(co2.loc[a:b], c_out)
+        fit = features.best_decay_fit(co2.loc[a:b], c_out, later=co2)
         if fit is None or fit["r2"] < MIN_R2:
             continue
         a, b = fit["start"], fit["end"]          # the trimmed span the fit actually used
@@ -409,15 +419,17 @@ def fit_open_wind(db, location, min_r2=MIN_R2):
 
     The quadrature in `fit_weather` still applies - stack pressure and wind pressure
     add as energies - but a wide opening is a different regime from an envelope leak.
-    The opening is large enough that wind pressure dominates the stack term, which
-    collapses the three-coefficient form to
+    The hypothesis tested here is that the opening is large enough for wind pressure
+    to dominate the stack term, which would collapse the three-coefficient form to
 
         lambda^2 = c*v^2    ->    lambda = k*v
 
-    one parameter, fitted through the origin. That choice matters with a handful of
-    events: the two-parameter form lambda = lambda0 + k*v would fit two measurements
-    exactly and leave nothing to check it against, while k alone leaves a residual
-    that can be reported. The form is derived and then tested, not chosen to fit.
+    one parameter, fitted through the origin. One parameter is what makes it testable
+    at all: the two-parameter form lambda = lambda0 + k*v fits two measurements
+    exactly and leaves no residual to judge it by, while k alone leaves one. The form
+    is derived and then tested, and on this room's record it fails the test - see the
+    r2 guard below. A negative r2 is reported rather than suppressed, because "the
+    opening is buoyancy-driven, not wind-driven" is the finding.
 
     Only openings the user confirmed with a label count. An inferred "ventilated"
     decay may be a window, a door or a trickle vent, and this bedroom's own record
@@ -446,6 +458,28 @@ def fit_open_wind(db, location, min_r2=MIN_R2):
            "wind_range": [round(float(wind.min()), 2), round(float(wind.max()), 2)],
            "lambda_range": [round(float(lam.min()), 3), round(float(lam.max()), 3)],
            "spread": round(float(lam.max() / max(lam.min(), 1e-9)), 1)}
+
+    # An opening whose decay settled above outdoor air was not exchanging purely with
+    # outdoors: part of its make-up air came from the rest of the home, through a
+    # door or a corridor, and that path has no wind pressure across it. Wind therefore
+    # drives only a fraction of such an event's lambda, and k fitted through it is
+    # biased - which way depends on whether the still openings or the windy ones are
+    # the mixed ones. The count has to travel with the coefficient.
+    def _house_air(r):
+        try:
+            return r["c_inf"] is not None and r["c_inf"] - r["c_out"] >= features.ASYM_MIN_ABOVE
+        except (IndexError, KeyError):
+            return False
+
+    mixed = [r for r in usable if _house_air(r)]
+    if mixed:
+        out["mixed"] = len(mixed)
+        levels = ", ".join("%.0f" % r["c_inf"] for r in mixed)
+        out["mixed_note"] = (
+            f"{len(mixed)} of {len(lam)} opening(s) settled above outdoor CO2 "
+            f"(at {levels} ppm), so some of their make-up air came from inside the "
+            f"flat, where wind has no pressure to apply. k is not a pure outdoor "
+            f"coupling.")
     # With two openings and one coefficient there is a single residual degree of
     # freedom, so a high r-squared is close to guaranteed: a line through the origin
     # between two widely separated points will always look excellent, and the stated
@@ -457,6 +491,27 @@ def fit_open_wind(db, location, min_r2=MIN_R2):
                               f"fail yet. Needs an opening between "
                               f"{out['wind_range'][0]} and {out['wind_range'][1]} m/s "
                               f"to be tested.")
+
+    # A law has to beat the thing it replaces. r2 below zero means the line through the
+    # origin predicts these openings worse than their own mean does, so the pooled
+    # median is the better model and the coefficient is not stored. That is a result,
+    # not a failure: proportionality through the origin assumed wind pressure dominates
+    # the stack term, and a still-air opening that still exchanges several air changes
+    # an hour says buoyancy is carrying it. lambda = lambda0 + k*v is the form that
+    # implies, and two points fit two parameters exactly - so it cannot be fitted here
+    # either, and what is needed is a third opening, not a different regression.
+    if out["r2"] < 0:
+        out["refuted"] = (
+            f"lambda is not proportional to wind: fitted through the origin it "
+            f"explains less than the mean does (r2={out['r2']:.2f}). The still-air "
+            f"opening still gave {float(lam[np.argmin(wind)]):.2f}/h at "
+            f"{float(wind.min()):.2f} m/s, where the law expects "
+            f"{k * float(wind.min()):.2f}/h - so buoyancy, not wind, drives most of "
+            f"it. Falling back to the pooled median until a third opening can "
+            f"separate the two terms.")
+        db.set_param(location, "lambda_open_k", None, None, 0, "(1/h) per (m/s)", out)
+        return out
+
     db.set_param(location, "lambda_open_k", k, stderr, len(lam), "(1/h) per (m/s)", out)
     return out
 
@@ -506,9 +561,13 @@ class RoomModel:
         # The open-window rate is a function of wind here, not a constant. See
         # lambda_open_at; the stored pooled median remains the fallback.
         row = stored.get("lambda_open_k")
-        self.open_wind = (json.loads(row["detail"])
-                          if row is not None and row["detail"]
-                          and row["n"] >= MIN_OPEN_FITS else None)
+        # The fit is kept whatever its verdict, because a law that was tested and
+        # failed is a result worth showing; only a law that PASSED may be used to
+        # predict, so the two are read into separate attributes.
+        detail = json.loads(row["detail"]) if row is not None and row["detail"] else None
+        self.open_wind_fit = detail
+        self.open_wind = (detail if detail and row["n"] >= MIN_OPEN_FITS
+                          and not detail.get("refuted") else None)
 
     @property
     def learned(self):
@@ -518,14 +577,17 @@ class RoomModel:
     def lambda_open_at(self, wind=None):
         """The open-window air-change rate at a wind speed, and how it was arrived at.
 
-        One pooled number cannot describe this room. The bedroom's two confirmed
-        openings differ five-fold - 4.55/h in 3.7 m/s against 0.87/h in 0.8 m/s -
-        and the temperature difference was LARGER on the still night, so buoyancy
-        alone predicts the opposite ordering. Averaging them would promise air on a
-        calm night that the window cannot deliver, which is the one error that
-        matters: it is the advice the user acts on.
+        A wind law is used only where one has survived its own test. The bedroom's
+        two confirmed openings give 4.55/h in 3.7 m/s and 2.58/h in 0.75 m/s: a
+        factor of 1.8 for a factor of five in wind, which proportionality through the
+        origin cannot produce - it would have the still-air opening at 0.98/h, a
+        third of what was measured. Most of an open window's exchange here is
+        buoyancy, and the wind adds to it rather than being it.
 
-        Falls back to the pooled median when there is no law or no wind to feed it."""
+        So `fit_open_wind` refuses to store a coefficient whose r2 is negative, and
+        this falls back to the pooled median. That fallback is the safer error: it
+        under-promises on a windy night rather than over-promising on a still one,
+        and over-promising is the one that reaches the user as bad advice."""
         fit = getattr(self, "open_wind", None)
         if fit and wind is not None:
             lam = predicted_lambda_open(fit, wind, floor=self.value["lambda_sealed"])

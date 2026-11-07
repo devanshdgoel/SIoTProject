@@ -220,7 +220,8 @@ def fit_decay(seg, c_out):
     return out
 
 
-def best_decay_fit(seg, c_out, offsets=(0.0, 0.15, 0.30, 0.45), min_excess=15.0):
+def best_decay_fit(seg, c_out, offsets=(0.0, 0.15, 0.30, 0.45), min_excess=15.0,
+                   later=None):
     """Fit a decay, allowing its start to be trimmed, and keep the best-conditioned one.
 
     A detected window often begins before the room really started emptying: the flat
@@ -240,6 +241,13 @@ def best_decay_fit(seg, c_out, offsets=(0.0, 0.15, 0.30, 0.45), min_excess=15.0)
     if seg.size < 6:
         return None
 
+    # Both models compete at every offset. Searching offsets under the forced
+    # asymptote alone is what made this subtly wrong: if a room is heading for house
+    # air rather than outdoor air, no start offset can make an exponential aimed at
+    # c_out fit the steep early part, so the best-conditioned FORCED fit is always the
+    # shallow far tail - and the search duly throws away the informative nine tenths
+    # of the curve and reports a rate several times too low. The asymptote has to be a
+    # candidate during the search, not a correction applied after it.
     best = None
     for frac in offsets:
         part = seg.iloc[int(len(seg) * frac):]
@@ -249,6 +257,16 @@ def best_decay_fit(seg, c_out, offsets=(0.0, 0.15, 0.30, 0.45), min_excess=15.0)
         if fit is None:
             continue
         fit["start"], fit["end"] = part.index[0], part.index[-1]
+        fit["r2_log"], fit["c_inf"] = fit["r2"], c_out
+        # Scored in ppm, not in log ppm, so that a fit with the asymptote forced and
+        # one with it free are measured on the same quantity. fit_decay's own r2 lives
+        # in log space, where it is not comparable with anything fitted on the curve.
+        fit["r2"] = _r2_ppm(part, _rss_forced(part, c_out, fit["lambda_h"]))
+        asym = asymptote_test(part, c_out, fit["lambda_h"], later=later)
+        if asym.get("free"):
+            fit.update(lambda_h=asym["lambda_h"], r2=asym["r2"],
+                       stderr=asym["stderr"], c_inf=asym["c_inf"])
+        fit["asym"] = asym
         if best is None or fit["r2"] > best["r2"]:
             best = fit
     return best
@@ -509,6 +527,17 @@ def departure_decay(co2, c_out, when, offset_min=DEPARTURE_OFFSET_MIN,
     if fit is None:
         return None
     fit["start"], fit["end"] = seg.index[0], seg.index[-1]
+    # Same two-model choice as best_decay_fit. The span here is fixed by the clock
+    # rather than chosen, so there is no offset search to go wrong - but a room that
+    # was heading for house air is still heading for house air, and the rate read off
+    # it under the wrong asymptote is still too low.
+    fit["r2_log"], fit["c_inf"] = fit["r2"], c_out
+    fit["r2"] = _r2_ppm(seg, _rss_forced(seg, c_out, fit["lambda_h"]))
+    asym = asymptote_test(seg, c_out, fit["lambda_h"], later=co2)
+    if asym.get("free"):
+        fit.update(lambda_h=asym["lambda_h"], r2=asym["r2"],
+                   stderr=asym["stderr"], c_inf=asym["c_inf"])
+    fit["asym"] = asym
     return fit
 
 
@@ -595,3 +624,158 @@ def label_over(labels, start_ts, end_ts, kind, slack=LABEL_SLACK_S):
         if overlap / span >= LABEL_COVER and overlap > best_overlap:
             best, best_overlap = lb["value"], overlap
     return best
+
+
+# One extra free parameter has to earn itself. The F-test below asks whether letting
+# the asymptote float reduces the residual variance by more than an extra degree of
+# freedom buys for nothing; this is the significance it has to clear.
+ASYM_P = 0.01
+ASYM_MIN_ABOVE = 30.0         # ppm the asymptote must clear c_out to be worth claiming
+
+
+def fit_decay_free(seg, c_out):
+    """One decay with the asymptote left free: C(t) = C_inf + A exp(-lambda t).
+
+    `fit_decay` assumes the room is heading for outdoor air, which is right for a
+    sealed envelope - a leak exchanges with outdoors by definition - and wrong for an
+    open window onto a flat. A bedroom door onto a corridor is a second, slower path
+    whose far end is house air, not outdoor air, so on a still night the make-up air
+    arriving through the window can itself be indoor air that has been round the flat.
+    The room then settles well above outdoor CO2, and forcing the curve down to c_out
+    buys the misfit off with a shallower exponential: lambda comes out too small, and
+    the residuals carry a systematic arc that says so.
+
+    Returns lambda, the fitted asymptote, r2 and the residual sum of squares, or None.
+    """
+    seg = seg.dropna()
+    if seg.size < 8:
+        return None
+    hours = (seg.index - seg.index[0]).total_seconds().to_numpy() / 3600.0
+    y = seg.to_numpy(dtype=float)
+    span = float(y[0] - y[-1])
+    if span < 50.0:
+        return None
+
+    def model(t, c_inf, amp, rate):
+        return c_inf + amp * np.exp(-rate * t)
+
+    # The asymptote is bounded below by outdoor air, which nothing in the home can
+    # undercut, and above by where the trace actually got to: an asymptote the room
+    # has already passed through is not an asymptote.
+    lo = min(c_out, float(np.min(y)) - 1.0)
+    hi = max(float(np.min(y)), lo + 1.0)
+    try:
+        popt, pcov = optimize.curve_fit(
+            model, hours, y, p0=[min(max(float(y[-1]) - 1.0, lo), hi), span, 1.0],
+            bounds=([lo, 1.0, 0.01], [hi, 20000.0, 30.0]), maxfev=20000)
+    except (RuntimeError, ValueError, TypeError):
+        return None
+    c_inf, _amp, rate = (float(v) for v in popt)
+    if not np.isfinite(rate) or rate <= 0:
+        return None
+    resid = float(np.sum((y - model(hours, *popt)) ** 2))
+    total = float(np.sum((y - y.mean()) ** 2))
+    try:
+        stderr = float(np.sqrt(pcov[2][2]))
+    except (ValueError, TypeError, IndexError):
+        stderr = None
+    return {"lambda_h": rate, "c_inf": c_inf, "stderr": stderr, "rss": resid,
+            "r2": 1.0 - resid / total if total > 0 else 0.0, "n": int(seg.size)}
+
+
+def _r2_ppm(seg, rss):
+    """Fraction of the variance in ppm that a fit explains, given its residual sum."""
+    y = seg.dropna().to_numpy(dtype=float)
+    total = float(np.sum((y - y.mean()) ** 2))
+    return 1.0 - rss / total if total > 0 else 0.0
+
+
+def _rss_forced(seg, c_out, lam):
+    """Residual sum of squares of the forced-asymptote fit, on the same scale as above.
+
+    `fit_decay` works in log space, so its r2 is not comparable with a fit done on the
+    raw curve. Re-evaluating its answer as ppm is what makes the two models rivals
+    rather than two numbers that merely look alike."""
+    seg = seg.dropna()
+    hours = (seg.index - seg.index[0]).total_seconds().to_numpy() / 3600.0
+    y = seg.to_numpy(dtype=float)
+    # Only the amplitude is re-estimated; lambda and the asymptote are both fixed, so
+    # this is the best the forced model can possibly do with the rate it reported.
+    basis = np.exp(-lam * hours)
+    amp = float(np.sum((y - c_out) * basis) / np.sum(basis ** 2))
+    return float(np.sum((y - (c_out + amp * basis)) ** 2))
+
+
+ASYM_LATER_H = 2.0            # how far past the fit to look for a contradiction
+
+
+def _asymptote_contradicted(c_inf, later, end, hours=ASYM_LATER_H):
+    """Did the room later go below the level this fit claimed it was settling at?
+
+    An asymptote is a claim about the future of the curve, so the future of the curve
+    can refute it - and for a short window it usually is the only thing that can. A
+    fixed-length slice taken across a change of regime fits beautifully as "a fast
+    decay that has already arrived": the 3 November bedroom morning falls from 2970 to
+    1305 in forty minutes as the door stands open, then crawls from 1305 to 933 over
+    the next three hours once it shuts. Fitted over one hour that reads as lambda=4.5
+    settling at 1246 ppm, with every residual small and an F-test delighted to spend
+    the parameter. The room then walked straight through 1246 and kept going, which is
+    the only evidence in the record that says so.
+
+    Returns the level it reached, or None if nothing contradicts the fit.
+    """
+    if later is None:
+        return None
+    after = later.loc[end:].dropna()
+    if after.size:
+        after = after.iloc[1:]
+    if after.empty:
+        return None
+    after = after.loc[:end + pd.Timedelta(hours=hours)]
+    if after.size < 3:
+        return None
+    # The 10th percentile rather than the minimum: one spike down is sensor noise,
+    # while a tenth of the next two hours spent below the asymptote is the room.
+    floor = float(after.quantile(0.10))
+    return floor if floor < c_inf - ASYM_MIN_ABOVE else None
+
+
+def asymptote_test(seg, c_out, forced_lambda, later=None, p=ASYM_P):
+    """Decide whether this decay was heading for outdoor air, and re-fit it if not.
+
+    Nested models, one extra parameter, so an F-test is the right instrument:
+    F = (RSS_forced - RSS_free) / (RSS_free / (n - 3)). Adopting the free asymptote
+    needs both significance and substance - a fitted asymptote a few ppm above c_out
+    is within what the sensor can resolve and is not worth a parameter.
+
+    Returns {"free": bool, ...} describing the model that won.
+    """
+    free = fit_decay_free(seg, c_out)
+    if free is None:
+        return {"free": False, "reason": "no free-asymptote fit converged"}
+    rss_forced = _rss_forced(seg, c_out, forced_lambda)
+    dof = free["n"] - 3
+    if dof < 2 or free["rss"] <= 0:
+        return {"free": False, "reason": "too few samples to spend a parameter on"}
+    f_stat = (rss_forced - free["rss"]) / (free["rss"] / dof)
+    p_value = float(stats.f.sf(f_stat, 1, dof)) if f_stat > 0 else 1.0
+    above = free["c_inf"] - c_out
+    out = {"c_inf": free["c_inf"], "lambda_h": free["lambda_h"], "r2": free["r2"],
+           "stderr": free["stderr"], "f": float(f_stat), "p": p_value,
+           "above_c_out": above}
+    went = _asymptote_contradicted(free["c_inf"], later, seg.dropna().index[-1])
+    if above < ASYM_MIN_ABOVE:
+        out["free"] = False
+        out["reason"] = "asymptote sits within sensor noise of outdoor air"
+    elif went is not None:
+        out["free"] = False
+        out["reason"] = (f"the room later reached {went:.0f} ppm, below the "
+                         f"{free['c_inf']:.0f} ppm this fit called its floor")
+    elif p_value > p:
+        out["free"] = False
+        out["reason"] = f"forcing the asymptote to c_out fits as well (p={p_value:.3f})"
+    else:
+        out["free"] = True
+        out["reason"] = (f"settles at {free['c_inf']:.0f} ppm, not outdoor air "
+                         f"(F={f_stat:.1f}, p={p_value:.2g})")
+    return out

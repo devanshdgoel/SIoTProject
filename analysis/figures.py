@@ -406,9 +406,6 @@ def main(outdir=None):
         print(f"  {p.name}  {p.stat().st_size // 1024} kB")
 
 
-if __name__ == "__main__":
-    main(sys.argv[1] if len(sys.argv) > 1 else None)
-
 
 def fig_estimators(db, out):
     """Three independent routes to the same lambda, and what each one looks at.
@@ -513,11 +510,13 @@ def _minutes_from(series, origin_ts):
 def fig_openings(db, out, location="bedroom"):
     """Every deliberate window opening on one clock, each curve named by its wind.
 
-    The two bedroom tests are the same window in the same room and behave nothing
-    alike: 4.55 air changes an hour in 3.7 m/s against 0.87 in 0.8 m/s. On a common
-    axis the difference is not subtle, and the lower panel rules out the obvious
-    alternative - the still night had the LARGER indoor-outdoor temperature
-    difference, so buoyancy on its own predicts the opposite ordering.
+    The two bedroom tests are the same window in the same room: 4.55 air changes an
+    hour in 3.7 m/s against 2.58 in 0.75 m/s. A factor of 1.8 for a factor of five in
+    wind, which is the measurement that refuted proportionality through the origin -
+    and the lower panel says why. The still night had the LARGER indoor-outdoor
+    difference, 9.3 C against 6.1, so buoyancy was working harder on the night the
+    wind was doing nothing. An open window here is a stack-driven opening that wind
+    adds to, not a wind-driven one.
 
     CO2 is drawn as excess above the outdoor baseline, as a percentage of the excess
     at the peak. That is not cosmetic. A first-order room obeys
@@ -537,18 +536,20 @@ def fig_openings(db, out, location="bedroom"):
     first half hour and cross 1/e within six minutes of each other, which cannot be
     reconciled with air-change rates five times apart.
 
-    The 6 Nov trace is not a single exponential. It falls steeply from 1141 ppm for
-    about 35 minutes and only then settles into the slow decay the fit describes.
-    That opening plunge is a breath plume dispersing past the sensor after the
-    occupant left - mixing within the room, not exchange with outside - and it obeys
-    no air-change rate at all. best_decay_fit trims it by searching start offsets,
-    which is exactly right; anchoring on the peak puts it back and makes a still
-    night look like a breezy one.
+    The 6 Nov curve does not reach zero, and that is the second finding rather than
+    a defect in the measurement. It flattens around 35% of its starting excess, which
+    in ppm is about 480 - close to the living room's own resting level and nowhere
+    near the 358 ppm outside. With the window open on a still night the air replacing
+    the bedroom's was mostly coming through the door from the rest of the flat, not
+    in through the window. Each curve is therefore drawn against the asymptote its
+    own fit found, marked where it differs from outdoor air.
 
-    So the reference is the point from which the room genuinely behaves as first
-    order. What precedes it is drawn faintly rather than hidden, because the reason
-    for the trim is itself worth seeing, and the 4 Nov opening shows how little gets
-    trimmed when no plume is involved.
+    This was originally read as a two-phase decay with a breath plume in front of it.
+    It is not: the sensor is far from where the occupant sleeps, and fitting the same
+    trace with the asymptote left free gives one clean exponential at r2 = 0.999. The
+    arc that looked like a second phase was the residual of forcing the curve down to
+    a floor the room was never heading for. Lead-in that the fit trims is still drawn
+    faintly, because how much had to be trimmed is worth seeing.
     """
     labels = db.labels(location=location)
     events = sorted((lb for lb in labels
@@ -597,7 +598,7 @@ def fig_openings(db, out, location="bedroom"):
         if fit is not None:
             name += f",  λ = {fit['lambda_h']:.2f}/h"
             if trimmed >= 10:
-                name += f"\n        (first {trimmed:.0f} min trimmed: not first order)"
+                name += f"\n        (fit starts {trimmed:.0f} min after the peak)"
 
         # Excess above the baseline, as a share of the excess where the fit begins.
         # Guard the division: a room already sitting on outdoor air has no excess to
@@ -625,9 +626,25 @@ def fig_openings(db, out, location="bedroom"):
             span = co2.loc[ts(fit["start_ts"]):ts(fit["end_ts"])]
             if span.size >= 3:
                 x = _minutes_from(span, origin)
-                model = excess0 * np.exp(-fit["lambda_h"] * x / 60.0)
+                # Each curve is drawn against the asymptote its own fit found, not
+                # against outdoor air. That is the whole correction: an opening that
+                # settles on house air is not a slow approach to outdoors, and a
+                # model curve aimed at zero would hide exactly the discrepancy the
+                # axis is here to show.
+                c_inf = (float(fit["c_inf"]) if fit["c_inf"] is not None else base)
+                model = (c_inf - base) + (at_origin - c_inf) * np.exp(
+                    -fit["lambda_h"] * x / 60.0)
                 ax_c.plot(x, model / excess0 * 100.0, color=colour, lw=1.0,
                           ls=(0, (4, 3)), alpha=.9, zorder=4)
+                floor = (c_inf - base) / excess0 * 100.0
+                if floor > 4.0:
+                    ax_c.axhline(floor, color=colour, lw=1.0, ls=(0, (1, 2)),
+                                 alpha=.65, zorder=1.5)
+                    ax_c.annotate(f"settles at {c_inf:.0f} ppm — house air, "
+                                  f"not outdoors",
+                                  (0.985, floor), xycoords=("axes fraction", "data"),
+                                  xytext=(0, 5), textcoords="offset points",
+                                  ha="right", color=colour, fontsize=7.5)
 
         shut = (ev["end_ts"] - origin) / 60.0
         shut_marks.append((shut, colour))
@@ -695,3 +712,6 @@ def fig_openings(db, out, location="bedroom"):
     fig.tight_layout()
     fig.savefig(out / "09_openings.png", dpi=140)
     plt.close(fig)
+
+if __name__ == "__main__":
+    main(sys.argv[1] if len(sys.argv) > 1 else None)

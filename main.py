@@ -216,8 +216,15 @@ def cmd_params(args, db):
         # An open window is not one number - what it delivers scales with wind - so
         # the pooled lambda_open above is only the fallback. Show the law and what it
         # predicts across the wind speeds this room was actually aired in.
-        law = model.open_wind
-        if law:
+        law = model.open_wind_fit
+        if law and law.get("refuted"):
+            print(f"  open-window law   REFUTED by this room's own openings")
+            print(f"  {'':18s}{law['refuted']}")
+            print(f"  {'':18s}tried lambda = {law['k']:.3f} x wind, r2={law['r2']:.4f}, "
+                  f"n={law['n']}; using the pooled median instead")
+            if law.get("mixed_note"):
+                print(f"  {'':18s}{law['mixed_note']}")
+        elif law and "k" in law:
             lo, hi = law["wind_range"]
             print(f"  open-window law   lambda = {law['k']:.3f} +/-{law['stderr']:.3f} "
                   f"x wind   r2={law['r2']:.4f}  n={law['n']}")
@@ -228,6 +235,8 @@ def cmd_params(args, db):
                 print(f"  {'':18s}wind {v:4.1f} m/s -> {model.lambda_open_at(v)[0]:5.2f}/h")
             if law.get("provisional"):
                 print(f"  {'':18s}provisional: {law['provisional']}")
+            if law.get("mixed_note"):
+                print(f"  {'':18s}{law['mixed_note']}")
         else:
             print("  open-window law   not yet: needs two labelled window openings "
                   "at different wind speeds")

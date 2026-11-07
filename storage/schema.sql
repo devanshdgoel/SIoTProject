@@ -180,6 +180,8 @@ CREATE TABLE IF NOT EXISTS decay_events (
     c_start   REAL,
     c_end     REAL,
     c_out     REAL,
+    c_inf     REAL,                       -- what the decay was actually heading for
+    asym_note TEXT,                       -- why that is, or is not, outdoor air
     delta_t_c REAL,                       -- indoor minus outdoor at the time
     wind_ms   REAL,
     labelled  TEXT,                       -- window state from labels, if one covers it
