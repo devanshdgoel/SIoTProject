@@ -27,6 +27,7 @@ Notes for the real deployment:
 
 import hmac
 import json
+import logging
 import math
 import os
 import queue
@@ -38,6 +39,8 @@ from pathlib import Path
 
 from collectors.base import CollectResult, CollectorError, NotConfigured, Observation
 from config import settings
+
+log = logging.getLogger(__name__)
 
 SOURCE = "scd40"
 SAMPLE_PERIOD_S = 5
@@ -148,10 +151,69 @@ def _clean(s, n):
     return re.sub(r'[^ -~]|["\\]', "", str(s))[:n]
 
 
-def _display_for_node(row):
+def _display_for_node(row, info=None):
     """db.latest_display() row -> the pet state sent back in the /ingest reply."""
-    return None if row is None else {"expression": _clean(row["expression"], 15),
-                                     "message": _clean(row["message"], 40)}
+    if row is None and not info:
+        return None
+    out = {"expression": _clean(row["expression"], 15) if row is not None else "",
+           "message": _clean(row["message"], 40) if row is not None else ""}
+    if info:
+        out["info"] = info
+    return out
+
+
+# The info screen is recomputed on this interval rather than every minute: the
+# purge search evaluates 144 start times against the forecast, which is cheap but
+# not free, and the answer does not change in sixty seconds.
+INFO_EVERY_S = 300
+
+
+def _info_lines(db, location):
+    """Four short lines for the node's double-tap screen, or [] if nothing to say.
+
+    The node renders these and interprets none of them, which is the right split:
+    deciding what is worth saying needs the room model, the weather forecast and
+    the air-quality feed, and none of those belong on a microcontroller. The node's
+    job is to show whatever the host last said, and to keep showing it when the
+    host goes quiet.
+
+    Kept to 22 characters so nothing is clipped at the 6x10 font's 21 columns.
+    """
+    import datetime as _dt
+
+    lines = []
+    try:
+        from analysis.room_model import RoomModel
+        from analysis.ventilation import plan_purge
+
+        aqi = db.latest("european_aqi", "home")
+        pm = db.latest("pm2_5", "home")
+        bits = []
+        if aqi is not None and aqi["value"] is not None:
+            bits.append(f"AQI {aqi['value']:.0f}")
+        if pm is not None and pm["value"] is not None:
+            bits.append(f"PM2.5 {pm['value']:.0f}")
+        lines.append("out: " + (", ".join(bits) if bits else "no data"))
+
+        co2 = db.latest("co2_ppm", location)
+        if co2 is not None and co2["value"] is not None:
+            lines.append(f"{location[:8]} {co2['value']:.0f} ppm")
+
+        plan = plan_purge(db, location)
+        best = plan.get("best") if plan else None
+        if best:
+            when = _dt.datetime.fromtimestamp(best["at"], _dt.UTC).astimezone()
+            lines.append(f"air at {when:%H:%M} for {best['duration_min']}m")
+            lines.append(f"-{best['clears_ppm']}ppm {best['heat_cost_c']:+.1f}C")
+        else:
+            lines.append("no good window found")
+    except Exception as e:                           # noqa: BLE001
+        # The info screen must never be able to break ingest. A node that shows a
+        # stale screen is a much smaller problem than a node whose readings stop
+        # being accepted because the advice could not be computed.
+        log.debug("info lines unavailable: %s", e)
+        return []
+    return [_clean(ln, 22) for ln in lines if ln][:4]
 
 
 class HttpBackend:
@@ -179,6 +241,7 @@ class HttpBackend:
         if not token:
             raise NotConfigured("INGEST_TOKEN missing from .env (shared secret for the ESP32)")
         self.queue, self.db, self.pressure, self.display = queue.Queue(), db, None, None
+        self._info, self._info_at = [], 0.0
         backend = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -261,7 +324,11 @@ class HttpBackend:
         if self.db is not None:
             p = self.db.latest("pressure_hpa")
             self.pressure = round(p["value"], 1) if p is not None and p["value"] else None
-            self.display = _display_for_node(self.db.latest_display())
+            now = time.time()
+            if now - self._info_at >= INFO_EVERY_S:
+                self._info = _info_lines(self.db, settings.SCD40_LOCATION)
+                self._info_at = now
+            self.display = _display_for_node(self.db.latest_display(), self._info)
         rows = []
         while True:
             try:

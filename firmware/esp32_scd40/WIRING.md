@@ -15,9 +15,45 @@ flashing; everything below follows from that one digit.
 | OLED | GND | GND |
 | OLED | SDA | GPIO21 |
 | OLED | SCL | GPIO22 |
+| conductive panel | — | GPIO27, through 1 kΩ |
 
 The OLED shares the I2C bus with the SCD40. They have different addresses
 (0x3C for the display, 0x62 for the sensor), so one pair of wires carries both.
+
+### The touch pad
+
+One wire. There is no touch sensor to buy: the ESP32 has a capacitive sensing
+peripheral on ten of its pins, which charges the pin and counts how long it takes
+to discharge. A finger near the electrode adds about a picofarad to ground and the
+count drops. GPIO27 is one of those pins (channel T7), is not a strapping pin, and
+is clear of the I2C pair.
+
+Run the wire from GPIO27 to the conductive panel on the pet's back. Conductive PLA
+is carbon-filled and perfectly conductive enough to be the electrode itself - there
+is nothing to glue on.
+
+Three practical points:
+
+**Put a 1 kΩ resistor in series.** You are connecting an exposed surface that a
+hand touches directly to a GPIO. The resistor costs nothing and is the only thing
+between a static discharge and the SoC. It does not measurably affect the reading.
+
+**Conductive PLA does not solder.** The filament melts long before the joint takes.
+Either pause the print and lay the stripped wire into the part so the next layers
+trap it, or print a small boss and drive a self-tapping screw into it with a ring
+terminal under the head. Keep the contact point close to the panel: a long thin
+printed trace can be tens of kΩ, which blunts the sensitivity.
+
+**Do not use GPIO0, 2, 12 or 15** even though they are touch channels. All four are
+strapping pins read at boot, and GPIO12 sets the flash voltage - holding it high at
+reset can stop the board booting at all.
+
+Nothing needs calibrating by hand. A fixed threshold would not survive the day
+anyway: the untouched count drifts with supply voltage, with the board warming up
+and with humidity, by more than a finger changes it. The firmware tracks the
+untouched level with a 20-second average and thresholds the deviation from it, and
+freezes that baseline while a touch is in progress so a long press does not teach
+it your hand. See `pet_touch.h`.
 
 ## Node 2 — bedroom (SCD40 + PMS5003)
 
@@ -76,6 +112,26 @@ Every sample records nine numbers, not three:
 Particle fields are sent only on the minutes the fan actually ran. The other four
 minutes in five carry no particle fields at all, because absent and zero are
 different claims and zero would mean clean air.
+
+## What the display does
+
+The whole screen is a face: two eyes and a mouth, drawn from parameters rather than
+from six fixed pictures, so a change of mood eases from one expression into the next
+instead of cutting. It blinks on an irregular schedule and its gaze drifts, which is
+not decoration - it is what makes the moments the face IS saying something read as a
+change rather than as a static diagram.
+
+Touching the panel:
+
+| gesture | what happens |
+|---|---|
+| stroke it (hold past ~0.7 s) | up on its hind legs, excited — an expression the air quality can never produce, so it always reads as "that was you" |
+| double tap | an info screen: outdoor AQI and PM2.5, this room's CO2, and the next good moment to air it out, with what that will cost in ppm and degrees. Returns after 12 s, or on a single tap |
+| single tap | it looks at you |
+
+The info screen's content comes from the host, which has the forecast and the room
+model; the node renders the lines and interprets none of them. Until the host has
+replied at least once it says so rather than showing an empty screen.
 
 ## Checking it
 

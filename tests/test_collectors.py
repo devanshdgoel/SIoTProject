@@ -131,8 +131,30 @@ def test_ingest_reply_carries_pet_display_to_the_node(db):
     db.set_display("concerned", 'open a window "now"\x01', mode="test")
     b.drain()                                    # the collector thread refreshes the reply payload
     d = requests.post(url, headers=hdr, json={"readings": [r]}).json()["display"]
-    assert d == {"expression": "concerned", "message": "open a window now"}   # quotes/controls stripped
+    assert d["expression"] == "concerned"
+    assert d["message"] == "open a window now"       # quotes and controls stripped
+    # The reply may also carry lines for the node's double-tap info screen. They
+    # are optional - a host that cannot compute advice must still accept readings -
+    # but if present they have to fit the panel and survive the node's hand-written
+    # parser, which means no quotes and no backslashes.
+    for line in d.get("info", []):
+        assert len(line) <= 22
+        assert '"' not in line and "\\" not in line
     b.server.shutdown()
+
+
+def test_the_info_screen_never_breaks_ingest(db):
+    """Advice is a nicety; accepting readings is not. A failure computing the one
+    must not cost the other, so _info_lines swallows everything and returns []."""
+    assert scd40._info_lines(None, "desk") == []
+
+
+def test_info_lines_fit_the_panel(db):
+    """21 columns at the 6x10 font, so 22 characters is the hard limit."""
+    lines = scd40._info_lines(db, "desk")
+    assert len(lines) <= 4
+    for line in lines:
+        assert len(line) <= 22, line
 
 
 def test_http_backend_requires_token(monkeypatch):
