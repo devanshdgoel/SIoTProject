@@ -393,7 +393,8 @@ def main(outdir=None):
     for name, fn in (("overview", fig_overview), ("colocation", fig_colocation),
                      ("decays", fig_decays), ("occupancy", fig_occupancy),
                      ("forecast", fig_forecast), ("nights", fig_nights),
-                     ("cooking", fig_cooking)):
+                     ("cooking", fig_cooking), ("estimators", fig_estimators),
+                     ("openings", fig_openings)):
         try:
             fn(db, out)
             made.append(name)
@@ -495,3 +496,142 @@ def fig_estimators(db, out):
     fig.savefig(path, dpi=140); plt.close(fig)
     print(f"  {path.name}  {path.stat().st_size//1024} kB")
     return path
+
+
+PRE_MIN, POST_MIN = 20, 25       # context either side of the opening
+SEARCH_MIN = 45                  # how far from a reported time to hunt the peak
+
+
+def _minutes_from(series, origin_ts):
+    """Index as minutes since `origin_ts`, so two events on different days overlay."""
+    secs = series.index.astype("int64") // 10 ** 9
+    return (secs - int(origin_ts)) / 60.0
+
+
+def fig_openings(db, out, location="bedroom"):
+    """Every deliberate window opening on one clock, each curve named by its wind.
+
+    The two bedroom tests are the same window in the same room and behave nothing
+    alike: 4.55 air changes an hour in 3.7 m/s against 0.87 in 0.8 m/s. On a common
+    axis the difference is not subtle, and the lower panel rules out the obvious
+    alternative - the still night had the LARGER indoor-outdoor temperature
+    difference, so buoyancy on its own predicts the opposite ordering.
+
+    Zero is the CO2 peak - the moment the room began to clear - and not the reported
+    time, which is rounded, nor the fitted start, which is trimmed. All three differ
+    here. The 4 Nov opening was reported as 20:00 and the air began moving at 19:30;
+    the 6 Nov fit starts at 22:35 because the offset search dropped a transient, but
+    the room peaked at 1162 ppm at 22:00 and anchoring on the fit would cut away a
+    third of its decay. The peak is the one anchor that is measured, untrimmed, and
+    means the same thing for both events.
+    """
+    labels = db.labels(location=location)
+    events = sorted((lb for lb in labels
+                     if lb["kind"] == "window" and lb["value"] == "open"),
+                    key=lambda lb: lb["start_ts"])
+    if not events:
+        raise ValueError(f"no labelled window openings for {location}")
+
+    fits = [r for r in db.decays(location, min_r2=0.9) if r["labelled"] == "open"]
+    stored = db.params(location)
+    c_out = float(stored["c_out"]["value"]) if "c_out" in stored else None
+
+    fig, (ax_c, ax_t) = plt.subplots(2, 1, figsize=(8.6, 7.4), sharex=True,
+                                     gridspec_kw={"height_ratios": [1.3, 1]})
+    palette = ["#4f93e8", "#e2a23b", "#3fb97f", "#b07ae0", "#e2574c"]
+    shut_marks = []
+
+    for i, ev in enumerate(events):
+        colour = palette[i % len(palette)]
+        fit = next((r for r in fits
+                    if ev["start_ts"] - 1800 <= r["start_ts"] <= ev["end_ts"]), None)
+        # Look either side of the reported time for where the room actually turned
+        # over. A label is accurate to about a quarter of an hour, so the search is
+        # wider than that and no wider.
+        wide = features.series(db, "co2_ppm", location,
+                               ev["start_ts"] - 3600, ev["end_ts"] + POST_MIN * 60).dropna()
+        if wide.empty:
+            continue
+        near = wide.loc[ts(ev["start_ts"] - SEARCH_MIN * 60):
+                        ts(ev["start_ts"] + SEARCH_MIN * 60)]
+        origin = int((near.idxmax() if not near.empty else wide.index[0]).timestamp())
+        a, b = origin - PRE_MIN * 60, ev["end_ts"] + POST_MIN * 60
+
+        co2 = wide.loc[ts(a):ts(b)]
+        t_in = features.series(db, "indoor_temp_c", location, a, b).dropna()
+        t_out = features.series(db, "outdoor_temp_c", "home", a, b).dropna()
+        if co2.empty:
+            continue
+
+        when = ts(origin).strftime("%d %b %H:%M")
+        gust = (float(fit["wind_ms"]) if fit is not None and fit["wind_ms"] is not None
+                else float("nan"))
+        name = f"{when} — wind {gust:.1f} m/s"
+        if fit is not None:
+            name += f",  λ = {fit['lambda_h']:.2f}/h"
+
+        ax_c.plot(_minutes_from(co2, origin), co2.values, color=colour,
+                  lw=1.9, marker="o", ms=2.6, label=name, zorder=3)
+
+        # The fitted exponential over its own span, to show the model IS the curve
+        # rather than a line drawn near it.
+        if fit is not None and c_out is not None:
+            span = co2.loc[ts(fit["start_ts"]):ts(fit["end_ts"])]
+            if span.size >= 3:
+                x = _minutes_from(span, origin)
+                excess = float(span.iloc[0]) - c_out
+                model = c_out + excess * np.exp(-fit["lambda_h"] * (x - x[0]) / 60.0)
+                ax_c.plot(x, model, color=colour, lw=1.0, ls=(0, (4, 3)),
+                          alpha=.9, zorder=4)
+
+        shut = (ev["end_ts"] - origin) / 60.0
+        shut_marks.append((shut, colour))
+
+        # --- temperature: indoors only ---------------------------------------
+        # Outdoor sits around 9-11 C against an indoor 15-19, so plotting both on one
+        # axis squeezes the indoor trace into a band too thin to read the cooling off.
+        # The outdoor figure matters as the DIFFERENCE driving that cooling, so it
+        # belongs in the legend as dT rather than as a second line.
+        if not t_in.empty:
+            held = t_in.loc[ts(origin):ts(ev["end_ts"])]
+            outside = float(t_out.mean()) if not t_out.empty else float("nan")
+            if held.size >= 2:
+                # The deepest cooling, not first-minus-last: the 4 Nov opening ran
+                # long enough for the heating to come back on, which would otherwise
+                # score a three-hour airing as a temperature GAIN.
+                lost = float(held.iloc[0] - held.min())
+                dT = float(held.mean()) - outside
+                ax_t.plot(_minutes_from(t_in, origin), t_in.values, color=colour,
+                          lw=1.9, marker="o", ms=2.6, zorder=3,
+                          label=f"{when} — outdoors {outside:.1f} °C, "
+                                f"ΔT {dT:.1f} °C,  fell {lost:.1f} °C")
+
+    if c_out is not None:
+        ax_c.axhline(c_out, color=MUTE, lw=1.1, ls="--", alpha=.75, zorder=1)
+        ax_c.annotate(f"measured outdoor baseline, {c_out:.0f} ppm",
+                      (0.015, c_out), xycoords=("axes fraction", "data"),
+                      xytext=(0, 5), textcoords="offset points",
+                      color=MUTE, fontsize=7.5)
+
+    # Each opening ran for a different length, so the close is marked per event, at
+    # the foot of the axis where it cannot collide with the traces or the legend.
+    for ax in (ax_c, ax_t):
+        ax.axvline(0, color=INK, lw=1.0, alpha=.35, zorder=1)
+        for shut, colour in shut_marks:
+            ax.axvline(shut, color=colour, lw=1.0, ls=":", alpha=.6, zorder=1)
+    lo, hi = ax_c.get_ylim()
+    for shut, colour in shut_marks:
+        ax_c.annotate(f"shut, {shut:.0f} min", (shut, lo), xytext=(4, 6),
+                      textcoords="offset points", color=colour, fontsize=7.5)
+
+    ax_c.set_title(f"the same {location} window, opened twice")
+    ax_c.set_ylabel("CO₂ (ppm)")
+    ax_c.legend(loc="upper right", fontsize=8)
+    ax_t.set_title("indoor temperature over the same openings")
+    ax_t.set_ylabel("temperature (°C)")
+    ax_t.set_xlabel("minutes since the CO₂ peak (0 = measured, not reported)")
+    ax_t.legend(loc="lower left", fontsize=8)
+
+    fig.tight_layout()
+    fig.savefig(out / "09_openings.png", dpi=140)
+    plt.close(fig)

@@ -936,3 +936,62 @@ def test_the_night_plan_changes_with_the_forecast_wind(db):
     breezy = {name: lam for name, lam, _b in options(model, wind=3.7)}
     assert breezy["window wide open"] > 4 * calm["window wide open"]
     assert calm["door and window shut"] == breezy["door and window shut"]
+
+
+# --- the opening-comparison figure -------------------------------------------
+
+def test_the_openings_figure_refuses_without_a_labelled_opening(db, tmp_path):
+    from analysis import figures
+
+    simulate(db, days=1, label=False)
+    with pytest.raises(ValueError, match="no labelled window openings"):
+        figures.fig_openings(db, tmp_path, location="bedroom")
+
+
+def test_the_openings_figure_anchors_on_the_peak_not_the_reported_time(db, tmp_path):
+    """The anchor is what makes two events on different days comparable.
+
+    The room here peaks a quarter of an hour before the time the user reported, the
+    way a real one does. Anchoring on the label would start the curve part-way down
+    its own decay, so the figure has to find the turn itself.
+    """
+    from analysis import figures
+
+    t0 = int(pd.Timestamp("2026-11-06 21:00", tz="UTC").timestamp())
+    peak_at = t0 + 30 * 60
+    top = 600 + 20 * 6
+    obs = []
+    for i in range(48):                       # rise for 30 min, then decay
+        ts_i = t0 + i * 300
+        if ts_i <= peak_at:
+            value = 600 + 20 * i
+        else:
+            value = 360 + (top - 360) * math.exp(-1.2 * (ts_i - peak_at) / 3600)
+        obs.append(Observation("scd40", "co2_ppm", "bedroom", ts_i,
+                               round(value, 1), "measured", "ppm"))
+        obs.append(Observation("scd40", "indoor_temp_c", "bedroom", ts_i,
+                               18.5, "measured", "C"))
+    result = CollectResult("scd40")
+    result.observations = obs
+    db.save_result(result)
+    # reported a quarter of an hour late, as people do
+    db.add_label("bedroom", "window", "open", peak_at + 900, t0 + 47 * 300)
+
+    figures.style()
+    figures.fig_openings(db, tmp_path, location="bedroom")
+    assert (tmp_path / "09_openings.png").exists()
+
+    # the anchor itself, checked directly rather than through the picture
+    wide = features.series(db, "co2_ppm", "bedroom", t0, t0 + 48 * 300).dropna()
+    near = wide.loc[figures.ts(peak_at + 900 - figures.SEARCH_MIN * 60):
+                    figures.ts(peak_at + 900 + figures.SEARCH_MIN * 60)]
+    assert abs(int(near.idxmax().timestamp()) - peak_at) <= 300
+
+
+def test_minutes_from_puts_two_days_on_one_axis(db):
+    from analysis import figures
+
+    idx = pd.date_range("2026-11-04 19:30", periods=4, freq="10min", tz="UTC")
+    got = figures._minutes_from(pd.Series([1.0] * 4, index=idx),
+                                int(idx[0].timestamp()))
+    assert list(got) == [0.0, 10.0, 20.0, 30.0]
