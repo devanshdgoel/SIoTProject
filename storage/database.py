@@ -52,6 +52,10 @@ class Database:
             if column not in have:
                 c.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
 
+        # Heal the NULLs that ALTER TABLE left behind. A counter that starts at
+        # NULL stays at NULL for ever, however many times it is incremented.
+        c.execute("UPDATE device_status SET reboots=0 WHERE reboots IS NULL")
+
         # collector_runs gained an 'empty' status. SQLite cannot alter a CHECK
         # constraint in place, so an older database has to be rebuilt - additively,
         # keeping every row, because the run history is the record of how the
@@ -138,7 +142,11 @@ class Database:
                            up_s=excluded.up_s, heap=excluded.heap,
                            heap_max_block=excluded.heap_max_block,
                            reset_reason=excluded.reset_reason,
-                           reboots=reboots+excluded.reboots""",
+                           -- COALESCE because the column was added to an existing
+                           -- table by ALTER TABLE, which fills old rows with NULL,
+                           -- and NULL + 1 is NULL. The counter sat at NULL for both
+                           -- nodes through every reboot it was built to count.
+                           reboots=COALESCE(reboots,0)+COALESCE(excluded.reboots,0)""",
                       (device, int(time.time()), addr, accepted, rejected, batch,
                        oldest_age_s, up, h.get("heap"), h.get("heap_max_block"),
                        h.get("reset"), rebooted))
