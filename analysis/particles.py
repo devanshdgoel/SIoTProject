@@ -374,6 +374,102 @@ def _check_ordering_rates(sizes):
                               f"no k should be believed from them.")}
 
 
+# Where to look for "outdoor", best first. AURN is real instruments; Open-Meteo is
+# a model on a ~11 km grid and was measuring a third of what the instruments read
+# on the night this was written, so taking whichever is present is not good enough.
+def outdoor_series(db, metric, start, now):
+    """Outdoor particles from the best source available, and which one it was."""
+    for src, kind in (("aurn", "measured"), ("open_meteo", "modelled")):
+        with db.conn() as c:
+            locs = [r[0] for r in c.execute(
+                "SELECT DISTINCT location FROM observations WHERE source=? "
+                "AND metric=? AND quality!='suspect' AND ts>?",
+                (src, metric, start))]
+        best = None
+        for loc in locs:
+            s_ = features.series(db, metric, loc, start, now).dropna()
+            if best is None or s_.size > best[1].size:
+                best = (loc, s_)
+        if best and best[1].size >= 24:
+            return best[1], f"{best[0]} ({kind})"
+    return None, None
+
+
+def calibration_bound(db, location, k_h, lambda_h, days=14, now=None,
+                      metric="pm2_5"):
+    """How much the counter over-reads, bounded by a law it cannot break.
+
+    With the window shut and no indoor source, the steady state is
+
+        P_in / P_out = lambda * p / (lambda + k)
+
+    and p, the fraction of outdoor particles surviving the journey in, cannot
+    exceed 1 - nothing indoors creates particles out of filtered air. So the
+    measured ratio implies a value for p, and any p above 1 is not a discovery
+    about the building, it is an inconsistency in the inputs.
+
+    That makes it a calibration. Against a reference instrument a few kilometres
+    away, with lambda and k measured in this room from two independent tracers, the
+    excess over p = 1 is what the counter is reading high by:
+
+        over-read factor = ratio * (lambda + k) / lambda,   when that exceeds 1
+
+    Low-cost optical counters are known to read high against reference instruments,
+    because they infer size from scattered light and humidity swells the particles.
+    This puts a number on it for THIS unit without co-locating it with anything.
+
+    The alternatives have to be said, because the arithmetic cannot separate them:
+    a residual indoor source during the supposedly quiet hours, a genuinely dirtier
+    street than the reference site, or lambda being underestimated would each
+    produce the same excess. It is an upper bound on the over-read, not a
+    measurement of it.
+    """
+    import time as _time
+
+    now = int(_time.time()) if now is None else int(now)
+    start = now - days * 86400
+    inside = features.series(db, metric, location, start, now).dropna()
+    outside, src = outdoor_series(db, metric, start, now)
+    if inside.size < 24 or outside is None or not lambda_h:
+        return None
+
+    pair = inside.to_frame("in").join(outside.to_frame("out"), how="inner").dropna()
+    pair = pair[pair["out"] > 2.0]
+    if pair.shape[0] < 12:
+        return None
+    pair["ratio"] = pair["in"] / pair["out"]
+    quiet = pair[pair["ratio"] <= pair["ratio"].quantile(0.25)]
+    ratio = float(quiet["ratio"].median()) if not quiet.empty else float(
+        pair["ratio"].median())
+    implied_p = ratio * (lambda_h + k_h) / lambda_h
+
+    out = {"metric": metric, "outdoor_source": src, "n": int(pair.shape[0]),
+           "ratio_in_out": round(ratio, 3), "implied_penetration": round(implied_p, 3),
+           "lambda_h": round(lambda_h, 3), "k_h": round(k_h, 3)}
+    if implied_p <= 1.0:
+        out["over_read"] = None
+        out["note"] = (f"indoors sits at {ratio:.2f} of {src} {metric}; with "
+                       f"lambda={lambda_h:.2f}/h and k={k_h:.2f}/h that implies "
+                       f"{implied_p:.2f} of outdoor particles survive the way in, "
+                       f"which is physically possible and needs no explaining away")
+    else:
+        out["over_read"] = round(implied_p, 2)
+        out["min_true_outdoor"] = round(
+            float(inside.tail(24).median()) * (lambda_h + k_h) / lambda_h, 1)
+        out["note"] = (
+            f"indoors sits at {ratio:.2f} of {src} {metric}, which with "
+            f"lambda={lambda_h:.2f}/h and k={k_h:.2f}/h demands a penetration of "
+            f"{implied_p:.2f}. Penetration cannot exceed 1, so the inputs disagree "
+            f"by {(implied_p - 1) * 100:.0f}%. The likeliest single cause is this "
+            f"counter reading high against the reference instrument - optical "
+            f"sensors infer size from scattered light and humidity swells the "
+            f"particles - but a residual indoor source during the quiet hours, a "
+            f"dirtier street than the reference site, or an underestimated lambda "
+            f"would each look identical. Treat {implied_p:.2f} as an upper bound on "
+            f"the over-read, not a calibration factor to divide by.")
+    return out
+
+
 def penetration(db, location, k_h, lambda_h, days=14, now=None, metric="pm2_5"):
     """Fraction of outdoor particles that survive the journey indoors.
 
@@ -389,8 +485,8 @@ def penetration(db, location, k_h, lambda_h, days=14, now=None, metric="pm2_5"):
     now = int(_time.time()) if now is None else int(now)
     start = now - days * 86400
     inside = features.series(db, metric, location, start, now).dropna()
-    outside = features.series(db, metric, "home", start, now).dropna()
-    if inside.size < 24 or outside.size < 24 or not lambda_h:
+    outside, _src = outdoor_series(db, metric, start, now)
+    if inside.size < 24 or outside is None or outside.size < 24 or not lambda_h:
         return None
 
     pair = inside.to_frame("in").join(outside.to_frame("out"), how="inner").dropna()
@@ -431,16 +527,32 @@ def learn_particles(db, location, days=14, now=None):
         return out
 
     fine = out["sizes"].get("pm2_5")
-    if out.get("ordered") and fine and fine["k_h"]:
+    # Store unless the ordering test actively FAILED. `None` means it could not
+    # discriminate - an all-fine aerosol gives the three masses nothing to differ
+    # about - and refusing on that would throw away a good measurement for want of
+    # a test that was never applicable. `False` is a real contradiction and still
+    # blocks. The distinction is recorded with the value so nobody has to guess
+    # which kind of silence it was.
+    if out.get("ordered") is not False and fine and fine["k_h"]:
         db.set_param(location, "deposition_k_pm2_5", fine["k_h"], fine["stderr"],
                      fine["n_usable"], "1/h",
                      {"from": f"{fine['events']} particle decay(s) minus the CO2 "
                               f"rate over the same minutes",
+                      "size_test": ("passed" if out.get("ordered")
+                                    else "no power on this aerosol"),
+                      "coarse_share": out.get("coarse_share"),
                       "ordering": out["ordering_note"]})
-        pen = penetration(db, location, fine["k_h"],
-                          model.value["lambda_sealed"], days=days, now=now)
-        if pen:
-            db.set_param(location, "penetration_pm2_5", pen["penetration"], None,
-                         pen["n"], "fraction", pen)
-            out["penetration"] = pen
+        # Penetration, measured against real instruments rather than a model.
+        # Which outdoor source is used is not a detail: the same indoor data
+        # implies p = 1.5 against Open-Meteo's grid and p = 0.79 against the AURN
+        # stations, and only one of those is a number rather than a contradiction.
+        lam = model.value["lambda_sealed"]
+        chk = calibration_bound(db, location, fine["k_h"], lam, days=days, now=now)
+        if chk:
+            out["calibration"] = chk
+            if chk["implied_penetration"] <= 1.0:
+                db.set_param(location, "penetration_pm2_5",
+                             chk["implied_penetration"], None, chk["n"], "fraction",
+                             chk)
+                out["penetration"] = chk["implied_penetration"]
     return out

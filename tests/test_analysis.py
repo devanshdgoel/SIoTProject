@@ -1863,3 +1863,60 @@ def test_refusing_says_how_near_it_came(db):
         assert a["short_by_c"] > 0
         assert a["best_case_c"] < a["floor_c"]
         assert a["duration_min"] in (10, 20, 30, 45, 60)
+
+
+def test_penetration_above_one_is_an_inconsistency_not_a_finding(db):
+    """p is the fraction of outdoor particles surviving the way in, so p > 1 is
+    not a discovery about the building - it means the inputs disagree. Against
+    Open-Meteo's model the real bedroom demanded 1.5; against the AURN
+    instruments the same indoor data gives 0.79. Which outdoor source is used is
+    not a detail."""
+    from analysis.particles import calibration_bound
+
+    now = int(dt.datetime(2026, 11, 9, 0, 0, tzinfo=dt.UTC).timestamp())
+    idx = pd.date_range("2026-11-08 06:00", periods=120, freq="5min", tz="UTC")
+    obs = []
+    for ts in idx:
+        t = int(ts.timestamp())
+        # indoor sits well ABOVE the modelled outdoor and below the measured one
+        obs.append(Observation("open_meteo", "pm2_5", "home", t, 20.0,
+                               "modelled", "ug/m3"))
+        obs.append(Observation("aurn", "pm2_5", "london_n__kensington", t, 60.0,
+                               "measured", "ug/m3"))
+        obs.append(Observation("scd40", "pm2_5", "bedroom", t, 40.0,
+                               "measured", "ug/m3"))
+    res = CollectResult("mix")
+    res.observations = obs
+    db.save_result(res)
+
+    got = calibration_bound(db, "bedroom", k_h=0.08, lambda_h=0.27, days=3, now=now)
+    assert got is not None
+    # the real instruments must be preferred over the model
+    assert "aurn" in got["outdoor_source"] or "kensington" in got["outdoor_source"]
+    # 40/60 = 0.667, times (0.27+0.08)/0.27 = 1.296 -> 0.86, physically possible
+    assert got["implied_penetration"] == pytest.approx(0.86, abs=0.05)
+    assert got["over_read"] is None
+    assert "physically possible" in got["note"]
+
+
+def test_an_impossible_penetration_is_reported_as_an_over_read(db):
+    from analysis.particles import calibration_bound
+
+    now = int(dt.datetime(2026, 11, 9, 0, 0, tzinfo=dt.UTC).timestamp())
+    idx = pd.date_range("2026-11-08 06:00", periods=120, freq="5min", tz="UTC")
+    obs = []
+    for ts in idx:
+        t = int(ts.timestamp())
+        obs.append(Observation("aurn", "pm2_5", "london_n__kensington", t, 40.0,
+                               "measured", "ug/m3"))
+        obs.append(Observation("scd40", "pm2_5", "bedroom", t, 50.0,
+                               "measured", "ug/m3"))   # indoor ABOVE outdoor: impossible
+    res = CollectResult("mix")
+    res.observations = obs
+    db.save_result(res)
+
+    got = calibration_bound(db, "bedroom", k_h=0.08, lambda_h=0.27, days=3, now=now)
+    assert got["implied_penetration"] > 1.0
+    assert got["over_read"] == pytest.approx(got["implied_penetration"])
+    assert "upper bound on the over-read" in got["note"]
+    assert "would each look identical" in got["note"]      # names the alternatives
