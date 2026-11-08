@@ -591,6 +591,15 @@ static void petIdle(uint32_t ms) {
     faceTick(now, dt);
 
     if (now - lastFrameMs >= FRAME_MS) { lastFrameMs = now; petRender(now); }
+#if HAS_PMS
+    // A node with both a face and a counter spends almost all of its time in
+    // here, and the counter still has to be serviced. pmsPoll() at the top of
+    // loop() alone would run eight times across the fan's eight-second listen
+    // window instead of the thirty-odd it expects, so it would median over half
+    // the frames it could have had. It is non-blocking, so calling it every few
+    // milliseconds costs nothing and keeps the two features independent.
+    pmsPoll();
+#endif
     delay(4);
   }
 }
