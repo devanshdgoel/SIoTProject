@@ -1772,3 +1772,94 @@ def test_penetration_is_recovered_from_a_quiet_stretch(db):
     got = particles.penetration(db, "bedroom", k_h=k, lambda_h=lam, days=5, now=now)
     assert got is not None
     assert got["penetration"] == pytest.approx(p, abs=0.12), got
+
+
+# --- advice that says how firm it is ------------------------------------------
+
+def test_a_tie_is_reported_as_a_tie(db):
+    """The complaint was "the suggestion keeps changing". It was not changing its
+    mind - dozens of start times scored within one percent of each other and the
+    winner hopped between them as the forecast refreshed. Reporting only the
+    winner made a tie look like a decision."""
+    from analysis.ventilation import plan_purge
+
+    now = simulate(db, days=3)
+    learn(db, "bedroom", days=4, now=now)
+    # flat forecast: nothing distinguishes one hour from another, so every start
+    # time must come out equivalent and the planner has to say so.
+    obs = []
+    for h in range(14):
+        ts = now + h * 3600
+        for metric, value, unit in (("outdoor_temp_c", 18.0, "C"),
+                                    ("wind_ms", 2.0, "m/s"),
+                                    ("pm2_5", 8.0, "ug/m3")):
+            obs.append(Observation("open_meteo", metric, "home", ts, value,
+                                   "forecast", unit))
+    res = CollectResult("open_meteo")
+    res.observations = obs
+    db.save_result(res)
+
+    plan = plan_purge(db, "bedroom", now=now, horizon_h=6.0)
+    if plan.get("best"):
+        assert plan["timing"] == "interchangeable", plan.get("timing_note")
+        assert plan["margin_rel"] < 0.05
+        assert "has not changed its mind" in plan["timing_note"]
+
+
+def test_the_cost_terms_are_reported_separately(db):
+    """Three quantities in different units combined with hand-chosen weights. The
+    least a reader is owed is which of them decided the answer."""
+    from analysis.ventilation import plan_purge
+
+    now = simulate(db, days=3)
+    learn(db, "bedroom", days=4, now=now)
+    obs = []
+    for h in range(14):
+        ts = now + h * 3600
+        for metric, value, unit in (("outdoor_temp_c", 17.0, "C"),
+                                    ("wind_ms", 2.0, "m/s"),
+                                    ("pm2_5", 5.0, "ug/m3")):
+            obs.append(Observation("open_meteo", metric, "home", ts, value,
+                                   "forecast", unit))
+    res = CollectResult("open_meteo")
+    res.observations = obs
+    db.save_result(res)
+
+    plan = plan_purge(db, "bedroom", now=now, horizon_h=6.0)
+    if plan.get("best"):
+        t = plan["terms"]
+        assert set(t) >= {"co2_benefit", "heat_cost", "pm_cost", "total", "dominant"}
+        assert t["dominant"] in ("clearing CO2", "losing heat",
+                                 "letting particles in")
+        # the parts have to add up to the whole, or the decomposition is decorative
+        assert t["co2_benefit"] + t["heat_cost"] + t["pm_cost"] == pytest.approx(
+            t["total"], abs=0.01)
+
+
+def test_refusing_says_how_near_it_came(db):
+    """"Nothing is warm enough" is true and useless: it does not distinguish
+    missing the comfort floor by a tenth of a degree from missing it by five, and
+    those call for different decisions. It is also exactly where the advice goes
+    unstable, since a candidate on the boundary flips with every refresh."""
+    from analysis.ventilation import plan_purge
+
+    now = simulate(db, days=3)
+    learn(db, "bedroom", days=4, now=now)
+    obs = []
+    for h in range(14):                        # bitterly cold: nothing can qualify
+        ts = now + h * 3600
+        for metric, value, unit in (("outdoor_temp_c", -8.0, "C"),
+                                    ("wind_ms", 3.0, "m/s"),
+                                    ("pm2_5", 5.0, "ug/m3")):
+            obs.append(Observation("open_meteo", metric, "home", ts, value,
+                                   "forecast", unit))
+    res = CollectResult("open_meteo")
+    res.observations = obs
+    db.save_result(res)
+
+    plan = plan_purge(db, "bedroom", now=now, horizon_h=6.0)
+    if plan.get("best") is None and plan.get("all_too_cold"):
+        a = plan["all_too_cold"]
+        assert a["short_by_c"] > 0
+        assert a["best_case_c"] < a["floor_c"]
+        assert a["duration_min"] in (10, 20, 30, 45, 60)

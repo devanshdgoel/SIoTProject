@@ -832,15 +832,55 @@ def cmd_ventilate(args, db):
     purge = ventilation.plan_purge(db, args.room, horizon_h=args.horizon)
     b = purge.get("best")
     print()
+
+    def _when(mins):
+        return time.strftime("%H:%M", time.localtime(time.time() + mins * 60))
+
     if b:
         print(f"  cheapest airing in the next {args.horizon:.0f} h "
-              f"({purge['evaluated']} options tried):")
-        print(f"    in {b['in_minutes']} min, for {b['duration_min']} min "
-              f"-> clears {b['clears_ppm']} ppm, costs {b['heat_cost_c']} C "
-              f"(outdoor {b['t_out']} C, PM2.5 {b['pm25']})")
-        print(f"    using the open-window rate {purge['lambda_open']}/h ({purge['basis']})")
+              f"({purge['evaluated']} options tried, "
+              f"{purge.get('rejected_too_cold', 0)} rejected as too cold):")
+        print(f"    {_when(b['in_minutes'])} (in {b['in_minutes']} min) for "
+              f"{b['duration_min']} min")
+        print(f"      clears {b['clears_ppm']} ppm | costs {b['heat_cost_c']} C | "
+              f"lets in {b['intake_ug_h']} ug.h/m3 of PM2.5")
+        print(f"      conditions then: {b['t_out']} C out, PM2.5 {b['pm25']}, "
+              f"rate {b['lambda_open']}/h ({b['basis']})")
+
+        # What actually decided it. Three terms in different units, combined with
+        # weights that are an opinion; naming the dominant one stops the number
+        # being read as more objective than it is.
+        t = purge.get("terms")
+        if t:
+            print(f"      the choice turns on {t['dominant']} "
+                  f"(CO2 {t['co2_benefit']:+.2f}, heat {t['heat_cost']:+.2f}, "
+                  f"PM {t['pm_cost']:+.2f}, total {t['total']:+.2f})")
+
+        # How firm it is. This is the part that was missing while the advice
+        # appeared to change its mind: dozens of candidates sit within a hair of
+        # each other and the winner hops between them as the forecast shifts.
+        if purge.get("timing"):
+            rel = purge.get("margin_rel")
+            extra = f", margin {rel:.0%}" if rel is not None else ""
+            print(f"    timing: {purge['timing']} "
+                  f"({purge.get('stability', 0):.0%} of cost weightings agree{extra})")
+            print(f"      {purge['timing_note']}")
+        if purge.get("margin") is not None:
+            print(f"      next materially different option is "
+                  f"{_when(purge['runner_up_in_minutes'])}, worse by "
+                  f"{purge['margin']:.2f}")
+        for a in (purge.get("alternatives") or []):
+            print(f"    also: {_when(a['in_minutes'])} for {a['duration_min']} min "
+                  f"-> {a['clears_ppm']} ppm, {a['heat_cost_c']} C "
+                  f"(cost {a['cost']:+.2f})")
+    elif purge.get("all_too_cold"):
+        a = purge["all_too_cold"]
+        print(f"  nothing worth doing in the next {args.horizon:.0f} h:")
+        print(f"    {a['note']}")
+        print(f"    if you will accept {a['best_case_c']} C, that is "
+              f"{a['duration_min']} min at {_when(a['in_minutes'])}.")
     else:
-        print("  no airing in the next window would leave the room warm enough")
+        print("  no airing options could be scored (no outdoor forecast?)")
 
 
 def cmd_dashboard(args, db):
