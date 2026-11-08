@@ -78,16 +78,14 @@ def pm_decays(series, min_minutes=MIN_PM_MINUTES, min_drop=MIN_PM_DROP,
     if s.size < 8:
         return []
     smooth = s.rolling(3, center=True, min_periods=1).median()
-    out, start = [], None
-    for i in range(1, len(smooth)):
-        falling = smooth.iloc[i] < smooth.iloc[i - 1]
-        if falling and start is None:
-            start = i - 1
-        elif not falling and start is not None:
-            out.append((start, i - 1))
-            start = None
-    if start is not None:
-        out.append((start, len(smooth) - 1))
+    # Bridge the wobble. Particle counts are far noisier than CO2 - the counter
+    # samples a tenth of a litre and Poisson noise alone moves it several percent
+    # - so a real decay ticks upward every few samples. Splitting the run there
+    # turns one eight-hour clearance into forty fragments, none long enough to
+    # fit, which is exactly what happened to the first night of data this saw.
+    falling = (smooth.diff() <= 0).fillna(False)
+    out = [(s.index.get_loc(a), s.index.get_loc(b))
+           for a, b in features._runs(falling, bridge=3)]
 
     keep = []
     for a, b in out:
@@ -142,6 +140,66 @@ def _lambda_during(db, location, start_ts, end_ts, model=None):
     span = max(float(end_ts - start_ts), 1.0)
     if best is not None and overlap / span >= 0.5:
         return float(best["lambda_h"]), "measured CO2 decay over the same minutes"
+
+    # No decay, but a particle event does not need the room to be empty - and the
+    # best one so far happened while someone slept through it. An occupied rise
+    # over the same hours measures the same lambda and is often the better curve:
+    # last night's was r2 = 0.999 over five hours against a pooled value standing
+    # on eleven mixed events.
+    import pandas as _pd
+
+    co2 = features.series(db, "co2_ppm", location,
+                          start_ts - 1800, end_ts + 1800).dropna()
+    seg = co2.loc[_pd.Timestamp(start_ts, unit="s", tz="UTC"):
+                  _pd.Timestamp(end_ts, unit="s", tz="UTC")]
+    # The RISING LIMB of the window, not the whole of it. A particle decay can
+    # easily outlast the occupancy that started it - last night's ran from 02:35
+    # to 11:25 while the sleeper left around 08:00 - so the window contains a rise
+    # and then a fall, and fitting one exponential across both describes neither.
+    # The climb to the peak is the part that measures lambda.
+    # ...and only the OCCUPIED part of that limb. fit_rise assumes a source running
+    # from the first sample, so a flat lead-in before anyone came in breaks it: last
+    # night the window opened at 02:35 and the sleeper arrived near 03:30, and
+    # fitting from 02:35 gave lambda 0.068 with a 9611 ppm ceiling - a fit the
+    # `covered` gate correctly refused. Intersecting with the occupancy the room
+    # itself reports turns the same data into r2 = 0.999.
+    labels = db.labels(location=location, start=start_ts - 86400, end=end_ts + 3600)
+    for occ_a, occ_b in features.occupied_windows(db, location, labels,
+                                                  start_ts - 3600, end_ts + 3600):
+        a = max(occ_a, start_ts)
+        b = min(occ_b, end_ts)
+        if b - a < 3 * 3600:
+            continue
+        limb = co2.loc[_pd.Timestamp(a, unit="s", tz="UTC"):
+                       _pd.Timestamp(b, unit="s", tz="UTC")]
+        if limb.size < 24:
+            continue
+        rise = features.fit_rise(limb, model.value["c_out"] if model else 400.0)
+        if rise and rise["r2"] >= 0.95 and rise.get("covered", 0) >= 0.5:
+            return float(rise["lambda_h"]), "CO2 rise of the occupancy inside it"
+
+    # Last resort, and the one that actually fires: the room's own climb, with the
+    # lead-in trimmed by searching start offsets exactly as best_decay_fit does.
+    #
+    # This is needed more often than it should be. Occupancy is taken from labels
+    # and from ring sleep sessions, and the ring publishes a night only after it
+    # syncs - so the morning after the best particle event this project has
+    # recorded, the system had no idea anyone had been in the room, while the CO2
+    # trace went from 553 to 3469 ppm. A rise like that is not ambiguous evidence
+    # of occupancy; it just was not being read as any.
+    limb = seg.loc[:seg.idxmax()]
+    best = None
+    for frac in (0.0, 0.1, 0.2, 0.3, 0.4):
+        part = limb.iloc[int(len(limb) * frac):]
+        if part.size < 24:
+            continue
+        rise = features.fit_rise(part, model.value["c_out"] if model else 400.0)
+        if rise is None or rise["r2"] < 0.95 or rise.get("covered", 0) < 0.5:
+            continue
+        if best is None or rise["covered"] > best["covered"]:
+            best = rise
+    if best is not None:
+        return float(best["lambda_h"]), "CO2 rise inside the same window"
     if model is not None:
         return float(model.value["lambda_sealed"]), "the room's pooled lambda_sealed"
     return None, "no CO2 rate available"
@@ -162,13 +220,31 @@ def deposition(db, location, days=14, now=None, model=None):
     start = now - days * 86400
     out = {"location": location, "sizes": {}, "events": 0}
 
+    # One window for all three sizes.
+    #
+    # Detecting a decay separately per size is wrong for the one comparison that
+    # matters. The sizes are noisier at the coarse end, so their runs start and end
+    # at different times, and the first version of this fitted PM2.5 over 530
+    # minutes and PM10 over 375 - then compared the rates as if they described the
+    # same event. They did not, and the "wrong" ordering it produced was an artefact
+    # of the windows rather than a finding about the room.
+    #
+    # PM2.5 picks the window: it is the best-conditioned of the three, high enough
+    # above the counter's noise to give a clean run and fine enough not to be
+    # dominated by a few coarse counts.
+    pivot = features.series(db, "pm2_5", location, start, now)
+    windows = pm_decays(pivot) if pivot.dropna().size >= 12 else []
+
     for metric, micron in PM_SIZES:
-        s = features.series(db, metric, location, start, now)
-        if s.dropna().size < 12:
+        s_ = features.series(db, metric, location, start, now)
+        if s_.dropna().size < 12:
             continue
         ks, rows = [], []
-        for a, b in pm_decays(s):
-            fit = fit_pm_decay(s.loc[a:b])
+        for a, b in windows:
+            seg = s_.loc[a:b].dropna()
+            if seg.size < 6:
+                continue
+            fit = fit_pm_decay(seg)
             if fit is None:
                 continue
             lam, basis = _lambda_during(db, location, int(a.timestamp()),
@@ -180,6 +256,7 @@ def deposition(db, location, days=14, now=None, model=None):
                          "lambda_h": round(lam, 3), "k_h": round(k, 3),
                          "floor": round(fit["floor"], 1), "r2": round(fit["r2"], 4),
                          "peak": round(fit["peak"], 1), "basis": basis,
+                         "minutes": round((b - a).total_seconds() / 60),
                          "start_ts": int(a.timestamp())})
             # A negative k means particles left SLOWER than the air did, which is
             # impossible: deposition can only add to the loss. Kept in the record
@@ -192,8 +269,12 @@ def deposition(db, location, days=14, now=None, model=None):
                                     "k_h": med, "stderr": err, "n_usable": n,
                                     "negative": len(rows) - n, "fits": rows}
             out["events"] += len(rows)
+    out["window_minutes"] = [round((b - a).total_seconds() / 60) for a, b in windows]
 
-    out.update(_check_ordering(out["sizes"]))
+    power = _ordering_power(db, location, windows)
+    if power:
+        out["coarse_share"] = power["coarse_share"]
+    out.update(_check_ordering(out["sizes"], power))
     return out
 
 
@@ -209,7 +290,56 @@ def _robust_k(values):
     return round(med, 3), round(float(1.253 * sd / np.sqrt(a.size)), 3), int(a.size)
 
 
-def _check_ordering(sizes):
+# Below this the three masses are all measuring the same fine aerosol and no
+# ordering can be resolved, however good the fits are. Expressed as the share of
+# PM10 mass that is coarse (above 2.5 um).
+MIN_COARSE_SHARE = 0.25
+
+
+def _ordering_power(db, location, windows):
+    """Is there enough coarse material for the size test to mean anything?
+
+    The falsification only works if the three masses describe genuinely different
+    particles. A combustion or cooking aerosol is almost entirely sub-micron, so
+    PM1, PM2.5 and PM10 are three views of one population and their decay rates
+    MUST come out nearly equal - whatever the room is doing.
+
+    Last night is the case in point: 16% of PM10 mass was coarse and 0.56% of the
+    counts were above 2.5 um. The rates duly came out 0.32 and 0.29 with PM10 a
+    shade SLOWER, which would have been reported as "deposition does not rise with
+    size, so these are fits to noise". That verdict would have been wrong. The test
+    had no power to begin with, and a test that reports failure when it cannot
+    discriminate is as misleading as one that cannot fail.
+    """
+    import pandas as _pd
+
+    if not windows:
+        return None
+    fine = features.series(db, "pm2_5", location)
+    coarse = features.series(db, "pm10", location)
+    a, b = windows[0][0], windows[-1][1]
+    j = _pd.DataFrame({"f": fine, "c": coarse}).dropna().loc[a:b]
+    if j.empty or float(j["c"].median()) <= 0:
+        return None
+    share = float(((j["c"] - j["f"]) / j["c"]).median())
+    return {"coarse_share": round(share, 3), "enough": share >= MIN_COARSE_SHARE}
+
+
+def _check_ordering(sizes, power=None):
+    if power is not None and not power.get("enough", True):
+        return {"ordered": None, "power": power,
+                "ordering_note": (
+                    f"only {power['coarse_share'] * 100:.0f}% of PM10 mass is coarse, "
+                    f"so all three sizes are measuring the same fine aerosol and "
+                    f"their rates must come out nearly equal whatever the room does. "
+                    f"The size test has no power here - that is not the same as "
+                    f"failing it. It needs an event with real coarse material: "
+                    f"vacuuming, a made bed, something dusty rather than something "
+                    f"burnt.")}
+    return _check_ordering_rates(sizes)
+
+
+def _check_ordering_rates(sizes):
     """Does fitted deposition rise with particle size, as gravity requires?
 
     This is the falsification and it costs nothing: the sensor reports all three
