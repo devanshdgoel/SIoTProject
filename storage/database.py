@@ -42,7 +42,12 @@ class Database:
                                     ("decay_events", "method", "TEXT"),
                                     ("decay_events", "c_inf", "REAL"),
                                     ("decay_events", "asym_note", "TEXT"),
-                                    ("predictions", "naive", "REAL")):
+                                    ("predictions", "naive", "REAL"),
+                                    ("device_status", "up_s", "INTEGER"),
+                                    ("device_status", "heap", "INTEGER"),
+                                    ("device_status", "heap_max_block", "INTEGER"),
+                                    ("device_status", "reset_reason", "TEXT"),
+                                    ("device_status", "reboots", "INTEGER")):
             have = {r[1] for r in c.execute(f"PRAGMA table_info({table})")}
             if column not in have:
                 c.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
@@ -104,17 +109,39 @@ class Database:
                       "VALUES (?,?,?,?,?,?)",
                       (collector, int(started_at), int(duration_ms), status, n_rows, error))
 
-    def touch_device(self, device, accepted, rejected, batch, oldest_age_s, addr=None):
+    def touch_device(self, device, accepted, rejected, batch, oldest_age_s, addr=None,
+                     health=None):
+        """Record a node's check-in, and count reboots by watching its uptime fall.
+
+        A node that reboots and one that loses WiFi both simply stop arriving, so
+        the host cannot tell them apart from absence alone. The node's own uptime
+        can: if it comes back lower than it went away, the board restarted. That
+        counter is what turns "it keeps stopping" into a number, and the reset
+        reason beside it says why."""
+        h = health or {}
+        up = h.get("up_s")
         with self.conn() as c:
+            prev = c.execute("SELECT up_s, reboots FROM device_status WHERE device=?",
+                             (device,)).fetchone()
+            rebooted = 0
+            if prev is not None and up is not None and prev["up_s"] is not None:
+                rebooted = 1 if int(up) < int(prev["up_s"]) else 0
             c.execute("""INSERT INTO device_status
-                         (device,last_seen,remote_addr,accepted_total,rejected_total,last_batch,oldest_age_s)
-                         VALUES (?,?,?,?,?,?,?)
+                         (device,last_seen,remote_addr,accepted_total,rejected_total,
+                          last_batch,oldest_age_s,up_s,heap,heap_max_block,reset_reason,reboots)
+                         VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
                          ON CONFLICT(device) DO UPDATE SET last_seen=excluded.last_seen,
                            remote_addr=excluded.remote_addr,
                            accepted_total=accepted_total+excluded.accepted_total,
                            rejected_total=rejected_total+excluded.rejected_total,
-                           last_batch=excluded.last_batch, oldest_age_s=excluded.oldest_age_s""",
-                      (device, int(time.time()), addr, accepted, rejected, batch, oldest_age_s))
+                           last_batch=excluded.last_batch, oldest_age_s=excluded.oldest_age_s,
+                           up_s=excluded.up_s, heap=excluded.heap,
+                           heap_max_block=excluded.heap_max_block,
+                           reset_reason=excluded.reset_reason,
+                           reboots=reboots+excluded.reboots""",
+                      (device, int(time.time()), addr, accepted, rejected, batch,
+                       oldest_age_s, up, h.get("heap"), h.get("heap_max_block"),
+                       h.get("reset"), rebooted))
 
     def set_display(self, expression, message, task=None, event_id=None, mode="live"):
         """Record what the pet is showing (the pet controller calls this on every change)."""

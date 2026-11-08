@@ -233,6 +233,47 @@ def cmd_volume(args, db):
           "  no source term fitted yet, so nothing to check it against")
 
 
+def cmd_nodes(args, db):
+    """Each sensor node: is it up, has it rebooted, and why.
+
+    A node that reboots and one that loses WiFi both simply stop arriving, which
+    is why "it keeps stopping" went undiagnosed for a whole evening. The node's
+    own uptime separates them - back lower than it went away means the board
+    restarted - and the ESP32's reset reason says which kind of restart."""
+    import time as _t
+
+    now = int(_t.time())
+    with db.conn() as c:
+        rows = [dict(r) for r in c.execute(
+            "SELECT * FROM device_status ORDER BY last_seen DESC")]
+    if not rows:
+        print("no node has ever checked in")
+        return
+    for r in rows:
+        age = (now - r["last_seen"]) // 60
+        up = r.get("up_s")
+        state = "LIVE" if age < 3 else f"silent {age} min"
+        print(f"{r['device']:10s} {state:16s} accepted={r['accepted_total']} "
+              f"rejected={r['rejected_total']}")
+        if up is None:
+            print("           (older firmware: no uptime reported, so a reboot "
+                  "cannot be told from a dropout)")
+            continue
+        print(f"           uptime {up // 3600}h{up % 3600 // 60:02d}m   "
+              f"reboots seen {r.get('reboots') or 0}   "
+              f"last reset: {r.get('reset_reason') or '?'}")
+        if r.get("heap") is not None:
+            print(f"           heap {r['heap']} free, largest block "
+                  f"{r.get('heap_max_block')}")
+        reason = (r.get("reset_reason") or "").lower()
+        if reason == "brownout":
+            print("           -> BROWNOUT: the supply sagged. Thicker cable, a "
+                  "2 A adapter, or power the PMS straight from the adapter.")
+        elif reason in ("panic", "task_wdt", "int_wdt", "wdt"):
+            print("           -> the FIRMWARE crashed or hung, not the power. "
+                  "The serial log at the moment of reset has the backtrace.")
+
+
 def cmd_particles(args, db):
     """Is the particle counter working, and are its numbers physically possible?
 
@@ -821,6 +862,8 @@ def main():
     p.add_argument("--people", type=int, help="how many, for an occupancy label")
     p.set_defaults(fn=cmd_label)
     p = sub.add_parser("params"); p.set_defaults(fn=cmd_params)
+    p = sub.add_parser("nodes", help="node uptime, reboots and why")
+    p.set_defaults(fn=cmd_nodes)
     p = sub.add_parser("particles", help="is the particle counter working")
     p.set_defaults(fn=cmd_particles)
     p = sub.add_parser("limits", help="what this system does not know")

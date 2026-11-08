@@ -107,7 +107,12 @@ CREATE TABLE IF NOT EXISTS device_status (
     accepted_total  INTEGER NOT NULL DEFAULT 0,
     rejected_total  INTEGER NOT NULL DEFAULT 0,
     last_batch      INTEGER,
-    oldest_age_s    INTEGER              -- age of the oldest reading in the last batch (backlog depth)
+    oldest_age_s    INTEGER,             -- age of the oldest reading in the last batch (backlog depth)
+    up_s            INTEGER,             -- the node's own uptime: resets mean it rebooted
+    heap            INTEGER,
+    heap_max_block  INTEGER,
+    reset_reason    TEXT,                -- brownout | panic | task_wdt | poweron | ...
+    reboots         INTEGER NOT NULL DEFAULT 0
 );
 
 -- What the pet is (or was told to be) showing. The newest row is the current display.

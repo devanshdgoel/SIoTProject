@@ -287,10 +287,15 @@ class HttpBackend:
                     return self._reply(400, {"error": "malformed"})
                 if backend.db is not None and readings:
                     oldest = min((int(r["ts"]) for r in readings if isinstance(r, dict) and "ts" in r), default=None)
+                    # Whatever health fields the node volunteered. Older firmware
+                    # sends none and that must stay fine, so every one is optional.
+                    health = {k: body.get(k) for k in
+                              ("up_s", "heap", "heap_max_block", "reset")
+                              if body.get(k) is not None}
                     backend.db.touch_device(str(body.get("device", "unknown"))[:40], accepted,
                                             len(readings) - accepted, len(readings),
                                             int(time.time() - oldest) if oldest else None,
-                                            self.client_address[0])
+                                            self.client_address[0], health=health)
                 self._reply(200, {"accepted": accepted, "pressure_hpa": backend.pressure,
                                   "display": backend.display})
 

@@ -725,12 +725,48 @@ static uint8_t jsonStrArray(const String &s, const char *key,
   return n;
 }
 
+/* Why the chip last restarted, in a word the host can store.
+ *
+ * This is the question that cannot be answered from the host: a node that
+ * reboots and one that merely loses WiFi look identical from there - both just
+ * stop arriving - and they have completely different causes. The chip knows, and
+ * has known all along; it simply was not being asked. BROWNOUT means the supply
+ * sagged, PANIC means the firmware crashed, WDT means it hung, POWERON means
+ * someone pulled the plug. Each points somewhere different.
+ */
+static const char *resetReason() {
+  switch (esp_reset_reason()) {
+    case ESP_RST_POWERON:  return "poweron";
+    case ESP_RST_EXT:      return "external";
+    case ESP_RST_SW:       return "software";
+    case ESP_RST_PANIC:    return "panic";       // a crash: null deref, bad memory
+    case ESP_RST_INT_WDT:  return "int_wdt";
+    case ESP_RST_TASK_WDT: return "task_wdt";    // a loop that stopped feeding
+    case ESP_RST_WDT:      return "wdt";
+    case ESP_RST_DEEPSLEEP: return "deepsleep";
+    case ESP_RST_BROWNOUT: return "brownout";    // the supply sagged
+    case ESP_RST_SDIO:     return "sdio";
+    default:               return "unknown";
+  }
+}
+
 /* Send one batch. Returns 1 sent, 0 nothing to send, -1 the host would not take it. */
 static int uploadBatch() {
   if (bufCount == 0) return 0;
   if (WiFi.status() != WL_CONNECTED) { Serial.printf("[upload] skipped: WiFi is down, %d reading(s) waiting in memory\n", bufCount); return -1; }
   int n = bufCount < BATCH_MAX ? bufCount : BATCH_MAX;
-  String body = "{\"device\":\"" DEVICE_NAME "\",\"room\":\"" ROOM_NAME "\",\"readings\":[";
+  // Uptime, heap and the last reset reason ride along on every upload. They cost
+  // about forty bytes and they are the difference between "it keeps stopping" and
+  // a diagnosis: an uptime that climbs across a gap means WiFi dropped, one that
+  // resets to zero means the board did.
+  char health[128];
+  snprintf(health, sizeof health,
+           ",\"up_s\":%lu,\"heap\":%u,\"heap_max_block\":%u,\"reset\":\"%s\"",
+           (unsigned long)(millis() / 1000UL), (unsigned)ESP.getFreeHeap(),
+           (unsigned)ESP.getMaxAllocHeap(), resetReason());
+  String body = "{\"device\":\"" DEVICE_NAME "\",\"room\":\"" ROOM_NAME "\"";
+  body += health;
+  body += ",\"readings\":[";
   // Ask for the whole thing at once. `body += item` thirty times grows the String
   // by reallocating and copying, which on a board already carrying a large static
   // buffer and a WiFi stack chops the heap into pieces too small for the next
