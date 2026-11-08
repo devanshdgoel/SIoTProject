@@ -50,9 +50,12 @@ not: there has to be an indoor source and then an end to it. One deliberate cook
 event with the door shut gives every number on this page.
 """
 
+import math
+
 import numpy as np
 
 from analysis import features
+from analysis.ventilation import _forecast_at
 
 # The three masses the PMS5003 reports, with the size each stands for. The order is
 # load-bearing: it is what the deposition ordering is checked against.
@@ -510,6 +513,116 @@ def penetration(db, location, k_h, lambda_h, days=14, now=None, metric="pm2_5"):
                      + (". Capped at 1.5: a penetration above 1 means the model is "
                         "wrong, most likely an indoor source during the 'quiet' "
                         "hours." if p > 1.5 else "."))}
+
+
+# A wide opening does almost no filtering: the gaps a closed envelope leaks
+# through are what strip particles out, and a sash raised six inches has no such
+# gaps. So penetration goes to ~1 while the window is open, and the room heads for
+# whatever is actually outside.
+OPEN_PENETRATION = 0.95
+
+
+def pm_forward(p_in, p_out, minutes, lam_h, k_h, penetration):
+    """Where indoor particles head under one ventilation state.
+
+        dP/dt = lambda*p*P_out - (lambda + k)*P
+
+    so the room approaches lambda*p*P_out/(lambda+k) with time constant
+    1/(lambda+k). The same closed form as CO2, with two differences that matter:
+    the loss term carries deposition as well as air exchange, and the source is
+    outside rather than inside.
+    """
+    total = lam_h + k_h
+    if total <= 0:
+        return p_in, p_in
+    steady = lam_h * penetration * p_out / total
+    now = steady + (p_in - steady) * math.exp(-total * minutes / 60.0)
+    return now, steady
+
+
+def pm_dose(p_in, p_out, minutes, lam_h, k_h, penetration):
+    """Integrated exposure over the period, in ug.h/m3.
+
+    Dose rather than concentration, because that is what a body responds to: ten
+    minutes at 200 and two hours at 20 are not the same thing, and the instant
+    reading cannot tell them apart. Integrated in closed form from the same
+    solution rather than by stepping, so it is exact.
+    """
+    total = lam_h + k_h
+    hours = minutes / 60.0
+    if total <= 0:
+        return p_in * hours
+    steady = lam_h * penetration * p_out / total
+    return steady * hours + (p_in - steady) * (1 - math.exp(-total * hours)) / total
+
+
+def air_trade(db, location, minutes=60, now=None):
+    """What opening the window costs and buys, for BOTH pollutants at once.
+
+    This is the question the system exists to answer and could not until the
+    particle counter arrived. Opening a window drives CO2 down and - whenever the
+    street is dirtier than the room - particles up. They move in opposite
+    directions through the same opening, and until now the CO2 side was measured
+    while the particle side was a guessed divisor against a modelled outdoor
+    figure that turned out to be half the truth.
+
+    Every term here is now measured in this room: lambda shut and open from CO2
+    decays and rises, k from a particle decay against those, penetration from the
+    level a quiet room settles at, and outdoor from real instruments.
+
+    Returns one row per option with where each pollutant ends up and the dose
+    breathed getting there, so the trade can be read rather than asserted.
+    """
+    import time as _time
+
+    from analysis.room_model import RoomModel
+
+    now = int(_time.time()) if now is None else int(now)
+    model = RoomModel(db, location)
+    co2 = features.series(db, "co2_ppm", location, now - 6 * 3600, now).dropna()
+    pm = features.series(db, "pm2_5", location, now - 6 * 3600, now).dropna()
+    if co2.empty or pm.empty:
+        return None
+    out_series, src = outdoor_series(db, "pm2_5", now - 3 * 86400, now)
+    if out_series is None or out_series.empty:
+        return None
+
+    params = db.params(location)
+    k = float(params["deposition_k_pm2_5"]["value"]) if "deposition_k_pm2_5" in params else None
+    pen = float(params["penetration_pm2_5"]["value"]) if "penetration_pm2_5" in params else None
+    if k is None or pen is None:
+        return {"error": "needs a measured deposition rate and penetration factor "
+                         "first - run a particle event (cook with the door shut)"}
+
+    c0, p0 = float(co2.iloc[-1]), float(pm.iloc[-1])
+    p_out = float(out_series.iloc[-1])
+    occupied = True
+    source = model.value["source_ppm_h"] * model.occupants
+    rows = []
+    for name, lam, basis in __import__("analysis.ventilation", fromlist=["options"]).options(
+            model, _forecast_at(db, "wind_ms", now)):
+        if lam is None:
+            rows.append({"option": name, "basis": basis, "unmeasured": True})
+            continue
+        # CO2: the room's own source against the air change
+        steady_co2 = model.value["c_out"] + (source / lam if occupied else 0.0)
+        c_end = steady_co2 + (c0 - steady_co2) * math.exp(-lam * minutes / 60.0)
+        # particles: outdoor air against air change plus settling. A wide opening
+        # filters almost nothing, so penetration rises towards 1 when it is open.
+        p_here = OPEN_PENETRATION if "open" in name else pen
+        p_end, p_steady = pm_forward(p0, p_out, minutes, lam, k, p_here)
+        rows.append({
+            "option": name, "basis": basis, "lambda_h": round(lam, 3),
+            "co2_end": round(c_end), "co2_change": round(c_end - c0),
+            "pm_end": round(p_end, 1), "pm_change": round(p_end - p0, 1),
+            "pm_steady": round(p_steady, 1),
+            "co2_dose_ppm_h": round((c0 + c_end) / 2 * minutes / 60.0),
+            "pm_dose_ug_h": round(pm_dose(p0, p_out, minutes, lam, k, p_here), 1),
+            "penetration_used": p_here})
+    return {"location": location, "minutes": minutes, "co2_now": round(c0),
+            "pm_now": round(p0, 1), "pm_outdoor": round(p_out, 1),
+            "outdoor_source": src, "k_h": k, "penetration_shut": pen,
+            "options": rows}
 
 
 def learn_particles(db, location, days=14, now=None):

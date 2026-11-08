@@ -829,6 +829,42 @@ def cmd_ventilate(args, db):
     print("  to hold the night below:  " + "   ".join(
         f"{t} ppm needs {v}/h" for t, v in plan["needed"].items()))
 
+    # Both pollutants, which move in opposite directions through the same opening.
+    # Until the particle counter arrived this half did not exist and the CO2 half
+    # was presented as if it were the whole decision.
+    try:
+        from analysis.particles import air_trade
+        trade = air_trade(db, args.room, minutes=60)
+    except Exception:                                   # noqa: BLE001
+        trade = None
+    if trade and not trade.get("error"):
+        print()
+        print(f"  over the next hour, both pollutants "
+              f"(indoor PM2.5 {trade['pm_now']}, outdoor {trade['pm_outdoor']} "
+              f"from {trade['outdoor_source']}):")
+        print(f"  {'option':24s}{'CO2 ends':>10s}{'change':>8s}"
+              f"{'PM ends':>9s}{'change':>8s}{'PM dose':>9s}")
+        for r in trade["options"]:
+            if r.get("unmeasured"):
+                continue
+            print(f"  {r['option']:24s}{r['co2_end']:10d}{r['co2_change']:+8d}"
+                  f"{r['pm_end']:9.1f}{r['pm_change']:+8.1f}{r['pm_dose_ug_h']:9.1f}")
+        shut = next((r for r in trade["options"] if "shut" in r["option"]), None)
+        wide = next((r for r in trade["options"] if "wide" in r["option"]), None)
+        if shut and wide:
+            dpm = wide["pm_dose_ug_h"] - shut["pm_dose_ug_h"]
+            dco2 = shut["co2_end"] - wide["co2_end"]
+            if dpm <= 1.0:
+                print(f"    opening costs nothing in particles today "
+                      f"({dpm:+.1f} ug.h/m3) and saves {dco2} ppm - the trade is "
+                      f"one-sided, so open it")
+            else:
+                print(f"    opening saves {dco2} ppm of CO2 and costs "
+                      f"{dpm:+.1f} ug.h/m3 of PM2.5 - that is the trade, and it is "
+                      f"measured rather than assumed")
+        print(f"    using k={trade['k_h']}/h and penetration {trade['penetration_shut']} "
+              f"measured in this room")
+
     purge = ventilation.plan_purge(db, args.room, horizon_h=args.horizon)
     b = purge.get("best")
     print()
