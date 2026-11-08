@@ -249,7 +249,19 @@ class HttpBackend:
                 pass
 
             def _reply(self, code, body):
-                data = json.dumps(body).encode()
+                # Compact, with no space after the colons. The node parses this
+                # reply by hand - it has no JSON library and should not need one
+                # for four fields - and its lookups are literal: it searches for
+                # `"expression":"` and `"info":[`. json.dumps defaults to `: `
+                # separators, so every one of those lookups failed and had been
+                # failing since the feature was written. The face fell back to
+                # local CO2 and looked stuck; the info screen stayed empty.
+                #
+                # Fixing it here rather than in the firmware means it takes effect
+                # without reflashing either node, and the bytes are smaller too.
+                # The node's parser is also being made whitespace-tolerant so that
+                # this cannot bite again, but that needs a flash and this does not.
+                data = json.dumps(body, separators=(",", ":")).encode()
                 self.send_response(code)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(data)))

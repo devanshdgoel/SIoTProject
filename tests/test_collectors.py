@@ -397,3 +397,33 @@ def test_a_saturated_mass_drops_the_set_but_not_the_reading(db):
     assert not [o for o in obs if o.metric.startswith(("pm", "pc"))]
     assert len(obs) == 4
     b.server.shutdown()
+
+
+def test_the_reply_matches_what_the_node_parses(db):
+    """The node has no JSON library and searches for literal byte sequences.
+
+    json.dumps defaults to `": "` separators, so `"expression":"` never appeared
+    in the reply and the node never read a single one - the face ran on its local
+    CO2 fallback for the whole project and looked stuck on one mood. Nothing
+    raised, nothing logged, and the numbers kept working because toFloat skips
+    whitespace. This pins the exact sequences firmware/esp32_scd40.ino looks for.
+    """
+    import json
+    import time
+
+    import requests
+
+    b = scd40.HttpBackend(db, port=0, token="secret")
+    url, hdr = f"http://127.0.0.1:{b.port}/ingest", {"X-Auth-Token": "secret"}
+    now = int(time.time()) // 60 * 60
+    r = {"ts": now, "co2": 900, "co2_max": 950, "t": 21.0, "rh": 50, "n": 12}
+    db.set_display("happy", "all good", mode="test")
+    b.drain()
+    raw = requests.post(url, headers=hdr, json={"readings": [r]}).text
+    b.server.shutdown()
+
+    assert '"expression":"' in raw, raw[:200]
+    assert '"message":"' in raw
+    assert '"accepted":' in raw
+    # and it is still valid JSON, not just the right bytes
+    assert json.loads(raw)["display"]["expression"] == "happy"

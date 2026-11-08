@@ -649,12 +649,35 @@ static void pushReading(const Reading &r) {
   if (bufCount < BUF_SIZE) bufCount++; else bufHead = (bufHead + 1) % BUF_SIZE;   // drop oldest
 }
 
+/* Find "key": and return the index of the first character after it, skipping any
+ * whitespace, or -1.
+ *
+ * The whitespace is the whole point. These lookups used to be literal - the code
+ * searched for the ten characters `"expression":"` - and the host serialises with
+ * Python's json.dumps, whose default separator is `: ` with a space. So every
+ * string field silently failed to parse from the day it was written: the face fell
+ * back to local CO2 and looked stuck on one expression, and the info screen stayed
+ * empty. The numbers were fine, which is what hid it, because toFloat and toInt
+ * skip leading whitespace and quoted strings do not.
+ *
+ * The host now sends compact JSON, which fixes it without reflashing anything.
+ * This makes the node stop caring either way, so a future change of serialiser
+ * cannot quietly break the display again. */
+static int jsonAfterKey(const String &s, const char *key) {
+  String pat = String("\"") + key + "\":";
+  int i = s.indexOf(pat);
+  if (i < 0) return -1;
+  i += pat.length();
+  while (i < (int)s.length() && (s[i] == ' ' || s[i] == '\t' ||
+                                 s[i] == '\n' || s[i] == '\r')) i++;
+  return i;
+}
+
 /* Pull one "key":"value" string out of the reply without a JSON library. */
 static bool jsonStr(const String &s, const char *key, char *out, size_t n) {
-  String pat = String("\"") + key + "\":\"";
-  int i = s.indexOf(pat);
-  if (i < 0) return false;
-  i += pat.length();
+  int i = jsonAfterKey(s, key);
+  if (i < 0 || i >= (int)s.length() || s[i] != '"') return false;
+  i++;                                            // past the opening quote
   int j = s.indexOf('"', i);
   if (j < 0) return false;
   s.substring(i, j).toCharArray(out, n);
@@ -669,10 +692,9 @@ static bool jsonStr(const String &s, const char *key, char *out, size_t n) {
  * ever renders and never interprets. */
 static uint8_t jsonStrArray(const String &s, const char *key,
                             char out[][INFO_CHARS], uint8_t maxN) {
-  String pat = String("\"") + key + "\":[";
-  int i = s.indexOf(pat);
-  if (i < 0) return 0;
-  i += pat.length();
+  int i = jsonAfterKey(s, key);
+  if (i < 0 || i >= (int)s.length() || s[i] != '[') return 0;
+  i++;                                            // past the opening bracket
   int end = s.indexOf(']', i);
   if (end < 0) return 0;
   uint8_t n = 0;
