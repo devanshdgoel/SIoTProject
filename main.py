@@ -300,13 +300,21 @@ def cmd_particles(args, db):
                   f"/{len(df) * (len(have) - 1)} ok"
                   + ("" if not bad else f"  <-- {bad} IMPOSSIBLE"))
 
-        # 4. duty cycle: particles arrive on one minute in five
-        if pm25.size and newest is not None:
+        # 4. duty cycle, measured only over the span the counter has existed.
+        # Comparing its sample count against the whole CO2 record reported 0.00
+        # for a sensor that had been running for six minutes, which looks like a
+        # fault and is just arithmetic over the wrong window.
+        if pm25.size >= 2:
             co2 = features.series(db, "co2_ppm", loc).dropna()
-            if co2.size:
-                share = pm25.size / co2.size
-                print(f"  particle samples per CO2 sample: {share:.2f} "
-                      f"(expect about 1.0 on the 5-minute grid)")
+            since = co2.loc[pm25.index[0]:pm25.index[-1]]
+            if since.size:
+                share = pm25.size / since.size
+                print(f"  particle samples per CO2 sample since the counter "
+                      f"started: {share:.2f} (expect ~1.0 on the 5-minute grid)")
+            gaps = pm25.index.to_series().diff().dt.total_seconds().dropna()
+            if gaps.size:
+                print(f"  interval between samples: {gaps.median() / 60:.0f} min "
+                      f"(expect 5)")
 
         dep = db.params(loc).get("deposition_k_pm2_5")
         if dep and dep["value"]:
