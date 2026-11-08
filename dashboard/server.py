@@ -156,6 +156,7 @@ def full_state(db, collectors):
             "errors": _rows(c, "SELECT collector, started_at, error FROM collector_runs "
                                "WHERE status='error' ORDER BY started_at DESC LIMIT 10"),
             "body": body_state(c, now),
+            "air": air_state(c, now),
             "components": component_state(),
             "config": {
                 "scd40_backend": settings.SCD40_BACKEND, "ingest_port": settings.INGEST_PORT,
@@ -186,6 +187,79 @@ def full_state(db, collectors):
 
 def _rows_of(rows):
     return [dict(r) for r in rows]
+
+
+# The counter reports three masses and six cumulative count bins. The bins are the
+# part most projects throw away and the part that says WHAT the particles are:
+# cooking, traffic and floor dust have different size distributions at the same
+# PM2.5, so the shape matters as much as the number.
+PM_MASSES = (("pm1_0", "PM1"), ("pm2_5", "PM2.5"), ("pm10", "PM10"))
+PM_BINS = (("pc0_3", ">0.3"), ("pc0_5", ">0.5"), ("pc1_0", ">1.0"),
+           ("pc2_5", ">2.5"), ("pc5_0", ">5"), ("pc10_0", ">10"))
+
+
+def air_state(c, now, stale_s=1800):
+    """Indoor particles from the counter, and outdoor from two independent sources.
+
+    Keeping the AURN stations and the Open-Meteo figure side by side is the point
+    rather than a detail. Open-Meteo's PM2.5 is a MODEL on a roughly 11 km grid;
+    AURN is three real instruments a few kilometres away. Everything downstream
+    that compares indoor against outdoor - the penetration factor, the intake term
+    in the purge cost - rests on whichever of those is used, and until now only the
+    model was collected into anything that read it. Showing both means a reader can
+    see how far apart they are before trusting either.
+    """
+    out = {"indoor": [], "outdoor": [], "bins": []}
+
+    rooms = [r[0] for r in c.execute(
+        "SELECT DISTINCT location FROM observations WHERE source='scd40' "
+        "AND metric='pm2_5'")]
+    for room in rooms:
+        row = {"room": room, "ts": None, "masses": {}, "bins": {}}
+        for metric, label in PM_MASSES + PM_BINS:
+            r = c.execute("SELECT ts, value FROM observations WHERE source='scd40' "
+                          "AND location=? AND metric=? ORDER BY ts DESC LIMIT 1",
+                          (room, metric)).fetchone()
+            if r is None:
+                continue
+            target = row["masses"] if metric in dict(PM_MASSES) else row["bins"]
+            target[label] = r["value"]
+            row["ts"] = max(row["ts"] or 0, r["ts"])
+        if row["ts"]:
+            row["age_s"] = now - row["ts"]
+            row["stale"] = row["age_s"] > stale_s
+            out["indoor"].append(row)
+
+    # Outdoor: every source that reports PM2.5, labelled by what kind of thing it is.
+    #
+    # Two filters that are not optional. open_meteo stores forecast rows alongside
+    # modelled ones, so without `ts <= now` the "current" outdoor reading is
+    # whatever the model expects tomorrow afternoon - the first version of this
+    # reported an age of minus twenty-three hours. And AURN publishes -99 for a
+    # station with no data; the collector correctly files those as suspect rather
+    # than dropping them, which only helps if the reader honours the flag.
+    for r in c.execute(
+            "SELECT source, location, metric, value, MAX(ts) ts FROM observations "
+            "WHERE metric IN ('pm2_5','pm10') AND source IN ('aurn','open_meteo') "
+            "AND quality!='suspect' AND ts<=? "
+            "GROUP BY source, location, metric ORDER BY metric, source, location",
+            (now,)):
+        out["outdoor"].append({
+            "source": r["source"], "location": r["location"], "metric": r["metric"],
+            "value": r["value"], "ts": r["ts"], "age_s": now - r["ts"],
+            "stale": (now - r["ts"]) > 3 * 3600,
+            "kind": "measured" if r["source"] == "aurn" else "modelled"})
+
+    # Stations currently reporting no data. Worth showing rather than hiding: the
+    # kerbside/background pair is the whole reason three stations are polled, and
+    # if two of them are down the bracketing silently becomes a single site.
+    out["no_data"] = [
+        {"location": r["location"], "metric": r["metric"], "ts": r["ts"]}
+        for r in c.execute(
+            "SELECT location, metric, MAX(ts) ts FROM observations WHERE source='aurn' "
+            "AND quality='suspect' AND ts>? GROUP BY location, metric",
+            (now - 6 * 3600,))]
+    return out
 
 
 def body_state(c, now):

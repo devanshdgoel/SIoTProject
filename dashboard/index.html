@@ -151,6 +151,19 @@ tr:hover td{background:#192029}
 
   <section class="card c8"><h2>Rooms</h2><div id="rooms"></div></section>
 
+  <section class="card c6"><h2>Particles indoors</h2>
+    <div id="pmIndoor"></div></section>
+
+  <section class="card c6"><h2>Outdoor air — modelled against measured</h2>
+    <div id="pmOutdoor"></div></section>
+
+  <section class="card c12"><h2>PM2.5 — this room against the air outside</h2>
+    <div class="chartbox"><canvas id="chPm"></canvas>
+      <div class="empty" id="emPm" hidden>no particle data in this range</div></div>
+    <div class="dim" style="margin-top:6px">Open-Meteo is a model on a ~11 km grid;
+      the AURN stations are instruments. Where they disagree, the instruments are
+      the measurement and the model is a guess at it.</div></section>
+
   <section class="card c8"><h2>Indoor CO₂ — both rooms, with what you told it</h2>
     <div class="chartbox tall"><canvas id="chCo2"></canvas>
       <div class="empty" id="emCo2" hidden>no data in this range</div></div>
@@ -345,6 +358,90 @@ function drawFace(expr, co2){
   $('#faceG').style.animationDuration = secs.toFixed(2)+'s';
 }
 
+/* ---------------- particles ---------------- */
+const pmColour = v => v==null ? 'var(--dim)' : v>=55 ? 'var(--bad)' : v>=35 ? 'var(--warn)'
+  : v>=15 ? 'var(--ink)' : 'var(--good)';
+
+function renderAir(){
+  const A = S?.air;
+  if(!A){ return; }
+
+  // indoor: the three masses big, the six count bins underneath. The bins are
+  // what distinguishes cooking from dust at the same PM2.5, so they are shown
+  // rather than summarised away.
+  const ind = (A.indoor||[]);
+  $('#pmIndoor').innerHTML = !ind.length
+    ? '<span class="dim">no particle counter reporting yet</span>'
+    : ind.map(r=>{
+        const age = Math.round((r.age_s||0)/60);
+        const masses = Object.entries(r.masses||{}).map(([k,v])=>
+          `<div><div class="dim" style="font-size:11px">${esc(k)}</div>`
+          + `<div style="font-size:20px;color:${pmColour(v)}">${v==null?'—':v.toFixed(0)}</div></div>`
+        ).join('');
+        const bins = Object.entries(r.bins||{}).map(([k,v])=>
+          `<span class="pill flat" title="particles per 0.1 L above ${esc(k)} um">`
+          + `${esc(k)}µm ${v==null?'—':Math.round(v)}</span>`).join(' ');
+        return `<div style="margin-bottom:10px">
+            <b>${esc(r.room)}</b> <span class="dim">µg/m³, ${age} min ago</span>
+            ${r.stale?'<span class="pill flat" style="color:var(--warn)">stale</span>':''}
+            <div class="grid" style="grid-template-columns:repeat(3,1fr);gap:10px;margin:6px 0">${masses}</div>
+            <div style="line-height:1.9">${bins}</div></div>`;
+      }).join('');
+
+  // outdoor: measured and modelled next to each other, never merged
+  const out = (A.outdoor||[]).filter(o=>o.metric==='pm2_5');
+  const rows = out.map(o=>[
+    o.kind==='measured' ? '<b>measured</b>' : '<span class="dim">modelled</span>',
+    esc(o.location.replace(/^london_/,'').replace(/_+/g,' ')),
+    `<span style="color:${pmColour(o.value)}">${o.value==null?'—':o.value.toFixed(1)}</span>`,
+    `${Math.round((o.age_s||0)/60)} min`]);
+  let note = '';
+  const meas = out.filter(o=>o.kind==='measured').map(o=>o.value);
+  const mod  = out.filter(o=>o.kind==='modelled').map(o=>o.value);
+  if(meas.length && mod.length){
+    const m = meas.reduce((a,b)=>a+b,0)/meas.length, g = mod[0];
+    const ratio = g ? m/g : null;
+    if(ratio && (ratio>1.5 || ratio<0.67))
+      note = `<div style="margin-top:8px;color:var(--warn)">The instruments read
+        ${m.toFixed(0)} and the model ${g.toFixed(0)} — a factor of
+        ${ratio.toFixed(1)}. Anything using the modelled figure (the purge cost's
+        intake term, the pet's advice about outdoor air) is working from the
+        wrong number right now.</div>`;
+  }
+  const down = (A.no_data||[]).map(d=>esc(d.location.replace(/^london_/,'').replace(/_+/g,' ')));
+  if(down.length)
+    note += `<div class="dim" style="margin-top:6px">reporting no data:
+      ${down.join(', ')}</div>`;
+  $('#pmOutdoor').innerHTML = table(['','site','µg/m³','age'], rows) + note;
+}
+
+async function drawPm(){
+  const hours = +$('#range').value;
+  const sets = [];
+  const indoor = (S?.air?.indoor||[]).map(r=>r.room);
+  for(const room of indoor){
+    const q = new URLSearchParams({metric:'pm2_5', location:room, hours});
+    const d = await fetch('/api/series?'+q).then(r=>r.json()).catch(()=>({points:[]}));
+    const col = roomColour(room);
+    sets.push({label:room+' (indoor)', borderColor:col, backgroundColor:col,
+      data:(d.points||[]).map(p=>({x:p[0]*1000,y:p[1]}))});
+  }
+  const outs = [['home','outdoor (modelled)','#8b9bab'],
+                ['london_n__kensington','N Kensington (measured)','#3fb97f'],
+                ['london_marylebone_road','Marylebone Rd (measured)','#e2a23b']];
+  for(const [loc,label,col] of outs){
+    const q = new URLSearchParams({metric:'pm2_5', location:loc, hours});
+    const d = await fetch('/api/series?'+q).then(r=>r.json()).catch(()=>({points:[]}));
+    const pts = (d.points||[]).filter(p=>p[1]!=null && p[1] > -5);
+    if(!pts.length) continue;
+    sets.push({label, borderColor:col, backgroundColor:col, borderDash:[4,3],
+      pointRadius:0, data:pts.map(p=>({x:p[0]*1000,y:p[1]}))});
+  }
+  charts.pm.data.datasets = sets;
+  charts.pm.update('none');
+  $('#emPm').hidden = sets.some(d=>d.data.length > 1);
+}
+
 /* ---------------- rooms ---------------- */
 function renderRooms(){
   if(!R){ return; }
@@ -456,6 +553,11 @@ Chart.register(labelBands);
 
 const charts = {};
 function mkCharts(){
+  charts.pm = new Chart($('#chPm'), {type:'line', data:{datasets:[]}, options: base({
+    scales:{x:{type:'linear', ticks:{maxTicksLimit:8, callback:v=>new Date(v).toLocaleString([],
+      {month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'})}},
+      y:{title:{display:true,text:'PM2.5 µg/m³'}, suggestedMin:0}},
+    plugins:{legend:{labels:{boxWidth:9,boxHeight:9,padding:10}}}})});
   charts.co2 = new Chart($('#chCo2'), {type:'line', data:{datasets:[]}, options: base({
     scales:{x:{type:'linear', ticks:{maxTicksLimit:8, callback:v=>new Date(v).toLocaleString([],
       {month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'})}},
@@ -675,7 +777,7 @@ async function refreshState(){
 }
 async function refreshRooms(){
   try{ R = await fetch('/api/rooms').then(r=>r.json()); }catch(e){ return; }
-  try{ renderRooms(); renderLearned(); }catch(e){ console.error(e); }
+  try{ renderRooms(); renderLearned(); renderAir(); }catch(e){ console.error(e); }
   const lead = R.rooms.find(r=>!r.stale) || R.rooms[0];
   if(lead){
     drawFace(lead.expression, lead.stale ? null : lead.co2);
@@ -693,7 +795,8 @@ async function refreshNights(){
   try{ N = await fetch('/api/nights').then(r=>r.json()); renderNights(); }catch(e){ console.error(e); }
 }
 async function refreshAll(){ await refreshState(); await refreshRooms();
-  await drawCo2().catch(console.error); await drawBody().catch(console.error);
+  await drawCo2().catch(console.error); await drawPm().catch(console.error);
+  await drawBody().catch(console.error);
   await refreshNights(); await refreshEpisodes(); }
 
 $('#addLabel').onclick = async () => {
@@ -719,14 +822,16 @@ $('#detectNow').onclick = async () => {
   refreshEpisodes();
 };
 $('#refresh').onclick = refreshAll;
-$('#range').onchange = () => { drawCo2().catch(console.error); drawBody().catch(console.error); };
+$('#range').onchange = () => { drawCo2().catch(console.error); drawPm().catch(console.error);
+  drawBody().catch(console.error); };
 
 try{ mkCharts(); }catch(e){ console.error(e);
   document.querySelectorAll('.chartbox').forEach(b=>b.innerHTML='<div class="empty">charts unavailable</div>'); }
 refreshAll();
 setInterval(refreshState, 10000);
 setInterval(refreshRooms, 15000);
-setInterval(() => { drawCo2().catch(console.error); drawBody().catch(console.error); }, 60000);
+setInterval(() => { drawCo2().catch(console.error); drawPm().catch(console.error);
+  drawBody().catch(console.error); }, 60000);
 setInterval(refreshNights, 300000);
 setInterval(refreshEpisodes, 60000);
 </script></body></html>
