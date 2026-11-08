@@ -114,6 +114,7 @@ def cmd_collect(args, db):
         print("  stop that one first, or point this at another database with --db")
         raise SystemExit(1)
     single_instance.record(db.path, f"started {time.strftime('%Y-%m-%d %H:%M:%S')}")
+    code_at_start = single_instance.code_fingerprint()
 
     if not args.no_catchup:
         _catch_up(db)
@@ -127,8 +128,19 @@ def cmd_collect(args, db):
         t.start()
     log.info("collecting into %s (Ctrl+C to stop)", db.path)
     try:
+        warned = False
         while True:
             time.sleep(1)
+            # Say so, once, when the code on disk has moved past what is running.
+            # Nothing can be done about it from in here - the modules are already
+            # imported - but a line in the log is the difference between "the fix
+            # did not work" and "the fix is not running".
+            if not warned and single_instance.stale_by(code_at_start) > 0:
+                warned = True
+                log.warning("the project's code has changed since this collector "
+                            "started - it is still running the OLD version. "
+                            "Restart it (Ctrl+C, then `python main.py collect`) "
+                            "or anything you just fixed is not in effect here.")
     except KeyboardInterrupt:
         stop.set()
         log.info("stopping")
@@ -249,6 +261,13 @@ def cmd_nodes(args, db):
     if not rows:
         print("no node has ever checked in")
         return
+    import single_instance
+    note = single_instance.describe(db.path)
+    if any(r.get("up_s") is None for r in rows):
+        print("Note: nodes reporting no uptime are either on older firmware, or "
+              "the collector storing their uploads is.")
+        print(f"      the collector holding the lock says: {note}")
+        print()
     for r in rows:
         age = (now - r["last_seen"]) // 60
         up = r.get("up_s")

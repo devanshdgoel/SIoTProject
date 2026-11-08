@@ -92,6 +92,47 @@ def describe(key):
         return "another process on this machine"
 
 
+def code_fingerprint(root=None):
+    """Newest modification time across the project's Python sources.
+
+    Python holds imported modules in memory, so a collector keeps serving the code
+    it started with however many times the files change underneath it. That is not
+    a subtle failure - it has, in one evening, silently reverted a tape-measured
+    room volume, kept an OLED showing stale advice after the fix was written, and
+    swallowed the node health fields that were added specifically to diagnose a
+    node that kept dropping. Each time the symptom looked like a bug in the new
+    code rather than the old code still running.
+
+    A timestamp is cruder than a git hash and has the advantage of working on a
+    dirty tree, which is where the problem actually happens: the edit is made,
+    the tests pass, and nobody restarts the thing that is running.
+    """
+    import os
+    from pathlib import Path
+
+    root = Path(root or Path(__file__).resolve().parent)
+    newest = 0.0
+    for sub in ("", "analysis", "collectors", "storage", "config", "dashboard"):
+        d = root / sub if sub else root
+        if not d.is_dir():
+            continue
+        for name in os.listdir(d):
+            if name.endswith(".py"):
+                try:
+                    newest = max(newest, (d / name).stat().st_mtime)
+                except OSError:
+                    pass
+    return newest
+
+
+def stale_by(started_fingerprint, root=None):
+    """Seconds of code change since a process started, or 0 if it is current."""
+    if not started_fingerprint:
+        return 0
+    now = code_fingerprint(root)
+    return max(0.0, now - started_fingerprint)
+
+
 def _note_path(key):
     return str(key) + ".collector.pid"
 
