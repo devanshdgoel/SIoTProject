@@ -71,11 +71,17 @@ static const float    TEMP_OFFSET_C  = 4.0;      // self-heating compensation
 #if HAS_PMS
 // Each stored minute carries three mass figures and six count bins on top of the
 // CO2 fields, so it is roughly twice the size. Halving the depth keeps the static
-// allocation where it was: a day of backlog still outlasts any outage seen so far,
-// and running the board out of DRAM would cost every reading, not just the old ones.
-static const int      BUF_SIZE       = 1440;     // minutes of backlog (~24 h)
+// allocation where it was: half a day of backlog still outlasts any outage seen so
+// far, and running the board out of DRAM costs every reading, not just the old ones.
+//
+// These two numbers were the wrong way round. The comment said halve it and the
+// code doubled it, so the node with the bigger struct also got the deeper buffer -
+// roughly 56 KB of static array on the board that then kept dropping off the
+// network every few minutes, while the node with the smaller struct ran on half
+// that and stayed up for days. Backwards either way, and worth ruling out first.
+static const int      BUF_SIZE       = 720;      // minutes of backlog (~12 h)
 #else
-static const int      BUF_SIZE       = 720;     // minutes of backlog (~12 h)
+static const int      BUF_SIZE       = 1440;     // minutes of backlog (~24 h)
 #endif
 static const int      BATCH_MAX      = 30;       // readings per POST
 static const int      MAX_BATCHES_PER_CALL = 8;  // keep sampling while a backlog drains
@@ -716,6 +722,12 @@ static int uploadBatch() {
   if (WiFi.status() != WL_CONNECTED) { Serial.printf("[upload] skipped: WiFi is down, %d reading(s) waiting in memory\n", bufCount); return -1; }
   int n = bufCount < BATCH_MAX ? bufCount : BATCH_MAX;
   String body = "{\"device\":\"" DEVICE_NAME "\",\"room\":\"" ROOM_NAME "\",\"readings\":[";
+  // Ask for the whole thing at once. `body += item` thirty times grows the String
+  // by reallocating and copying, which on a board already carrying a large static
+  // buffer and a WiFi stack chops the heap into pieces too small for the next
+  // attempt. A particle minute is about 210 bytes against 95 without, so the
+  // reserve assumes the worst case or it defeats itself on the node it is for.
+  body.reserve((size_t)n * 240 + 96);
   for (int i = 0; i < n; i++) {
     const Reading &r = buf[(bufHead + i) % BUF_SIZE];
     char item[320];
@@ -809,6 +821,11 @@ static int uploadBatch() {
     return 1;
   }
   uploadOk = false;
+  // Heap on the way out. An upload that failed because the board could not build
+  // the request looks identical to one the host refused, and only this tells them
+  // apart: a largest-block below the body size is the signature.
+  Serial.printf("[upload] free heap %u, largest block %u at failure\n",
+                (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap());
   if (code < 0) {
     Serial.printf("[upload] FAILED: %s\n", HTTPClient::errorToString(code).c_str());
     Serial.println("[upload]   -> host unreachable. Check: INGEST_URL IP is the laptop's current IP,");
@@ -868,6 +885,9 @@ void setup() {
    * indistinguishable from one that is broken unless the banner names it. */
   Serial.printf("[boot] device \"%s\" in room \"%s\" (NODE %d)\n",
                 DEVICE_NAME, ROOM_NAME, (int)NODE);
+  Serial.printf("[boot] free heap %u bytes, largest block %u, backlog buffer %u\n",
+                (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap(),
+                (unsigned)sizeof(buf));
   Serial.printf("[boot] built with: display %s | particle counter %s | touch pad %s\n",
                 HAS_OLED ? "YES" : "no", HAS_PMS ? "YES" : "no",
                 HAS_TOUCH ? "YES" : "no");
