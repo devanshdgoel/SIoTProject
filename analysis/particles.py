@@ -53,6 +53,7 @@ event with the door shut gives every number on this page.
 import math
 
 import numpy as np
+import pandas as pd
 
 from analysis import features
 from analysis.ventilation import _forecast_at
@@ -65,6 +66,53 @@ MIN_PM_DROP = 0.5          # a decay must lose half its excess to be worth fitti
 MIN_PM_MINUTES = 40        # and run long enough for the curvature to be real
 MIN_PM_PEAK = 15.0         # ug/m3 above the floor; below this it is sensor noise
 MIN_PM_R2 = 0.85           # particle data is noisier than CO2; do not demand 0.99
+
+# How much outdoor particles may move across a candidate decay before the decay
+# stops being about the room. Expressed as the fraction of its own starting level
+# that outdoor loses over the window.
+MAX_OUTDOOR_FALL = 0.30
+MAX_PM_WINDOW_MIN = 480    # eight hours; longer and it has merged separate events
+
+
+def outdoor_stable(db, a, b, metric="pm2_5", limit=MAX_OUTDOOR_FALL):
+    """Did outdoor particles hold still enough for this to measure the room?
+
+    The indoor balance is dP/dt = lambda*p*P_out - (lambda + k)P, and the whole
+    method assumes P_out is roughly constant so that the only thing falling is the
+    room. When outdoor falls too, indoor follows it down through the envelope and
+    the fit reads that as a clearance it had nothing to do with.
+
+    This is not hypothetical and it cost a published number. The first deposition
+    estimate here came from a window where indoor went 105 -> 38 ug/m3 and was
+    reported as k = 0.08/h. Outdoor over the same hours went 87 -> 36. The ratio
+    barely moved, which is the signature of a room tracking the street rather than
+    clearing itself, and the k was an artefact.
+
+    Returns (ok, detail). A rise outdoors is not disqualifying in the same way - it
+    pushes indoor UP and so makes a measured decay harder, not easier, to fake.
+    """
+    out, src = outdoor_series(db, metric, int(a.timestamp()) - 86400,
+                              int(b.timestamp()) + 3600)
+    if out is None:
+        return True, {"outdoor": "unknown", "source": None}
+    seg = out.loc[a:b].dropna()
+    if seg.size < 3:
+        return True, {"outdoor": "too few samples to judge", "source": src}
+    first, last = float(seg.iloc[0]), float(seg.iloc[-1])
+    if first <= 0:
+        return True, {"outdoor": "zero", "source": src}
+    fell = (first - last) / first
+    detail = {"source": src, "outdoor_start": round(first, 1),
+              "outdoor_end": round(last, 1), "outdoor_fell_frac": round(fell, 3)}
+    if fell > limit:
+        detail["outdoor"] = (
+            f"outdoor {metric} fell {fell * 100:.0f}% over the same window "
+            f"({first:.0f} -> {last:.0f}), so most of the indoor fall is the street "
+            f"clearing rather than the room. No deposition rate from this one.")
+        return False, detail
+    detail["outdoor"] = (f"outdoor held within {fell * 100:.0f}% "
+                         f"({first:.0f} -> {last:.0f}), so the fall is the room's")
+    return True, detail
 
 
 def pm_decays(series, min_minutes=MIN_PM_MINUTES, min_drop=MIN_PM_DROP,
@@ -99,6 +147,14 @@ def pm_decays(series, min_minutes=MIN_PM_MINUTES, min_drop=MIN_PM_DROP,
         peak, floor = float(seg.iloc[0]), float(seg.min())
         if minutes < min_minutes or peak - floor < min_peak:
             continue
+        if minutes > MAX_PM_WINDOW_MIN:
+            # Bridging short interruptions is necessary on Poisson-noisy counts, and
+            # it over-merges once there is enough record: a 1300-minute "decay" had
+            # swallowed a clearance, a quiet afternoon and the start of the next
+            # event. Keep the first MAX_PM_WINDOW_MIN, which is where the curvature is.
+            seg = seg.loc[:seg.index[0] + pd.Timedelta(minutes=MAX_PM_WINDOW_MIN)]
+            if seg.size < 6:
+                continue
         if (peak - float(seg.iloc[-1])) < min_drop * (peak - floor):
             continue
         keep.append((seg.index[0], seg.index[-1]))
@@ -249,6 +305,10 @@ def deposition(db, location, days=14, now=None, model=None):
                 continue
             fit = fit_pm_decay(seg)
             if fit is None:
+                continue
+            ok, air = outdoor_stable(db, a, b)
+            if not ok:
+                out.setdefault("rejected", []).append(air["outdoor"])
                 continue
             lam, basis = _lambda_during(db, location, int(a.timestamp()),
                                         int(b.timestamp()), model)
