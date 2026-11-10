@@ -312,14 +312,33 @@ class HttpBackend:
         threading.Thread(target=self.server.serve_forever, daemon=True, name="ingest").start()
 
     def accept(self, r, room=settings.SCD40_LOCATION):
-        """Validate one reading and queue it; returns 1 if kept (bad/old/future rows are dropped)."""
+        """Validate one reading and queue it; returns 1 if kept (bad/old/future rows are dropped).
+
+        A reading may carry CO2, particles, or both. The two sensors share a board
+        and nothing else, so one failing must not discard the other's measurement -
+        which is exactly what happened when a silent SCD40 took ten hours of
+        particle data with it.
+        """
         try:
-            ts, co2, t, rh = int(r["ts"]), float(r["co2"]), float(r["t"]), float(r["rh"])
-            co2_max, n = float(r.get("co2_max", co2)), int(r.get("n", 12))
+            ts = int(r["ts"])
         except (KeyError, TypeError, ValueError):
             return 0
         now = time.time()
         if not (now - self.MAX_AGE_S <= ts <= now + self.MAX_FUTURE_S):
+            return 0
+
+        pm = _particles(r)
+        if "co2" not in r:
+            # Particles only: the SCD40 said nothing this minute. Keep them.
+            if pm is None:
+                return 0
+            self.queue.put((ts, None, None, None, None, 0, room, pm))
+            return 1
+
+        try:
+            co2, t, rh = float(r["co2"]), float(r["t"]), float(r["rh"])
+            co2_max, n = float(r.get("co2_max", co2)), int(r.get("n", 12))
+        except (KeyError, TypeError, ValueError):
             return 0
         # The CO2 floor is 250, not 350. These sensors run on their factory
         # calibration with self-calibration off, and this pair reads roughly 60 ppm
@@ -329,8 +348,13 @@ class HttpBackend:
         # pinned the lowest stored value at precisely 350.0. A genuinely faulty
         # reading is 0 or negative, which 250 still rejects.
         if not (250 <= co2 <= 10000 and -10 <= t <= 60 and 0 <= rh <= 100):
+            # The CO2 half is unusable, but a particle sample in the same minute is
+            # a separate instrument and still good.
+            if pm is not None:
+                self.queue.put((ts, None, None, None, None, 0, room, pm))
+                return 1
             return 0
-        self.queue.put((ts, co2, co2_max, t, rh, n, room, _particles(r)))
+        self.queue.put((ts, co2, co2_max, t, rh, n, room, pm))
         return 1
 
     def drain(self):
@@ -422,8 +446,12 @@ def reading_to_obs(ts, co2, co2_max, t, rh, n, location=settings.SCD40_LOCATION,
     """One node-averaged reading -> Observations ('partial' if under half the samples arrived)."""
     q = "ok" if n >= 6 else "partial"
     mk = lambda m, v, u: Observation(SOURCE, m, location, ts, round(v, 2), "measured", u, quality=q)  # noqa: E731
-    obs = [mk("co2_ppm", co2, "ppm"), mk("co2_max_ppm", co2_max, "ppm"),
-           mk("indoor_temp_c", t, "C"), mk("indoor_rh_pct", rh, "%")]
+    # co2 is None on a minute the SCD40 missed. The particle fields below still
+    # stand on their own; emitting a zero here instead would be inventing a
+    # measurement of clean air out of a sensor that was not answering.
+    obs = [] if co2 is None else [
+        mk("co2_ppm", co2, "ppm"), mk("co2_max_ppm", co2_max, "ppm"),
+        mk("indoor_temp_c", t, "C"), mk("indoor_rh_pct", rh, "%")]
     if pm:
         # Masses use the same metric names as the outdoor feeds, distinguished by
         # location alone, so an indoor/outdoor ratio is a join rather than a mapping.

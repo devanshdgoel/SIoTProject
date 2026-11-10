@@ -100,6 +100,7 @@ struct Particles {
 struct Reading {
   uint32_t ts; float co2, co2_max, t, rh; uint8_t n;
   uint8_t  hasPm;                                 // 0 on the minutes the fan was off
+  uint8_t  hasCo2;                                // 0 when the SCD40 said nothing
   Particles pm;
 };
 static Reading buf[BUF_SIZE];
@@ -776,9 +777,14 @@ static int uploadBatch() {
   for (int i = 0; i < n; i++) {
     const Reading &r = buf[(bufHead + i) % BUF_SIZE];
     char item[320];
-    int k = snprintf(item, sizeof item,
-                     "%s{\"ts\":%lu,\"co2\":%.1f,\"co2_max\":%.0f,\"t\":%.2f,\"rh\":%.1f,\"n\":%u",
-                     i ? "," : "", (unsigned long)r.ts, r.co2, r.co2_max, r.t, r.rh, r.n);
+    // Absent and zero are different claims for CO2 exactly as they are for
+    // particles, so a minute the SCD40 missed carries no CO2 fields at all rather
+    // than four zeroes the host would have to guess about.
+    int k = r.hasCo2
+        ? snprintf(item, sizeof item,
+                   "%s{\"ts\":%lu,\"co2\":%.1f,\"co2_max\":%.0f,\"t\":%.2f,\"rh\":%.1f,\"n\":%u",
+                   i ? "," : "", (unsigned long)r.ts, r.co2, r.co2_max, r.t, r.rh, r.n)
+        : snprintf(item, sizeof item, "%s{\"ts\":%lu", i ? "," : "", (unsigned long)r.ts);
     // Particle fields appear only on the minutes that carry them. An absent field
     // and a zero are different claims - zero is clean air, absent is no measurement
     // - and a sensor that samples every five minutes must not assert the first.
@@ -1004,10 +1010,30 @@ void loop() {
     uint32_t minute = now / 60;
     if (curMinute == 0) curMinute = minute;
     if (minute != curMinute) {                                   // minute rolled over: finalise window
-      if (nSamples > 0) {
-        Reading r = { (uint32_t)(curMinute * 60 + 60), (float)(sumCo2 / nSamples), (float)maxCo2,
-                      (float)(sumT / nSamples), (float)(sumRh / nSamples), (uint8_t)nSamples,
-                      0, {0, 0, 0, 0, 0, 0, 0, 0, 0} };
+      /* Store the minute if EITHER sensor had something to say.
+       *
+       * This used to require a CO2 sample, and the particle fields ride inside the
+       * same struct - so a minute with no CO2 threw away a perfectly good particle
+       * measurement with it. The counter was hostage to a sensor it shares nothing
+       * with but a circuit board. It is not hypothetical: the SCD40 went quiet at
+       * 10:48 and ten hours of particle data went with it, while the board stayed
+       * up for 53 hours without a reboot and the host had no way to tell a dead
+       * node from a dead sensor.
+       */
+      bool anyCo2 = nSamples > 0;
+#if HAS_PMS
+      bool anyPm = pmHave;
+#else
+      bool anyPm = false;
+#endif
+      if (anyCo2 || anyPm) {
+        Reading r = { (uint32_t)(curMinute * 60 + 60),
+                      anyCo2 ? (float)(sumCo2 / nSamples) : 0.0f,
+                      anyCo2 ? (float)maxCo2 : 0.0f,
+                      anyCo2 ? (float)(sumT / nSamples) : 0.0f,
+                      anyCo2 ? (float)(sumRh / nSamples) : 0.0f,
+                      (uint8_t)nSamples, 0, (uint8_t)(anyCo2 ? 1 : 0),
+                      {0, 0, 0, 0, 0, 0, 0, 0, 0} };
 #if HAS_PMS
         // A particle sample belongs to the minute it was taken in, and to no other.
         // Consuming it here rather than repeating it means a minute either carries a
@@ -1016,13 +1042,17 @@ void loop() {
         if (pmHave) { r.hasPm = 1; r.pm = pmLatest; pmHave = false; }
 #endif
         pushReading(r);                                          // ts = window END, same as the host convention
-        Serial.printf("[minute] stored 1-min average: CO2 %.0f ppm, %.1f C, %.0f %% RH (%d samples). Waiting to upload: %d\n",
-                      r.co2, r.t, r.rh, nSamples, bufCount);
+        if (anyCo2)
+          Serial.printf("[minute] stored 1-min average: CO2 %.0f ppm, %.1f C, %.0f %% RH (%d samples). Waiting to upload: %d\n",
+                        r.co2, r.t, r.rh, nSamples, bufCount);
+        else
+          Serial.printf("[minute] SCD40 SILENT this minute - storing the particle sample alone. Waiting to upload: %d\n",
+                        bufCount);
         if (r.hasPm)
           Serial.printf("[minute]   with particles: PM2.5 %u ug/m3, %u per 0.1 L above 0.3 um\n",
                         r.pm.pm25, r.pm.n03);
       } else {
-        Serial.println("[minute] window had no valid samples - nothing stored");
+        Serial.println("[minute] window had no valid samples from either sensor - nothing stored");
       }
       sumCo2 = sumT = sumRh = maxCo2 = 0; nSamples = 0; curMinute = minute;
     }

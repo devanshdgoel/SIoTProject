@@ -427,3 +427,63 @@ def test_the_reply_matches_what_the_node_parses(db):
     assert '"accepted":' in raw
     # and it is still valid JSON, not just the right bytes
     assert json.loads(raw)["display"]["expression"] == "happy"
+
+
+def test_particles_survive_a_silent_co2_sensor(db):
+    """The two sensors share a board and nothing else, so one failing must not
+    discard the other's measurement. A silent SCD40 took ten hours of particle
+    data with it, because the particle fields ride inside the same struct and the
+    minute was only stored when CO2 had something to say."""
+    import time
+
+    import requests
+
+    b = scd40.HttpBackend(db, port=0, token="secret")
+    url, hdr = f"http://127.0.0.1:{b.port}/ingest", {"X-Auth-Token": "secret"}
+    now = int(time.time()) // 60 * 60
+    pm_only = {"ts": now, "pm1": 6, "pm25": 9, "pm10": 11,
+               "n03": 1480, "n05": 430, "n10": 96, "n25": 8, "n50": 2, "n100": 1}
+    got = requests.post(url, headers=hdr,
+                        json={"room": "bedroom", "readings": [pm_only]}).json()
+    assert got["accepted"] == 1, "a particle-only minute was thrown away"
+
+    obs = [o for row in b.drain() for o in scd40.reading_to_obs(*row)]
+    metrics = {o.metric for o in obs}
+    assert "pm2_5" in metrics and "pc0_3" in metrics
+    # and no CO2 is invented out of a sensor that was not answering
+    assert not any(m.startswith(("co2", "indoor_")) for m in metrics), metrics
+    b.server.shutdown()
+
+
+def test_a_minute_with_neither_sensor_is_still_dropped(db):
+    import time
+
+    import requests
+
+    b = scd40.HttpBackend(db, port=0, token="secret")
+    url, hdr = f"http://127.0.0.1:{b.port}/ingest", {"X-Auth-Token": "secret"}
+    now = int(time.time()) // 60 * 60
+    got = requests.post(url, headers=hdr,
+                        json={"readings": [{"ts": now}]}).json()
+    assert got["accepted"] == 0
+    b.server.shutdown()
+
+
+def test_a_bad_co2_reading_does_not_cost_its_particles(db):
+    """Validation rejects the CO2 half; the particle half is a different instrument."""
+    import time
+
+    import requests
+
+    b = scd40.HttpBackend(db, port=0, token="secret")
+    url, hdr = f"http://127.0.0.1:{b.port}/ingest", {"X-Auth-Token": "secret"}
+    now = int(time.time()) // 60 * 60
+    r = {"ts": now, "co2": 0, "co2_max": 0, "t": 21.0, "rh": 50, "n": 12,
+         "pm1": 6, "pm25": 9, "pm10": 11,
+         "n03": 1480, "n05": 430, "n10": 96, "n25": 8, "n50": 2, "n100": 1}
+    assert requests.post(url, headers=hdr, json={"readings": [r]}).json()["accepted"] == 1
+    obs = [o for row in b.drain() for o in scd40.reading_to_obs(*row)]
+    metrics = {o.metric for o in obs}
+    assert "pm2_5" in metrics
+    assert "co2_ppm" not in metrics
+    b.server.shutdown()
