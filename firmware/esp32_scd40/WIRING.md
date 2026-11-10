@@ -133,6 +133,36 @@ The info screen's content comes from the host, which has the forecast and the ro
 model; the node renders the lines and interprets none of them. Until the host has
 replied at least once it says so rather than showing an empty screen.
 
+## The backlog
+
+The node keeps its own readings when the host is unreachable, so a laptop that
+sleeps costs nothing. There are two tiers:
+
+| where | holds | survives a reboot |
+|---|---|---|
+| RAM ring | 240 readings, 4 hours | no |
+| flash (LittleFS) | about 14 days | yes |
+
+A healthy node never writes to flash. Readings land in the ring, upload a minute
+later, and the ring never fills. Flash is touched only once uploads have been
+failing for about three hours — which is rare, and is exactly when the data is
+worth keeping. At one block per outage a decade of them is a few thousand writes
+against a rated 100,000 per sector, with wear-levelling on top.
+
+On reconnect the flash backlog goes first, oldest to newest, and the read offset
+advances only after the host confirms it stored each batch. A crash mid-write
+loses at most the last block.
+
+This replaced a RAM-only ring that was 24 hours on one node and 12 on the other.
+That cost 56 KB of the DRAM the WiFi stack wants, lost 23 hours in a 35-hour
+outage, and emptied completely whenever the board was power-cycled — which is how
+an hour-long window test disappeared. The ring is now SMALLER and the backlog is
+fourteen times longer.
+
+**Board setting:** Tools → Partition Scheme must leave a SPIFFS/LittleFS
+partition — "Default 4MB with spiffs" does. With no partition the node logs
+`LittleFS would not mount` at boot and falls back to RAM only, which still works.
+
 ## Checking it
 
 Open the serial monitor at 115200. Within a minute of boot you should see:

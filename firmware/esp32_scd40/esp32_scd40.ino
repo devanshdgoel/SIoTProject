@@ -68,21 +68,19 @@
 
 static const uint8_t  SCD_ADDR       = 0x62;
 static const float    TEMP_OFFSET_C  = 4.0;      // self-heating compensation
-#if HAS_PMS
-// Each stored minute carries three mass figures and six count bins on top of the
-// CO2 fields, so it is roughly twice the size. Halving the depth keeps the static
-// allocation where it was: half a day of backlog still outlasts any outage seen so
-// far, and running the board out of DRAM costs every reading, not just the old ones.
+// The RAM ring is now the HOT buffer only, not the whole backlog: flash holds the
+// long outages (see pet_spill.h). So it gets smaller rather than bigger, which is
+// the opposite of what "increase the buffer" sounds like and is what actually
+// increases it. 240 readings is four hours and about 12 KB, against the 56 KB a
+// 24-hour ring cost - memory the WiFi stack and the HTTP client would rather have.
 //
-// These two numbers were the wrong way round. The comment said halve it and the
-// code doubled it, so the node with the bigger struct also got the deeper buffer -
-// roughly 56 KB of static array on the board that then kept dropping off the
-// network every few minutes, while the node with the smaller struct ran on half
-// that and stayed up for days. Backwards either way, and worth ruling out first.
-static const int      BUF_SIZE       = 720;      // minutes of backlog (~12 h)
-#else
-static const int      BUF_SIZE       = 1440;     // minutes of backlog (~24 h)
-#endif
+// Flash then carries days, and survives the power cycles that empty RAM entirely.
+static const int      BUF_SIZE       = 240;      // minutes held in RAM (~4 h)
+
+// Spill to flash once the ring is this full. Below it, a healthy node that uploads
+// every minute never touches flash at all.
+static const int      SPILL_AT       = (BUF_SIZE * 3) / 4;
+static const int      SPILL_BLOCK    = 60;       // readings moved per spill
 static const int      BATCH_MAX      = 30;       // readings per POST
 static const int      MAX_BATCHES_PER_CALL = 8;  // keep sampling while a backlog drains
 static const uint32_t UPLOAD_EVERY_MS = 60000;
@@ -103,6 +101,8 @@ struct Reading {
   uint8_t  hasCo2;                                // 0 when the SCD40 said nothing
   Particles pm;
 };
+#include "pet_spill.h"
+
 static Reading buf[BUF_SIZE];
 static int bufHead = 0, bufCount = 0;            // ring buffer: oldest at bufHead
 
@@ -660,6 +660,13 @@ static void reportWifi() {
 
 // ---------------------------------------------------------------- buffering / upload
 static void pushReading(const Reading &r) {
+  // Before the ring can overflow, move its oldest block to flash. Dropping the
+  // oldest reading was the only option when RAM was the whole backlog; now it is
+  // a last resort for when flash is full too.
+  if (bufCount >= SPILL_AT) {
+    int moved = spillWrite(buf, BUF_SIZE, bufHead, SPILL_BLOCK);
+    if (moved > 0) { bufHead = (bufHead + moved) % BUF_SIZE; bufCount -= moved; }
+  }
   int idx = (bufHead + bufCount) % BUF_SIZE;
   buf[idx] = r;
   if (bufCount < BUF_SIZE) bufCount++; else bufHead = (bufHead + 1) % BUF_SIZE;   // drop oldest
@@ -753,9 +760,19 @@ static const char *resetReason() {
 
 /* Send one batch. Returns 1 sent, 0 nothing to send, -1 the host would not take it. */
 static int uploadBatch() {
-  if (bufCount == 0) return 0;
-  if (WiFi.status() != WL_CONNECTED) { Serial.printf("[upload] skipped: WiFi is down, %d reading(s) waiting in memory\n", bufCount); return -1; }
-  int n = bufCount < BATCH_MAX ? bufCount : BATCH_MAX;
+  uint32_t inFlash = spillCount();
+  if (bufCount == 0 && inFlash == 0) return 0;
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.printf("[upload] skipped: WiFi is down, %d in memory + %lu in flash\n",
+                  bufCount, (unsigned long)inFlash);
+    return -1;
+  }
+
+  // Oldest first, and the oldest live in flash. Sending RAM first would deliver
+  // the record out of order and leave the flash backlog to grow behind it.
+  static Reading fromFlash[BATCH_MAX];
+  int nFlash = inFlash ? spillRead(fromFlash, BATCH_MAX) : 0;
+  int n = nFlash > 0 ? nFlash : (bufCount < BATCH_MAX ? bufCount : BATCH_MAX);
   // Uptime, heap and the last reset reason ride along on every upload. They cost
   // about forty bytes and they are the difference between "it keeps stopping" and
   // a diagnosis: an uptime that climbs across a gap means WiFi dropped, one that
@@ -775,7 +792,7 @@ static int uploadBatch() {
   // reserve assumes the worst case or it defeats itself on the node it is for.
   body.reserve((size_t)n * 240 + 96);
   for (int i = 0; i < n; i++) {
-    const Reading &r = buf[(bufHead + i) % BUF_SIZE];
+    const Reading &r = nFlash > 0 ? fromFlash[i] : buf[(bufHead + i) % BUF_SIZE];
     char item[320];
     // Absent and zero are different claims for CO2 exactly as they are for
     // particles, so a minute the SCD40 missed carries no CO2 fields at all rather
@@ -829,7 +846,8 @@ static int uploadBatch() {
     int ai = resp.indexOf("\"accepted\":");
     if (ai >= 0) acc = resp.substring(ai + 11).toInt();
     if (acc >= n) {
-      bufHead = (bufHead + n) % BUF_SIZE; bufCount -= n;        // all of it stored
+      if (nFlash > 0) spillConsume(n);                         // it came from flash
+      else { bufHead = (bufHead + n) % BUF_SIZE; bufCount -= n; }
       rejectStreak = 0;
     } else {
       rejectStreak++;
@@ -837,7 +855,8 @@ static int uploadBatch() {
                     "(attempt %d). Check the clock and the CO2 range.",
                     acc, n, rejectStreak);
       if (rejectStreak >= 2) {
-        bufHead = (bufHead + n) % BUF_SIZE; bufCount -= n;
+        if (nFlash > 0) spillConsume(n);
+        else { bufHead = (bufHead + n) % BUF_SIZE; bufCount -= n; }
         rejectStreak = 0;
         Serial.println("[upload] dropping it: the host will not take these readings. "
                        "THIS IS DATA LOSS and it is deliberate - the queue cannot "
@@ -867,7 +886,8 @@ static int uploadBatch() {
     // is not the host saying there is nothing to report.
     uint8_t ni = jsonStrArray(resp, "info", dispInfo, INFO_LINES);
     if (ni) dispInfoN = ni;
-    Serial.printf("[upload] OK - host accepted %d reading(s). Backlog now %d. THE WHOLE CHAIN WORKS.\n", n, bufCount);
+    Serial.printf("[upload] OK - host accepted %d reading(s). Backlog now %d in RAM + %lu in flash. THE WHOLE CHAIN WORKS.\n",
+                  n, bufCount, (unsigned long)spillCount());
     http.end();
     return 1;
   }
@@ -936,9 +956,9 @@ void setup() {
    * indistinguishable from one that is broken unless the banner names it. */
   Serial.printf("[boot] device \"%s\" in room \"%s\" (NODE %d)\n",
                 DEVICE_NAME, ROOM_NAME, (int)NODE);
-  Serial.printf("[boot] free heap %u bytes, largest block %u, backlog buffer %u\n",
+  Serial.printf("[boot] free heap %u bytes, largest block %u, RAM ring %u bytes (%d readings)\n",
                 (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap(),
-                (unsigned)sizeof(buf));
+                (unsigned)sizeof(buf), BUF_SIZE);
   Serial.printf("[boot] built with: display %s | particle counter %s | touch pad %s\n",
                 HAS_OLED ? "YES" : "no", HAS_PMS ? "YES" : "no",
                 HAS_TOUCH ? "YES" : "no");
@@ -955,6 +975,7 @@ void setup() {
 #else
   Serial.println("[pms] no particle counter on this node (set HAS_PMS in secrets.h)");
 #endif
+  spillBegin();
   i2cScan();
   oledBegin();
   petBegin();
