@@ -28,7 +28,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from analysis import analysis_human
-from collectors import aurn, open_meteo, scd40, ultrahuman
+from collectors import aurn, breathe_london, open_meteo, scd40, ultrahuman
 from collectors.base import run_collector
 from config import settings
 from storage.database import Database
@@ -40,6 +40,7 @@ ALL_COLLECTORS = {
     "open_meteo": open_meteo,
     "ultrahuman": ultrahuman,
     "aurn": aurn,
+    "breathe_london": breathe_london,
 }
 COLLECTORS = {n: m for n, m in ALL_COLLECTORS.items() if n in settings.COLLECTORS_ENABLED}
 PARKED = [n for n in ALL_COLLECTORS if n not in COLLECTORS]
@@ -394,6 +395,91 @@ def cmd_particles(args, db):
         print("  3. After the first 30 s warm-up it should show a reading. If it")
         print("     says 'only 0 good frame(s)', TXD is not on GPIO25 or VCC is")
         print("     not on 5V. Those are the two failures that look identical.")
+
+
+def _print_co2_baseline(co2):
+    """One room's outdoor-CO2 sanity check."""
+    print("\nOUTDOOR CO2: IS THE BASELINE EVEN POSSIBLE?  (%s)" % co2["location"])
+    if co2.get("fitted_c_out") is not None:
+        print("  this room's own outdoor baseline      %7.1f ppm" % co2["fitted_c_out"])
+    if co2.get("how"):
+        print("    arrived at by: %s" % co2["how"][:96])
+    print("  global atmospheric background        %7.1f ppm   (a floor, not a target)"
+          % co2["global_floor"])
+    if "model" in co2:
+        m = co2["model"]
+        print("  Open-Meteo modelled, this postcode   %7.1f ppm   lowest of %d hours"
+              % (m["min"], m["n"]))
+        print("                                       %7.1f ppm   median" % m["median"])
+    if co2.get("indoor_min") is not None:
+        print("  lowest raw reading the sensor gave   %7.1f ppm" % co2["indoor_min"])
+
+    ow = co2["open_window"]
+    if ow["labelled"] or ow["fitted"]:
+        print("\n  the 0 km reference - the sensor with the window open:")
+        for e in ow["labelled"][-4:]:
+            print("    labelled %s  %3d min   settled %.0f ppm, lowest %.0f"
+                  % (time.strftime("%d %b %H:%M", time.localtime(e["from"])),
+                     e["minutes"], e["settled"], e["min"]))
+        for e in ow["fitted"][-4:]:
+            print("    fitted   %s  lambda %.2f/h  heading for %.0f ppm"
+                  % (time.strftime("%d %b %H:%M", time.localtime(e["from"])),
+                     e["lambda_h"], e["c_inf"]))
+    else:
+        print("\n  no window-open period is labelled here, so the 0 km reference is")
+        print("  missing; one labelled hour would settle it outright")
+
+    for v in co2.get("verdicts", []):
+        print("\n  ! " + v)
+
+    aff = co2.get("affected")
+    if aff:
+        print("\n  what this does and does not change:")
+        print("    unchanged (a shared offset cancels in C - c_out): %s"
+              % ", ".join(aff["unchanged"]))
+        print("    reads about %d ppm low: %s"
+              % (aff["shifted_low_by_ppm"], ", ".join(aff["affected"])))
+        print("    no correction is applied anywhere - this measures the problem")
+        print("    rather than patching over it")
+
+
+def cmd_outdoor(args, db):
+    """Do the four 'outside' sources agree? Every indoor result leans on one.
+
+    Printed rather than plotted because the interesting part is a small number of
+    numbers: a bias, a ratio, and one impossibility.
+    """
+    from analysis import outdoor as od
+    rep = od.compare(db, days=args.days)
+
+    print("\nPM2.5: WHAT EACH SOURCE SAYS  (hourly means, last %d days)" % args.days)
+    src = rep["pm"]["sources"]
+    if not src:
+        print("  no PM2.5 anywhere yet")
+    else:
+        print("  %-26s %6s %8s %8s  %s" % ("source", "hours", "mean", "max", "what it is"))
+        for name in sorted(src, key=lambda k: -src[k]["mean"]):
+            d = src[name]
+            print("  %-26s %6d %8.1f %8.1f  %s"
+                  % (name[:26], d["n"], d["mean"], d["max"], d["label"]))
+
+    if rep["pm"]["pairs"]:
+        print("\n  pairwise, on the hours both covered:")
+        print("  %-44s %5s %8s %7s %6s" % ("", "n", "bias", "ratio", "r"))
+        for key, p in sorted(rep["pm"]["pairs"].items(),
+                             key=lambda kv: -abs(kv[1]["bias"])):
+            r = ("%+.2f" % p["r"]) if "r" in p else "   -"
+            print("  %-44s %5d %+8.1f %7.2f %6s"
+                  % (key[:44], p["n"], p["bias"], p["ratio"], r))
+        print("  bias and ratio are the SECOND source relative to the first")
+
+    if rep["missing"]:
+        print("\n  MISSING: %s - no rows stored, so absent from the table above"
+              % ", ".join(rep["missing"]))
+
+    for co2 in rep["co2"]:
+        _print_co2_baseline(co2)
+    print()
 
 
 def cmd_limits(args, db):
@@ -961,6 +1047,9 @@ def main():
     p.set_defaults(fn=cmd_nodes)
     p = sub.add_parser("particles", help="is the particle counter working")
     p.set_defaults(fn=cmd_particles)
+    p = sub.add_parser("outdoor", help="do the outdoor sources agree with each other")
+    p.add_argument("--days", type=int, default=14)
+    p.set_defaults(fn=cmd_outdoor)
     p = sub.add_parser("limits", help="what this system does not know")
     p.set_defaults(fn=cmd_limits)
     p = sub.add_parser("backup", help="consistent copy of the database")

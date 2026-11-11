@@ -64,6 +64,25 @@ EXPRESSIONS = ["neutral", "happy", "concerned", "alert", "sleepy", "sad"]
 AURN_API_ROOT = "https://uk-air.defra.gov.uk/sos-ukair/api/v1"
 AURN_STATIONS = [s.strip() for s in os.getenv("AURN_STATIONS", "786074,962,1033").split(",") if s.strip()]
 
+# --- Breathe London (GLA/Imperial Clarity nodes; API key required) ---------
+# Worth having for distance, not for accuracy. Measured from HOME_LAT/HOME_LON:
+#   CLDP0317 Warwick Road          0.71 km  roadside
+#   CLDP0675 Christ Church School  1.80 km  urban background
+#   nearest AURN analyser          ~3 km
+#   Open-Meteo CAMS cell           ~11 x 7 km, the whole of inner London
+# Both are configured on purpose rather than just the closest: a roadside node at
+# 700 m measures a road, and the air that infiltrates a bedroom is closer in
+# character to urban background. Having both brackets the flat instead of
+# assuming which one it resembles. Low-cost optical sensors, so a disagreement
+# with AURN is a finding rather than automatically their error.
+# Site selection needs no key - `python -m collectors.breathe_london` lists the
+# nearest nodes from the GLA's open inventory, with their siting class.
+BREATHE_LONDON_ROOT = "https://api.breathelondon-communities.org/api"
+BREATHE_LONDON_KEY = os.getenv("BREATHE_LONDON_KEY", "").strip()
+BREATHE_LONDON_SITES = [s.strip() for s in
+                        os.getenv("BREATHE_LONDON_SITES", "CLDP0317,CLDP0675").split(",")
+                        if s.strip()]
+
 # --- Which collectors run ---------------------------------------------------
 # Everything stays importable and testable; this only decides what the scheduler
 # starts. The city-scale collectors (grid carbon, Thames overflows, LAQN) live in
@@ -89,6 +108,7 @@ INTERVALS = {
     "open_meteo": 1800,        # hourly model output; 30 min guarantees freshness
     "ultrahuman": 1800,
     "aurn": 1800,             # hourly analyser means, published with a lag        # ring syncs via phone, so sub-30-min polling gains nothing
+    "breathe_london": 1800,   # hourly averages, same as AURN
 }
 
 # --- Analysis --------------------------------------------------------------
@@ -107,6 +127,7 @@ STALE_AFTER_S = {
     "scd40": 300,
     "open_meteo": 3 * 3600,
     "aurn": 6 * 3600,         # ratification lag means the newest hour often trails
+    "breathe_london": 6 * 3600,
     "ultrahuman": 12 * 3600,   # the ring syncs only when the phone app opens, so a
                                # half-day lag is normal, not a fault. A real failure
                                # shows up as a collector error, not as stale data.

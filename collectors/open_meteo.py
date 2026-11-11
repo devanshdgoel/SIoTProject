@@ -36,6 +36,14 @@ AIR_VARS = {
     "ozone": ("o3", "ug/m3"),
     "sulphur_dioxide": ("so2", "ug/m3"),
     "carbon_monoxide": ("co", "ug/m3"),
+    # Modelled outdoor CO2, in ppm. Collected for one reason: it is the only
+    # independent check on the outdoor baseline the room's own decays fit to.
+    # That baseline came out at 358 ppm, which is below the global atmospheric
+    # background and 87 ppm below the LOWEST hour this model has ever reported
+    # here - so one of the two is wrong, and until this series existed there was
+    # no way to tell. It is a model on an 11 km cell, not a measurement, so its
+    # floor is the useful part rather than its hour-to-hour value.
+    "carbon_dioxide": ("co2_outdoor_ppm", "ppm"),
     "european_aqi": ("european_aqi", "index"),
 }
 
