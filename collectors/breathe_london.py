@@ -167,7 +167,49 @@ def nearest(lat=None, lon=None, n=12):
     return out[:n]
 
 
+def verify():
+    """Is the key live yet? Prints a verdict, and says what it has ruled out.
+
+    Worth being a command rather than a note in a commit message, because the
+    answer changes without anything here changing: a key that their service has
+    not activated yet becomes a key that works, with no edit on this side. Run it
+    again rather than re-deriving the diagnosis.
+
+    It sends exactly one request, by the transport their documentation specifies.
+    The earlier investigation established what is NOT worth re-testing: the key is
+    39 characters with Google's usual key prefix (well formed, not truncated); the
+    rejection carries `x-powered-by: Express`, so it comes from Breathe London's
+    own application rather than Google's gateway; the same message comes back for
+    a request with no key at all, so the text says nothing about transport; and
+    `key`, `apikey`, `api_key`, `API_Key` and an `x-api-key` header were all
+    refused identically. That leaves the key not being active on their side.
+    """
+    key = settings.BREATHE_LONDON_KEY
+    if not key:
+        print("no BREATHE_LONDON_KEY in .env")
+        return False
+    print(f"key: {len(key)} chars, starts {key[:6]!r} "
+          f"({'well formed' if len(key) == 39 else 'UNEXPECTED LENGTH - 39 expected'})")
+    payload = get_json(f"{settings.BREATHE_LONDON_ROOT}/ListSensors", params={"key": key})
+    if isinstance(payload, list) and payload:
+        print(f"LIVE: {len(payload)} nodes returned. Add breathe_london to COLLECTORS "
+              f"in .env and run `python main.py once breathe_london`.")
+        return True
+    err = payload.get("error") if isinstance(payload, dict) else payload
+    print(f"REFUSED: {err}")
+    print("Their own application is rejecting the key value - transport is correct and")
+    print("every alternative was tried. Nothing on this side can fix it. Either the key")
+    print("is not activated yet (new registrations are not always immediate), or it was")
+    print("issued for something other than this API. If it is still refused after a day,")
+    print("helpdesk@breathelondon.org, quoting the first six characters only and the URL")
+    print(f"  {settings.BREATHE_LONDON_ROOT}/ListSensors?key=...")
+    return False
+
+
 if __name__ == "__main__":
+    print("--- is the key live? ---")
+    verify()
+    print()
     print(f"Breathe London nodes nearest {settings.HOME_LAT:.4f}, {settings.HOME_LON:.4f}")
     print(f"{'km':>6}  {'id':<11} {'site':<32} {'classification':<18} {'pm25 2022':>9}")
     for dist, sid, name, cls, pm in nearest():
