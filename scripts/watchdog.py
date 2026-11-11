@@ -208,6 +208,18 @@ def notify(title, body, priority="high"):
                              f"{type(exc).__name__}: {exc}\n")
             except OSError:
                 pass
+    # Record the successes too. Only failures were logged, which left no positive
+    # evidence that an alert ever went out: after the 11 November outage the only
+    # way to argue the 04:25 push had been sent was that nothing had logged a
+    # failure, and ntfy's free cache had already dropped the message. An absence
+    # of errors is not a delivery receipt.
+    if sent:
+        try:
+            with open(LOG, "a", encoding="utf-8") as fh:
+                fh.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} "
+                         f"NOTIFIED via {', '.join(sent)}: {title}\n")
+        except OSError:
+            pass
     return sent
 
 
