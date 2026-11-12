@@ -1584,24 +1584,57 @@ def test_two_databases_do_not_block_each_other(tmp_path):
     single_instance.release(b)
 
 
-def test_concurrent_analysis_passes_do_not_interleave(db):
+def test_concurrent_analysis_passes_do_not_interleave(db, monkeypatch):
     """run() is reachable from the collector loop and from the dashboard's button,
     in different processes. Both clear room_params and rewrite it, so overlapping
     passes can leave whichever subset the second DELETE missed - with no exception
-    and no log line."""
+    and no log line.
+
+    Starting four threads and hoping they collide does not test that. Thread
+    starts are staggered by milliseconds and a pass over three days of data
+    finishes in less than that, so the winner routinely released the lock before
+    the fourth thread had called run() at all - and a second pass then ran quite
+    correctly, one after the other, failing an assertion that demanded exactly
+    one. The test failed about half the time while the lock was never at fault,
+    which is worse than no test: it teaches you to ignore a red run.
+
+    So the overlap is made certain rather than hoped for. The winner is held
+    inside the locked section until the other three have been turned away, which
+    is the only arrangement in which 'exactly one ran' means what it claims.
+    """
     import threading
 
     simulate(db, days=3)
+    n = 4
     results = []
+    guard = threading.Lock()
+    may_finish = threading.Event()
+    real_run = analysis_human._run
+
+    def held_run(*a, **kw):
+        # Whoever won the lock waits here, still holding it, until every other
+        # thread has recorded its refusal. The timeout is a deadlock escape, not
+        # a timing assumption: it is asserted on below.
+        may_finish.wait(30)
+        return real_run(*a, **kw)
+
+    monkeypatch.setattr(analysis_human, "_run", held_run)
 
     def go():
-        results.append(analysis_human.run(db))
+        r = analysis_human.run(db)
+        with guard:
+            results.append(r)
+            if sum(1 for x in results if x.get("skipped")) == n - 1:
+                may_finish.set()
 
-    threads = [threading.Thread(target=go) for _ in range(4)]
+    threads = [threading.Thread(target=go) for _ in range(n)]
     for t in threads:
         t.start()
     for t in threads:
-        t.join()
+        t.join(60)
+    assert not any(t.is_alive() for t in threads), "a thread never finished"
+    assert may_finish.is_set(), (
+        "the other threads never reached the lock, so nothing was contended")
 
     ran = [r for r in results if not r.get("skipped")]
     assert len(ran) == 1, f"{len(ran)} passes ran at once"
