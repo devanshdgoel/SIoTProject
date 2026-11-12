@@ -25,6 +25,7 @@ why every number it produces has a unit and a confidence interval.
 """
 
 import json
+import math
 import time
 from datetime import datetime
 
@@ -236,19 +237,74 @@ def _robust(values):
     med = float(np.median(a))
     if a.size < 2:
         return med, None, 1
-    sd = 1.4826 * float(np.median(np.abs(a - med)))
-    # The MAD can be exactly zero - two of four fits agreeing to three decimals is
-    # enough - and 1.253*0/sqrt(n) is a claim of INFINITE precision written straight
-    # into room_params.stderr. _robust([0.5, 0.5, 0.5, 2.0]) did precisely that.
-    # The floor is the widest of three scales that cannot all collapse together, so
-    # a degenerate MAD falls back on the spread that is actually there.
-    if a.size >= 4:
-        q1, q3 = np.percentile(a, [25, 75])
-        sd = max(sd, float(q3 - q1) / 1.349)
-    sd = max(sd, 0.05 * abs(med))
+    sd = _spread(a, med)
     # At n = 4-6 the MAD's own relative error is near 40%, so this remains a noisy
     # estimate of a noisy quantity. It is a floor on the honesty, not a tight bound.
     return med, float(1.253 * sd / np.sqrt(a.size)), int(a.size)
+
+
+def _spread(values, med=None):
+    """Robust standard deviation of a sample - how much the quantity itself varies.
+
+    Split out of `_robust` because it is wanted on its own twice over: to say how far
+    a room's air-change rate moves between events, and to judge whether one decay is
+    grossly inconsistent with the rest of them.
+
+    The MAD can be exactly zero - two of four fits agreeing to three decimals is
+    enough - and 1.253*0/sqrt(n) is a claim of INFINITE precision written straight
+    into room_params.stderr. _robust([0.5, 0.5, 0.5, 2.0]) did precisely that. The
+    floor is the widest of three scales that cannot all collapse together, so a
+    degenerate MAD falls back on the spread that is actually there."""
+    a = np.asarray(list(values), dtype=float)
+    med = float(np.median(a)) if med is None else float(med)
+    sd = 1.4826 * float(np.median(np.abs(a - med)))
+    if a.size >= 4:
+        q1, q3 = np.percentile(a, [25, 75])
+        sd = max(sd, float(q3 - q1) / 1.349)
+    return max(sd, 0.05 * abs(med))
+
+
+def _uncertainty(values, per_fit=()):
+    """The two uncertainties on a pooled rate. They are not the same claim.
+
+      precision   median per-fit standard error: how tightly ONE curve pins its own
+                  lambda. A 25-minute exponential fall is well determined, so this is
+                  small - in this bedroom around 0.03/h.
+      spread      robust standard deviation of the population: how much the rate the
+                  room actually HAS varies from event to event. Several times larger.
+      se_median   spread / sqrt(n): how well the pooled median itself is pinned down.
+
+    Quoting precision alone is the easy mistake, because precision is the number a
+    curve fit hands you. It answers "how well did I measure that one decay". Every
+    use of lambda_sealed in this system - tonight's ceiling, the purge cost, the
+    forecast - asks instead "what is this room's rate", and the honest error bar on
+    that is the spread. The gap between the two is not instrument noise: it is the
+    room changing with wind, temperature difference and which doors were shut, which
+    is exactly what `fit_weather` then tries to explain. Reporting only precision
+    would make this system look several times more certain than it has any right to.
+    """
+    a = np.asarray([v for v in values if v is not None], dtype=float)
+    if a.size == 0:
+        return None
+    med = float(np.median(a))
+    fits = [float(e) for e in per_fit if e is not None and e > 0]
+    out = {"n": int(a.size), "median": round(med, 4),
+           "spread_1h": round(_spread(a, med), 4),
+           "range_1h": [round(float(a.min()), 3), round(float(a.max()), 3)]}
+    out["se_median_1h"] = (round(1.253 * out["spread_1h"] / math.sqrt(a.size), 4)
+                           if a.size >= 2 else None)
+    if fits:
+        out["precision_1h"] = round(float(np.median(fits)), 4)
+        out["n_with_stderr"] = len(fits)
+        if out["precision_1h"] > 0:
+            out["inflation"] = round(out["spread_1h"] / out["precision_1h"], 1)
+    if a.size >= 2 and out.get("precision_1h") and out.get("inflation"):
+        out["note"] = (
+            "%.3f/h within one event, %.3f/h between events (%sx): one decay pins "
+            "its own rate far more tightly than the room repeats it, so the "
+            "between-event spread is the uncertainty on 'the' rate"
+            % (out["precision_1h"], out["spread_1h"], out["inflation"]))
+    return out
 
 
 SPLIT_ALPHA = 0.05              # how surprising a split has to be before it is real
@@ -312,6 +368,99 @@ def split_point(values, default=None, alpha=SPLIT_ALPHA, draws=SPLIT_DRAWS, seed
     if best > float(np.quantile(null, alpha)):
         return None
     return cut
+
+
+# How far outside its own population an unlabelled decay has to sit before it stops
+# being treated as envelope leakage. Deliberately hard to trip: BOTH tests have to
+# fail together, because the opposite mistake is the one `split_point` was already
+# caught making - on a heavy-tailed sample, any threshold keen enough to catch the
+# tail starts calling ordinary dispersion an open window.
+INCONSISTENT_RATIO = 3.0        # times the room's own median rate
+INCONSISTENT_Z = 4.0            # robust standard deviations above it
+# The ratio is deliberately the binding test, and it was not always. At n of about
+# eight a MAD understates the tail badly, so z reached 5 or 6 on values only 2.7x
+# the median - the z test was condemning decays the ratio thought ordinary, which
+# is the dispersion-detecting failure again, wearing a different hat. Real envelope
+# leakage varies by a factor of two or three with wind and temperature, so a rate
+# has to clear three times the median before "the envelope cannot do that" is a
+# statement about physics rather than about sample size.
+INCONSISTENT_MIN_N = 6          # below this there is no population to be inconsistent with
+NEAR_MISS_RATIO = 2.0           # reported, not rejected, so the judgement stays visible
+
+
+def reject_inconsistent(lambdas, states, labelled, ratio=INCONSISTENT_RATIO,
+                        zmax=INCONSISTENT_Z, min_n=INCONSISTENT_MIN_N):
+    """Take grossly inconsistent unlabelled decays out of the sealed population.
+
+    `classify` falls back on "sealed" whenever there is no window label and no usable
+    cut - which is most of the time, since `split_point` rightly refuses a cut it
+    cannot tell apart from dispersion. That fallback treats the ABSENCE of a label as
+    evidence that the window was shut. It is not. It is evidence that nobody wrote
+    anything down.
+
+    The bedroom's 8 Nov 02:05 decay is the case that found this. It fell 1137 -> 553
+    ppm in 25 minutes towards a fitted asymptote of 358 ppm - outdoor air, so not the
+    door - at 3.91/h, ten times the room's median. Envelope leakage cannot do that.
+    It was pooled into lambda_sealed all the same, and pushed the decay-against-rise
+    cross-check from 21% to 42% apart: the system's best internal check was being
+    failed by a classification error rather than by the physics it was built to test.
+
+    A decay has to be BOTH several times the median AND far outside the room's own
+    scatter, and the population is measured WITHOUT it, so one large value cannot
+    inflate the very scale meant to judge it. Labelled rows are never screened: a
+    label is evidence, and this routine exists only where evidence is missing.
+
+    One pass, judged against the pool as it stands, so rejecting the largest decay
+    cannot tighten the scale and cascade into rejecting the next largest. Values that
+    are merely unusual are reported rather than removed - the near-miss list exists
+    so a reader can see where the line fell and disagree with it.
+
+    Rejected rows become "unexplained", not "ventilated". The room really did exchange
+    air that fast and that is worth keeping, but nothing here knows a window was open,
+    so it is not evidence about openings either. Every consumer filters on an exact
+    state, so an unexplained row simply stops contributing to any fit - which is the
+    whole intent.
+    """
+    lam = np.asarray(list(lambdas), dtype=float)
+    states, labelled = list(states), list(labelled)
+    pool = [i for i, st in enumerate(states) if st == "sealed"]
+    report = {"rejected": [], "near_misses": [], "n_pool": len(pool)}
+    if len(pool) < min_n:
+        report["note"] = ("%d sealed decays is too few to define a population that "
+                          "anything could be inconsistent with (needs %d); nothing "
+                          "screened" % (len(pool), min_n))
+        return states, report
+
+    for i in pool:
+        if labelled[i] in ("open", "closed"):
+            continue                      # the user said so, which outranks any screen
+        others = np.array([lam[j] for j in pool if j != i], dtype=float)
+        med = float(np.median(others))
+        sd = _spread(others, med)
+        if med <= 0 or sd <= 0:
+            continue
+        r, z = float(lam[i] / med), float((lam[i] - med) / sd)
+        entry = {"lambda_h": round(float(lam[i]), 3), "ratio": round(r, 1),
+                 "z": round(z, 1), "pool_median": round(med, 3),
+                 "pool_spread": round(sd, 3)}
+        if r >= ratio and z >= zmax:
+            states[i] = "unexplained"
+            report["rejected"].append(entry)
+        elif r >= NEAR_MISS_RATIO:
+            report["near_misses"].append(entry)
+    if report["rejected"]:
+        report["note"] = (
+            "%d unlabelled decay(s) removed from lambda_sealed: over %sx the median "
+            "AND more than %s robust sd above it, which envelope leakage cannot "
+            "produce. Kept as 'unexplained' rather than called a window, because no "
+            "label says it was one"
+            % (len(report["rejected"]), ratio, zmax))
+    elif report["near_misses"]:
+        report["note"] = (
+            "nothing grossly inconsistent; %d decay(s) above %sx the median kept, "
+            "since a heavy tail is not the same thing as an open window"
+            % (len(report["near_misses"]), NEAR_MISS_RATIO))
+    return states, report
 
 
 def classify(lambdas, labelled, cut):
@@ -505,7 +654,7 @@ def _learn(db, location, days=14, now=None):
                 "labelled": features.label_over(labels, int(a.timestamp()),
                                                 int(b.timestamp()), "window")}
 
-    rows, lams, marks = [], [], []
+    rows, lams, marks, screen = [], [], [], {}
 
     def coupled(row):
         """Did this decay empty into the rest of the home rather than outdoors?
@@ -558,28 +707,46 @@ def _learn(db, location, days=14, now=None):
                      (location, start))
     if rows:
         cut = split_point(lams)
-        for row, state in zip(rows, classify(lams, marks, cut)):
-            # A confirmed opening stays what the user said it was; anything else
-            # that settled on house air is reclassified, not discarded. It is still
-            # a real air-change rate of the room - it just answers a different
-            # question, and lumping it in with the envelope answers neither.
-            if state != "ventilated" and coupled(row):
-                state = "coupled"
+        states = classify(lams, marks, cut)
+        # A confirmed opening stays what the user said it was; anything else that
+        # settled on house air is reclassified, not discarded. It is still a real
+        # air-change rate of the room - it just answers a different question, and
+        # lumping it in with the envelope answers neither.
+        states = ["coupled" if (st != "ventilated" and coupled(row)) else st
+                  for st, row in zip(states, rows)]
+        # Coupling is settled BEFORE the consistency screen, deliberately. A decay
+        # that emptied into the rest of the flat has already left the sealed pool, so
+        # the screen only ever judges decays still claiming to measure the envelope -
+        # and a door is explained, where an unlabelled 3.9/h fall towards outdoor air
+        # is not.
+        states, screen = reject_inconsistent(lams, states, marks)
+        for row, state in zip(rows, states):
             row["inferred"] = state
+        if screen.get("rejected") or screen.get("near_misses"):
+            summary["screen"] = screen
         db.save_decays(rows)
         summary["decays"] = len(rows)
         summary["split_at"] = cut
         n_coupled = sum(1 for r in rows if r["inferred"] == "coupled")
         if n_coupled:
             summary["coupled"] = n_coupled
+        n_unexplained = sum(1 for r in rows if r["inferred"] == "unexplained")
+        if n_unexplained:
+            summary["unexplained"] = n_unexplained
         for state, param in (("sealed", "lambda_sealed"), ("ventilated", "lambda_open")):
             vals = [r["lambda_h"] for r in rows if r["inferred"] == state]
             med, err, n = _robust(vals)
             if med is not None:
+                # Both uncertainties, because the stored `stderr` column can hold only
+                # one and the two answer different questions. See `_uncertainty`.
                 db.set_param(location, param, med, err, n, "1/h",
                              {"from": "CO2 decay fits", "split_at": cut,
                               "labelled": sum(1 for r in rows
-                                              if r["inferred"] == state and r["labelled"])})
+                                              if r["inferred"] == state and r["labelled"]),
+                              "uncertainty": _uncertainty(
+                                  vals, [r.get("stderr") for r in rows
+                                         if r["inferred"] == state]),
+                              "screen": screen or None})
                 summary[param] = (round(med, 3), n)
 
     # Source term from occupied rises. A room filling toward its ceiling gives the
@@ -668,6 +835,17 @@ def _learn(db, location, days=14, now=None):
             r_med, _e, _n = _robust(rise_lams)
             detail = {"from": "CO2 decays and occupied rises pooled",
                       "decays": len(decay_lams), "rises": len(rise_lams),
+                      # This write replaces the one the per-state loop made above,
+                      # so anything that should survive has to be repeated here.
+                      # The screen was not, and a room with rises - which is the
+                      # room the screen was built for - showed its unexplained
+                      # count with no account of why.
+                      "screen": screen or None,
+                      "uncertainty": _uncertainty(
+                          decay_lams + rise_lams,
+                          [r.get("stderr") for r in rows
+                           if r.get("inferred") == "sealed"]
+                          + [r.get("stderr") for r in rises if r["lambda_usable"]]),
                       "decay_median": None if d_med is None else round(d_med, 3),
                       "rise_median": round(r_med, 3),
                       "skipped_rises": sum(1 for r in rises if not r["lambda_usable"])}
@@ -754,6 +932,107 @@ def _learn(db, location, days=14, now=None):
 MIN_WEATHER_FITS = 6          # below this the three coefficients are not identifiable
 
 
+def _marginal(lam, driver, name, unit):
+    """How lambda moves with ONE driver on its own, as a correlation and a t.
+
+    Reported because the quadrature fit can be refused on a ground that does not
+    apply to the thing a reader most wants to know. `fit_weather` needs a |dT| span
+    of 5 C before the stack term b can be told apart from the intercept a, and quite
+    right - but the CORRELATION between lambda and |dT| needs no such separation,
+    because with one predictor there is nothing for the intercept to steal. When the
+    three-coefficient fit is refused, the stack evidence used to vanish from the
+    output entirely, including the identifiable part of it.
+
+    The sign is the physics and is the reason this is worth printing at all.
+    Stack-driven infiltration MUST rise with |dT|: warm air leaves the top of a room
+    and cold air is drawn in at the bottom, and the pressure doing it is proportional
+    to the temperature difference. So a positive coefficient corroborates the
+    mechanism and a negative one contradicts it - which is a result either way, and a
+    more interesting one than a refused fit. The desk's |dT| coefficient is negative,
+    the bedroom's is positive; that difference is a finding, not noise to be averaged
+    away.
+
+    It is a correlation, so it is not a claim that |dT| CAUSES the change: in London
+    a cold night is often also a still one, and with wind in the same model the two
+    cannot be separated at this sample size. That is stated in the verdict rather
+    than hidden behind a p-value."""
+    lam = np.asarray(lam, dtype=float)
+    driver = np.asarray(driver, dtype=float)
+    n = int(lam.size)
+    if n < 4 or float(np.std(driver)) == 0 or float(np.std(lam)) == 0:
+        return None
+    r = float(np.corrcoef(driver, lam)[0, 1])
+    dof = n - 2
+    t = r * math.sqrt(dof / max(1e-12, 1.0 - r ** 2))
+    span = float(driver.max() - driver.min())
+    out = {"driver": name, "unit": unit, "n": n, "r": round(r, 3),
+           "t": round(float(t), 2), "dof": dof, "span": round(span, 1),
+           "range": [round(float(driver.min()), 1), round(float(driver.max()), 1)],
+           "significant": bool(abs(t) >= MIN_WEATHER_T)}
+    strength = ("distinguishable from zero" if out["significant"]
+                else "NOT distinguishable from zero at this sample size")
+    out["verdict"] = ("lambda vs %s: r = %+.2f (t = %.2f, %d df, span %.1f %s) - %s"
+                      % (name, r, t, dof, span, unit, strength))
+    return out
+
+
+def weather_marginals(db, location, min_r2=0.90, start=None):
+    """lambda against each weather driver on its own, over EVERY sealed decay.
+
+    `fit_weather` uses only departure-anchored decays, and it is right to: pooling
+    threshold-found windows would put the measurement geometry into the residuals
+    alongside the weather, and with three coefficients to identify that matters. But
+    the bedroom has two departure-anchored measurements and about a dozen sealed
+    decays, so that correct restriction deleted the question rather than answering
+    it - the room's stack signal was sitting in data the fit would not look at.
+
+    A single-predictor correlation is a different proposition. It has one degree of
+    freedom to spend, not three, and it asks only whether lambda MOVES with the
+    driver - which varying segment lengths blur but do not bias. So it is computed
+    over every sealed decay carrying weather, with the wider sample stated, and the
+    quadrature fit keeps its stricter one.
+
+    The sign is the result. Stack-driven infiltration must rise with |dT|: warm air
+    leaves the top of a room, cold air is drawn in at the bottom, and the pressure
+    doing it is proportional to the temperature difference. A positive coefficient
+    corroborates the mechanism; a negative one contradicts it, and is a finding
+    rather than noise. These two rooms disagree about it, which is the most
+    interesting thing either of them has said about infiltration.
+
+    'sealed' here is post-screen, so decays that measured a door (`coupled`) or that
+    were grossly inconsistent with the envelope (`unexplained`) are already gone. It
+    was worth checking: the bedroom's rejected 3.91/h decay was one of the coldest
+    nights on record, and it alone was holding up part of the apparent correlation.
+    """
+    rows = [r for r in db.decays(location, min_r2=min_r2, start=start)
+            if (r["inferred"] == "sealed" and r["wind_ms"] is not None
+                and r["delta_t_c"] is not None)]
+    if len(rows) < 4:
+        return {"marginal_n": len(rows),
+                "marginal_note": "fewer than 4 sealed decays carry weather data"}
+    lam = np.array([r["lambda_h"] for r in rows], dtype=float)
+    wind = np.array([r["wind_ms"] for r in rows], dtype=float)
+    dT = np.abs(np.array([r["delta_t_c"] for r in rows], dtype=float))
+
+    out = {"marginal_n": len(rows),
+           "marginal_from": "every sealed decay with weather, not only departures",
+           "buoyancy": _marginal(lam, dT, "|dT|", "C"),
+           "wind_marginal": _marginal(lam, wind, "wind", "m/s")}
+    if out["buoyancy"]:
+        right_sign = out["buoyancy"]["r"] > 0
+        out["buoyancy"]["physics"] = (
+            "positive - the sign stack-driven infiltration must have, since a bigger "
+            "indoor-outdoor temperature difference drives a bigger pressure and more "
+            "leakage. The mechanism is corroborated, and the magnitude is not claimed"
+            if right_sign else
+            "NEGATIVE, which stack pressure cannot produce: a colder night cannot "
+            "drive LESS infiltration. Something else is carrying it - occupancy "
+            "habits, or wind that runs the other way with temperature here")
+        out["buoyancy"]["stack_driven"] = bool(right_sign
+                                               and out["buoyancy"]["significant"])
+    return out
+
+
 def fit_weather(db, location, min_r2=0.90, start=None):
     """How this room's air-change rate moves with the weather.
 
@@ -794,9 +1073,22 @@ def fit_weather(db, location, min_r2=0.90, start=None):
     usable = [r for r in db.decays(location, min_r2=min_r2, start=start)
               if (r["method"] == "departure" and r["inferred"] == "sealed"
                   and r["wind_ms"] is not None and r["delta_t_c"] is not None)]
+    # The marginals are computed over a WIDER sample than the quadrature fit and are
+    # reported even when it cannot run, because they are the part of the question
+    # that this room's data can actually answer. See `weather_marginals`.
+    marginals = weather_marginals(db, location, min_r2=min_r2, start=start)
     if len(usable) < MIN_WEATHER_FITS:
-        return {"n": len(usable), "need": MIN_WEATHER_FITS,
-                "note": "not enough standardised measurements yet"}
+        out = {"n": len(usable), "need": MIN_WEATHER_FITS,
+               "note": "not enough standardised measurements for the quadrature fit"}
+        out.update(marginals)
+        # Stored with n=0 even though no law was fitted, because the marginals are
+        # the result here and an unstored result is one nobody reads. This is the
+        # bedroom's case exactly: two departure-anchored decays against a dozen
+        # sealed ones, so the only thing that can be said about its infiltration is
+        # the thing this branch carries.
+        db.set_param(location, "lambda_wind_c", None, None, 0,
+                     "(1/h)^2 per (m/s)^2", out)
+        return out
 
     lam = np.array([r["lambda_h"] for r in usable], dtype=float)
     wind = np.array([r["wind_ms"] for r in usable], dtype=float)
@@ -839,11 +1131,13 @@ def fit_weather(db, location, min_r2=0.90, start=None):
     if fails:
         out["refuted"] = "; ".join(fails)
         out["usable"] = False
+        out.update(marginals)
         db.set_param(location, "lambda_wind_c", None, None, 0,
                      "(1/h)^2 per (m/s)^2", out)
         return out
 
     out["usable"] = True
+    out.update(marginals)
     db.set_param(location, "lambda_wind_c", out["c"], out["stderr"][2], len(lam),
                  "(1/h)^2 per (m/s)^2", out)
     return out

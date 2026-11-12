@@ -11,7 +11,8 @@ import pandas as pd
 import pytest
 
 from analysis import analysis_human, features
-from analysis.room_model import RoomModel, classify, learn, split_point
+from analysis.room_model import (RoomModel, _marginal, _uncertainty, classify,
+                                 learn, reject_inconsistent, split_point)
 from collectors.base import CollectResult, Observation
 from storage.database import Database
 
@@ -1953,3 +1954,166 @@ def test_an_impossible_penetration_is_reported_as_an_over_read(db):
     assert got["over_read"] == pytest.approx(got["implied_penetration"])
     assert "upper bound on the over-read" in got["note"]
     assert "would each look identical" in got["note"]      # names the alternatives
+
+
+# --- the consistency screen ----------------------------------------------------
+#
+# The bug these cover: `classify` falls back on "sealed" whenever there is no label
+# and no usable cut, which treats the absence of a label as evidence of a shut
+# window. The bedroom's unlabelled 3.91/h decay was pooled into lambda_sealed on
+# that basis and pushed the decay-vs-rise cross-check from 21% to 42% apart.
+
+ENVELOPE = [0.21, 0.24, 0.30, 0.32, 0.38, 0.38, 0.45, 0.47]
+
+
+def test_a_grossly_inconsistent_unlabelled_decay_leaves_the_sealed_pool():
+    lams = ENVELOPE + [3.91]
+    states = ["sealed"] * len(lams)
+    out, report = reject_inconsistent(lams, states, [None] * len(lams))
+    assert out[-1] == "unexplained", "the 3.91/h decay stayed in lambda_sealed"
+    assert out[:-1] == ["sealed"] * len(ENVELOPE), "it took the envelope with it"
+    assert len(report["rejected"]) == 1
+    assert report["rejected"][0]["ratio"] > 8
+
+
+def test_the_rejected_decay_is_not_called_a_window():
+    """It is excluded from lambda_OPEN too. Nothing here knows a window was open."""
+    lams = ENVELOPE + [3.91]
+    out, _ = reject_inconsistent(lams, ["sealed"] * len(lams), [None] * len(lams))
+    assert "ventilated" not in out
+
+
+def test_a_heavy_tail_is_not_mistaken_for_a_window():
+    """The opposite error, and the one split_point was already caught making.
+
+    A log-normal-ish sample has a tail; a threshold keen enough to catch it starts
+    calling ordinary dispersion an opening."""
+    lams = ENVELOPE + [0.95]          # 2.7x the median, but only ~2 sd out
+    out, report = reject_inconsistent(lams, ["sealed"] * len(lams),
+                                      [None] * len(lams))
+    assert out[-1] == "sealed", "ordinary dispersion was called a window"
+    assert report["near_misses"], "a 2.7x value should be reported, not silently kept"
+
+
+def test_a_label_outranks_the_screen():
+    """If the user says the window was shut, that is evidence; the screen is not."""
+    lams = ENVELOPE + [3.91]
+    marks = [None] * len(ENVELOPE) + ["closed"]
+    out, report = reject_inconsistent(lams, ["sealed"] * len(lams), marks)
+    assert out[-1] == "sealed"
+    assert not report["rejected"]
+
+
+def test_one_outlier_cannot_hide_behind_itself():
+    """Leave-one-out: the population judging a decay is measured without it.
+
+    Including it inflates the scale by exactly the amount that would excuse it."""
+    lams = ENVELOPE + [12.0]
+    out, report = reject_inconsistent(lams, ["sealed"] * len(lams),
+                                      [None] * len(lams))
+    assert out[-1] == "unexplained"
+    assert report["rejected"][0]["pool_median"] < 0.5
+
+
+def test_rejecting_one_decay_does_not_cascade_into_the_next():
+    """One pass against the pool as it stands.
+
+    4.0 is plainly not this envelope; 1.1 is 2.9x the median and merely unusual.
+    Iterating would remove the 4.0, tighten the scale on what was left, and then
+    condemn the 1.1 as well - and so on down the tail until the population was as
+    homogeneous as the screen assumed. Judging everything against the pool as it
+    arrived is what stops that."""
+    lams = ENVELOPE + [1.1, 4.0]
+    out, _ = reject_inconsistent(lams, ["sealed"] * len(lams), [None] * len(lams))
+    assert out[-1] == "unexplained"
+    assert out.count("unexplained") == 1, "the screen ate its way down the tail"
+
+
+def test_too_few_decays_to_have_a_population():
+    lams = [0.3, 0.35, 4.0]
+    out, report = reject_inconsistent(lams, ["sealed"] * 3, [None] * 3)
+    assert out == ["sealed"] * 3, "3 decays cannot define what is inconsistent"
+    assert "too few" in report["note"]
+
+
+# --- precision against spread --------------------------------------------------
+
+def test_precision_and_spread_are_reported_separately():
+    """The two uncertainties on a rate, which are different claims.
+
+    Every value is pinned to +/-0.01 by its own fit, and yet they range over a
+    factor of three. Reporting the first alone would overstate the case eightfold."""
+    values = [0.20, 0.25, 0.30, 0.45, 0.60]
+    out = _uncertainty(values, [0.01] * len(values))
+    assert out["precision_1h"] == 0.01
+    assert out["spread_1h"] > 0.1
+    assert out["inflation"] > 8
+    assert "between events" in out["note"]
+
+
+def test_a_rate_with_no_per_fit_errors_still_reports_its_spread():
+    out = _uncertainty([0.2, 0.3, 0.5], [])
+    assert out["spread_1h"] > 0
+    assert "precision_1h" not in out
+
+
+# --- the marginal weather fits -------------------------------------------------
+
+def test_the_marginal_fit_reports_the_sign_of_the_stack_term():
+    """A single-predictor correlation is identifiable where three coefficients on
+    six points are not, and its SIGN is a physical claim worth checking."""
+    dT = np.array([2.0, 4.0, 6.0, 8.0, 10.0, 12.0])
+    lam = 0.2 + 0.03 * dT
+    out = _marginal(lam, dT, "|dT|", "C")
+    assert out["r"] > 0.9 and out["significant"]
+    assert "|dT|" in out["verdict"]
+
+
+def test_a_contradicted_stack_term_is_reported_not_hidden():
+    dT = np.array([2.0, 4.0, 6.0, 8.0, 10.0, 12.0])
+    out = _marginal(0.8 - 0.04 * dT, dT, "|dT|", "C")
+    assert out["r"] < 0
+    assert out["significant"], "a strong negative relation is still a measurement"
+
+
+def test_the_marginal_refuses_a_sample_too_small_to_speak():
+    assert _marginal(np.array([0.3, 0.4]), np.array([1.0, 2.0]), "|dT|", "C") is None
+
+
+# --- leave-one-night-out -------------------------------------------------------
+
+def test_a_held_out_night_contributes_nothing_to_the_model_that_scores_it(db):
+    """The point of the whole exercise: the parameters must not have seen the night.
+
+    Excluding a window that covers the entire record has to leave nothing to fit
+    with - if it still returns a lambda, the exclusion is not reaching the data."""
+    from analysis.holdout import _fit_without
+
+    simulate(db, days=3)
+    learn(db, "bedroom", days=7, now=T0 + 3 * 86400)
+    co2, _ = features.despike(
+        features.series(db, "co2_ppm", "bedroom", T0, T0 + 3 * 86400))
+    labels = db.labels(location="bedroom", start=T0, end=T0 + 3 * 86400)
+
+    everything = _fit_without(db, "bedroom", labels, co2, T0, T0 + 3 * 86400,
+                              exclude=(T0 - 86400, T0 + 4 * 86400))
+    assert everything["n_decays"] == 0, "excluding the whole record still found decays"
+    assert everything["lambda_h"] is None
+
+    some = _fit_without(db, "bedroom", labels, co2, T0, T0 + 3 * 86400, exclude=None)
+    assert some["n_decays"] > 0 and some["lambda_h"] is not None
+
+
+def test_the_validation_reports_the_nights_it_could_not_score(db):
+    """A validation that silently drops the nights it cannot handle is choosing its
+    own exam paper."""
+    from analysis.holdout import one_night_out
+
+    simulate(db, days=3)
+    learn(db, "bedroom", days=7, now=T0 + 3 * 86400)
+    rep = one_night_out(db, "bedroom", days=7, now=T0 + 3 * 86400)
+    assert "nights" in rep and "skipped" in rep
+    # No ring data in the fixture, so there are no sleep windows and nothing can be
+    # scored. That must be visible rather than looking like a clean pass.
+    assert not rep["nights"]
+    assert "summary" not in rep

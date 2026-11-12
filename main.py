@@ -482,6 +482,57 @@ def cmd_outdoor(args, db):
     print()
 
 
+def cmd_validate(args, db):
+    """Leave-one-night-out: does the model predict a night it was not fitted on?
+
+    Everything else in this system checks the model against itself. This is the one
+    command that cannot be passed by a model that is wrong in a way all its routes
+    share, because the night being scored contributed nothing to the parameters
+    scoring it.
+    """
+    from analysis.holdout import one_night_out
+    from analysis.room_model import rooms
+
+    for name in rooms(db):
+        rep = one_night_out(db, name, days=args.days)
+        print()
+        print(f"{name}  (outdoor baseline {rep['c_out']} ppm, shared across folds)")
+        if not rep["nights"]:
+            print("  no night could be validated:")
+            for sk in rep["skipped"][-6:]:
+                print(f"    {sk['day']}  {sk['why']}")
+            continue
+        print(f"  {'night':11s}{'h':>5}{'lambda':>8}{'S':>8}{'ceiling':>9}"
+              f"{'MAE':>8}{'naive':>8}{'skill':>8}{'late bias':>11}")
+        for e in rep["nights"]:
+            print(f"  {e['day']:11s}{e['hours']:5.1f}{e['lambda_used']:8.3f}"
+                  f"{e['source_used']:8.0f}{e['ceiling_ppm']:9d}{e['mae_ppm']:8.0f}"
+                  f"{e['naive_mae_ppm']:8.0f}{e['skill']:+8.0%}"
+                  f"{e['late_bias_ppm']:+11.0f}")
+        s = rep["summary"]
+        print()
+        print(f"  {s['verdict']}")
+        if s.get("ceiling_warning"):
+            print(f"  ! {s['ceiling_warning']}")
+        # Whether the parameter itself is stable under leaving a night out is a
+        # different question from whether its predictions are good, and a more
+        # basic one: a lambda that swings with each fold is not measuring the room.
+        folds = s.get("lambda_across_folds") or {}
+        if folds.get("range_1h"):
+            print(f"  lambda across the {s['n_nights']} folds: "
+                  f"{folds['range_1h'][0]}-{folds['range_1h'][1]}/h "
+                  f"(spread {folds['spread_1h']}/h) - how much dropping one night "
+                  f"moves the parameter at all")
+        if rep["skipped"]:
+            print(f"  {len(rep['skipped'])} night(s) not scored; last reason: "
+                  f"{rep['skipped'][-1]['why']}")
+    print()
+    print("Held out: every decay and rise inside the night being scored. NOT held "
+          "out: the outdoor baseline, and the occupancy labels for that night - "
+          "those are inputs, not predictions. So this validates lambda and the "
+          "source out of sample, not the whole pipeline.")
+
+
 def cmd_limits(args, db):
     """What this system does not know, measured from its own record.
 
@@ -688,12 +739,37 @@ def cmd_params(args, db):
             if kinds.get("coupled"):
                 print(f"  {'':18s}'coupled' settled on house air, not outdoor air, so they "
                       f"measure a door rather than the envelope and are kept out of lambda_sealed")
+            if kinds.get("unexplained"):
+                print(f"  {'':18s}'unexplained' exchanged air far faster than this envelope "
+                      f"can, with no label saying a window was open - kept out of both "
+                      f"lambda_sealed and lambda_open rather than guessed at")
 
         # lambda_sealed is measured twice over, by a room emptying and by the same
         # room filling. They share no assumption but the mass balance, so how far
         # apart they land is the best single check the system has on itself.
         stored = db.params(name).get("lambda_sealed")
         detail = json.loads(stored["detail"]) if stored and stored["detail"] else {}
+
+        # Precision and spread, which are different claims. The stored stderr column
+        # can hold only one number, and quoting the tighter one would overstate the
+        # case by roughly the inflation factor printed here.
+        unc = detail.get("uncertainty") or {}
+        if unc.get("note"):
+            print(f"  lambda_sealed     {unc['note']}")
+            print(f"  {'':18s}n={unc['n']}, range {unc['range_1h'][0]}-"
+                  f"{unc['range_1h'][1]}/h, median pinned to "
+                  f"+/-{unc['se_median_1h']}/h")
+
+        screen = detail.get("screen") or {}
+        if screen.get("rejected"):
+            print(f"  decay screen      {screen['note']}")
+            for e in screen["rejected"]:
+                print(f"  {'':18s}REJECTED {e['lambda_h']}/h = {e['ratio']}x the "
+                      f"median and {e['z']} robust sd above it")
+            for e in screen.get("near_misses", []):
+                print(f"  {'':18s}kept     {e['lambda_h']}/h = {e['ratio']}x "
+                      f"(z={e['z']}) - unusual, not impossible")
+
         if detail.get("agreement"):
             flag = "DISAGREE - " if detail.get("disagree") else "cross-check: "
             print(f"  lambda_sealed     {flag}{detail['agreement']}")
@@ -737,6 +813,22 @@ def cmd_params(args, db):
         elif wd and wd.get("usable"):
             print(f"  weather law       lambda^2 = {wd['a']:.3f} + {wd['b']:.4f}|dT| "
                   f"+ {wd['c']:.4f}v^2   r2_adj={wd['r2_adj']:.2f} n={wd['n']}")
+        # Each driver on its own, over every sealed decay rather than only the
+        # departure-anchored ones. This is the part the quadrature fit cannot reach
+        # in a room with two standardised measurements, and the SIGN of the stack
+        # term is a physical claim that can be checked without identifying its size.
+        if wd:
+            for key in ("buoyancy", "wind_marginal"):
+                m = wd.get(key)
+                if not m:
+                    continue
+                print(f"  {'':18s}{m['verdict']}")
+                if m.get("physics"):
+                    print(f"  {'':18s}  {m['physics']}")
+            if wd.get("marginal_n"):
+                print(f"  {'':18s}  (from {wd['marginal_n']} sealed decays; the "
+                      f"quadrature fit above uses only the {wd.get('n', 0)} "
+                      f"departure-anchored ones)")
 
         # An open window is not one number - what it delivers scales with wind - so
         # the pooled lambda_open above is only the fallback. Show the law and what it
@@ -1050,6 +1142,9 @@ def main():
     p = sub.add_parser("outdoor", help="do the outdoor sources agree with each other")
     p.add_argument("--days", type=int, default=14)
     p.set_defaults(fn=cmd_outdoor)
+    p = sub.add_parser("validate", help="predict each night from a model that never saw it")
+    p.add_argument("--days", type=int, default=21)
+    p.set_defaults(fn=cmd_validate)
     p = sub.add_parser("limits", help="what this system does not know")
     p.set_defaults(fn=cmd_limits)
     p = sub.add_parser("backup", help="consistent copy of the database")
